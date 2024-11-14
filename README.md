@@ -64,3 +64,7 @@ python evaluation_DeCo_Diff.py \
             --center-crop True \
             --augmentation True \
 ```
+## Sample Results
+
+![DeCo-Diff](./Samples.png)
+
