@@ -19,7 +19,7 @@ import os
 import torch.nn.functional as F
 from models import UNET_models
 
-from diffusion_temp import create_diffusion
+from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 from MVTECDataLoader import MVTECDataset
 from VISADataLoader import VISADataset
