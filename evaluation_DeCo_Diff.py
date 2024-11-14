@@ -5,7 +5,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import torch
 from skimage.transform import resize
 from torchvision.utils import save_image
-from diffusion_temp import create_diffusion
+from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 # from ldm.modules.diffusionmodules.openaimodel import UNetModel
 from models import UNET_models
