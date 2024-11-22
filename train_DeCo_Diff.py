@@ -233,25 +233,8 @@ def main(args):
         dataset = VISADataset('train', object_class=args.object_category, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
        
 
-    if args.center_size == 256 or args.center_size == 224:
-        if model!='UNet_XL':
-            loader = DataLoader(dataset, batch_size=128, shuffle=True, num_workers=4, drop_last=False)
-            accumulation_steps = 1
-        else:
-            loader = DataLoader(dataset, batch_size=96, shuffle=True, num_workers=4, drop_last=False)
-            accumulation_steps = 1
-    if args.center_size == 320 or args.center_size == 360:
-        loader = DataLoader(dataset, batch_size=96, shuffle=True, num_workers=4, drop_last=False)
-        accumulation_steps = 1
-    elif args.center_size == 384:
-        loader = DataLoader(dataset, batch_size=48, shuffle=True, num_workers=4, drop_last=False)
-        accumulation_steps = 2
-    elif args.center_size == 448:
-        loader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=4, drop_last=False)
-        accumulation_steps = 3
-    elif args.center_size == 512:
-        loader = DataLoader(dataset, batch_size=24, shuffle=True, num_workers=4, drop_last=False)
-        accumulation_steps = 4 
+    loader = DataLoader(dataset, batch_size=128, shuffle=True, num_workers=4, drop_last=False)
+    accumulation_steps = 1
 
         
     logger.info(f"Dataset contains {len(dataset):,} training images")
