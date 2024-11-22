@@ -88,34 +88,6 @@ def compute_pro(masks: ndarray, amaps: ndarray, num_th: int = 200) -> None:
     return pro_auc
 
 
-def local_cross_correlation(image1, image2):
-    # Get the dimensions of the images
-    height, width, c = image1.shape
-    
-    # Initialize the output cross-correlation image
-    cross_correlation = np.zeros((height, width))
-    
-    # Define the size of the local neighborhood
-    neighborhood_size = 9
-    offset = neighborhood_size // 2
-    
-    # Iterate over each pixel in the image
-    for i in range(offset, height - offset):
-        for j in range(offset, width - offset):
-            # Extract 3x3 neighborhoods from both images
-            patch1 = image1[i-offset:i+offset+1, j-offset:j+offset+1, :]
-            patch2 = image2[i-offset:i+offset+1, j-offset:j+offset+1, :]
-            
-            # Compute the mean of the patches
-            mean1 = np.mean(patch1)
-            mean2 = np.mean(patch2)
-            
-            # Compute the local cross-correlation
-            numerator = np.sum((patch1 - mean1) * (patch2 - mean2))
-            denominator = np.sqrt(np.sum((patch1 - mean1)**2) * np.sum((patch2 - mean2)**2))
-            cross_correlation[i, j] = (numerator+0.1) / (denominator+0.1) if denominator != 0 else 0
-            
-    return cross_correlation
 
 
 def calculate_metrics(ground_truth, prediction):
@@ -160,6 +132,7 @@ def calculate_metrics(ground_truth, prediction):
 def smooth_mask(mask, sigma=1.0):
     smoothed_mask = gaussian_filter(mask, sigma=sigma)
     return smoothed_mask
+    
 
 def evaluate(x0_s, segmentation_s, encoded_s,  image_samples_s, latent_samples_s, center_size=256):
         pr = []
@@ -243,7 +216,7 @@ def evaluation(args):
 
         
 
-        anomaly_classes = os.listdir(f'/home/ar94660/Datasets/UAD/mvtec-dataset/{category}/ground_truth/')
+        anomaly_classes = os.listdir(f'./mvtec-dataset/{category}/ground_truth/')
         anomaly_classes =  ['good'] + anomaly_classes
 
 
@@ -253,7 +226,7 @@ def evaluation(args):
         ])
             
         # Create diffusion object:
-        diffusion = create_diffusion(f'ddim{t}', predict_deviation=True, sigma_small=False, predict_xstart=False, diffusion_steps=10)
+        diffusion = create_diffusion(f'ddim5', predict_deviation=True, sigma_small=False, predict_xstart=False, diffusion_steps=10)
             
         
         x_s = []
@@ -281,7 +254,7 @@ def evaluation(args):
                         # encoded,
                         model, encoded.shape, noise = encoded, clip_denoised=False, 
                         # start_from_t = True,
-                        start_t = 5 ,
+                        start_t = 5,
                         model_kwargs=model_kwargs, progress=False, device=device,
                         # noise_additive = torch.zeros(num_iteration, 4, latent_size, latent_size).cuda(),
                         eta = 0
