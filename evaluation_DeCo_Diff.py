@@ -179,7 +179,7 @@ def evaluate(x0_s, segmentation_s, encoded_s,  image_samples_s, latent_samples_s
                 # image_difference = ((((1-out_image_mask)*((torch.abs(image_samples-x))).to(torch.float32)).sum(axis=0)/((1-out_image_mask).sum(axis=0))).detach().cpu().numpy().transpose(1,2,0).sum(axis=2))
                 image_difference = (((((torch.abs(image_samples-x))).to(torch.float32)).mean(axis=0)).detach().cpu().numpy().transpose(1,2,0).max(axis=2))
                 image_difference = (np.clip(image_difference, 0.0, 0.4) ) * 2.5
-                image_difference = smooth_mask(image_difference, sigma=3)
+                image_difference = smooth_mask(image_difference, sigma=1)
                 image_differences.append(image_difference)
                 
                 latent_difference = (((((torch.abs(latent_samples-encoded))).to(torch.float32)).mean(axis=0)).detach().cpu().numpy().transpose(1,2,0).mean(axis=2))
@@ -190,9 +190,9 @@ def evaluate(x0_s, segmentation_s, encoded_s,  image_samples_s, latent_samples_s
                 
                 final_anomaly = image_difference * latent_difference
                 final_anomaly = np.sqrt(final_anomaly)
-                final_anomaly = smooth_mask(final_anomaly, sigma=3)
+                final_anomaly = smooth_mask(final_anomaly, sigma=1)
                 final_anomaly2 = 1/2*image_difference + 1/2*latent_difference
-                final_anomaly2 = smooth_mask(final_anomaly2, sigma=3)
+                final_anomaly2 = smooth_mask(final_anomaly2, sigma=1)
                 pr.append(final_anomaly)
                 pr2.append(final_anomaly2)
 
@@ -281,7 +281,7 @@ def evaluation(args):
                         # encoded,
                         model, encoded.shape, noise = encoded, clip_denoised=False, 
                         # start_from_t = True,
-                        start_t = t ,
+                        start_t = 5 ,
                         model_kwargs=model_kwargs, progress=False, device=device,
                         # noise_additive = torch.zeros(num_iteration, 4, latent_size, latent_size).cuda(),
                         eta = 0
