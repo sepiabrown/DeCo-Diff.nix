@@ -1,23 +1,39 @@
-# DeCo-Diff
-This Repository contains the PyTorch implementation of the multi-class unsupervised anomaly detection method for: "Correcting Deviations from Normality: A Reformulated Diffusion Model for Unsupervised Anomaly Detection", Accepted in CVPR 2025.
+Below is an enhanced, "fancier" version of your README. It emphasizes the core contributions and adds some stylistic elements for a more engaging presentation.
 
-## Approach
+---
+
+# ✨ DeCo-Diff ✨
+**A PyTorch Implementation for Multi-Class Unsupervised Anomaly Detection**
+
+This repository hosts the official PyTorch implementation for our CVPR 2025 paper:  
+**"Correcting Deviations from Normality: A Reformulated Diffusion Model for Unsupervised Anomaly Detection"**.
+
+---
+
+## 🎨 Approach
+
 
 ![DeCo-Diff](./assets/DeCo-for-UAD.png)
 
+---
 
-## Setup
+## 🚀 Getting Started
 
-### Environment
+### 🛠️ Environment Setup
 
-We utilize the `Python 3.11` interpreter in our experiments. Install the required packages using the following command:
+We utilize **Python 3.11** for all experiments. To install the necessary packages, simply run:
+
 ```bash
 pip3 install -r requirements.txt
 ```
 
-### Datasets
+### 📁 Datasets
 
-Download [MVTec-AD](https://www.mvtec.com/company/research/datasets/mvtec-ad) or [VisA](https://amazon-visual-anomaly.s3.us-west-2.amazonaws.com/VisA_20220922.tar) datasets, and organize them in the following file structure (the default structure of MVTec-AD):
+Download the datasets below and organize them as shown:
+- [MVTec-AD](https://www.mvtec.com/company/research/datasets/mvtec-ad)
+- [VisA](https://amazon-visual-anomaly.s3.us-west-2.amazonaws.com/VisA_20220922.tar)
+
+The expected file structure (default for MVTec-AD) is as follows:
 ```
 ├── class1
 │   ├── ground_truth
@@ -33,9 +49,11 @@ Download [MVTec-AD](https://www.mvtec.com/company/research/datasets/mvtec-ad) or
 ...
 ```
 
-## Train
+---
 
-Train our RLR with the following command:
+## 🏋️ Training
+
+Train our model using the following command. This command sets up the RLR training with various options tailored to your dataset and desired augmentations:
 
 ```bash
 torchrun evaluation_DeCo_Diff.py \
@@ -50,9 +68,11 @@ torchrun evaluation_DeCo_Diff.py \
             --ckpt-every 20 
 ```
 
-## Test
+---
 
-Test the model with the following command:
+## 🧪 Testing
+
+Once the model is trained, test its performance using the command below:
 
 ```bash
 python evaluation_DeCo_Diff.py \
@@ -62,9 +82,15 @@ python evaluation_DeCo_Diff.py \
             --image-size 288 \
             --center-size 256 \
             --center-crop True \
-            --augmentation True \
+            --augmentation True 
 ```
-## Sample Results
 
-![DeCo-Diff](./assets/Samples.png)
+---
 
+## 📸 Sample Results
+
+Below are some sample outputs showcasing the performance of DeCo-Diff on real data:
+
+![DeCo-Diff Samples](./assets/Samples.png)
+
+---
