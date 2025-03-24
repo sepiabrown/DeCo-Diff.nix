@@ -1,6 +1,4 @@
-Below is an enhanced, "fancier" version of your README. It emphasizes the core contributions and adds some stylistic elements for a more engaging presentation.
 
----
 
 # ✨ DeCo-Diff ✨
 **A PyTorch Implementation for Multi-Class Unsupervised Anomaly Detection**
