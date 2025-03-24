@@ -102,13 +102,11 @@ For convenience, we provide pretrained weights for DeCo-Diff. These weights can 
 Below are the performances of DeCo-Diff on the MVTec-AD and VisA datasets. These results illustrate the high efficacy of DeCo-Diff in detecting anomalies in multi-class UAD setting.
 
 
-|             |        **Image-level**         |             **Pixel-level**                |
-|**Dataset**  |**AUROC**| **AP** |**f1max**|**AUROC**| **AP** |**f1max**|**AUPRO**|
-|-------------|---------|--------|---------|---------|--------|---------|---------|
-| MVTec-AD   |---------|--------|---------|---------|--------|---------|---------|
-| VisA       |---------|--------|---------|---------|--------|---------|---------|
+|**Dataset**  |I-**AUROC**| I-**AP** |I-**f1max**|P-**AUROC**| P-**AP** |P-**f1max**|P-**AUPRO**|
+|-------------|-----------|----------|-----------|-----------|--------|-----------|-----------|
+| MVTec-AD   |-----------|----------|-----------|-----------|--------|-----------|-----------|
+| VisA       |-----------|----------|-----------|-----------|--------|-----------|-----------|
 
-*Note: These metrics are indicative. Replace them with your actual experimental results.*
 
 ---
 
