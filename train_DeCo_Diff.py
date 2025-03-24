@@ -399,9 +399,9 @@ if __name__ == "__main__":
     parser.add_argument("--mask-ratio", type=float, default=0.7)
     parser.add_argument("--patch-shuffle-ratio", type=float, default=0.3)
     parser.add_argument("--object-category", type=str, default='all')
-    parser.add_argument("--mask-random-ratio", type=bool, default=True)
-    parser.add_argument("--from-scratch", type=bool, default=True)
-    parser.add_argument("--augmentation", type=bool, default=True)
+    parser.add_argument("--mask-random-ratio", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
+    parser.add_argument("--from-scratch", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
+    parser.add_argument("--augmentation", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
     
     
     args = parser.parse_args()
