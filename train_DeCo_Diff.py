@@ -415,5 +415,6 @@ if __name__ == "__main__":
         args.actual_image_size = args.center_size
     else:
         args.actual_image_size = args.image_size
+    args.mask_random_ratio = bool(eval(args.mask_random_ratio))
         
     main(args)
