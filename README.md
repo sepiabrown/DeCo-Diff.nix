@@ -3,7 +3,7 @@ This Repository contains the PyTorch implementation of the multi-class unsupervi
 
 ## Approach
 
-![DeCo-Diff](./DeCo-Diff_for_UAD.png)
+![DeCo-Diff](./assets/DeCo-for-UAD.png)
 
 
 ## Setup
@@ -66,5 +66,5 @@ python evaluation_DeCo_Diff.py \
 ```
 ## Sample Results
 
-![DeCo-Diff](./Samples.png)
+![DeCo-Diff](./assets/Samples.png)
 
