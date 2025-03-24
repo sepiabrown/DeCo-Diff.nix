@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore")
 class MVTECDataset(Dataset):
     """ABIDE dataset."""
 
-    def __init__(self, mode, object_class, rootdir= '/home/farzadbz/projects/def-josedolz/farzadbz/mvtec-dataset/',transform=None,  normal=True, anomaly_class='good', image_size=256, center_size=224, augment=False, center_crop=False):
+    def __init__(self, mode, object_class, rootdir= './mvtec-dataset/',transform=None,  normal=True, anomaly_class='good', image_size=280, center_size=256, augment=False, center_crop=False):
         """
         Args:
             mode: 'train','val','test'
@@ -57,11 +57,7 @@ class MVTECDataset(Dataset):
             df = df.query(f'split=="{mode}"')    
         else:
             df = df.query(f'split=="{mode}" and object=="{object_class}"')    
-            
-        # if normal:
-        #     df = df.query(f'label=="normal"')    
-        # else:
-        #     df = df.query(f'label=="anomaly"')   
+              
             
         if anomaly_class=='good' or self.normal:
             df = df.query(f'category=="good"') 
