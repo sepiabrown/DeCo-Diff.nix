@@ -385,7 +385,7 @@ if __name__ == "__main__":
     parser.add_argument("--model-size", type=str, choices=['UNet_XS','UNet_S', 'UNet_M', 'UNet_L', 'UNet_XL'], default='UNet_XS')
     parser.add_argument("--image-size", type=int, default= 288 )
     parser.add_argument("--center-size", type=int, default=256)
-    parser.add_argument("--center-crop", type=bool, default=False)
+    parser.add_argument("--center-crop", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
     parser.add_argument("--epochs", type=int, default=800)
     parser.add_argument("--warmup-epochs", type=int, default=10)
     parser.add_argument("--global-batch-size", type=int, default=128)
