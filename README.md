@@ -56,7 +56,8 @@ Train our model using the following command. This command sets up the RLR traini
 ```bash
 torchrun evaluation_DeCo_Diff.py \
             --dataset mvtec \
-            --model UNet_L \
+            --data-dir ./mvtec-dataset/ \
+            --model-size UNet_L \
             --mask-random-ratio True \
             --object-category all  \
             --image-size 288 \
@@ -75,12 +76,13 @@ Once the model is trained, test its performance using the command below:
 ```bash
 python evaluation_DeCo_Diff.py \
             --dataset mvtec \
-            --model UNet_L \
+            --data-dir ./mvtec-dataset/ \
+            --model-size UNet_L \
             --object-category all  \
+            --anomaly-class all  \
             --image-size 288 \
             --center-size 256 \
             --center-crop True \
-            --augmentation True \
             --pretrained /path/to/pretrained_weights.pt
 ```
 ---
