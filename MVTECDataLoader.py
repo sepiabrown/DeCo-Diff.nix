@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore")
 class MVTECDataset(Dataset):
     """ABIDE dataset."""
 
-    def __init__(self, mode, object_class, rootdir= './mvtec-dataset/',transform=None,  normal=True, anomaly_class='good', image_size=280, center_size=256, augment=False, center_crop=False):
+    def __init__(self, mode, object_class, rootdir= './mvtec-dataset/',transform=None,  normal=True, anomaly_class='good', image_size=288, center_size=256, augment=False, center_crop=False):
         """
         Args:
             mode: 'train','val','test'
