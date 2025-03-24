@@ -281,7 +281,7 @@ if __name__ == "__main__":
     parser.add_argument("--model-size", type=str, choices=['UNet_XS','UNet_S', 'UNet_M', 'UNet_L', 'UNet_XL'], default='UNet_L')
     parser.add_argument("--image-size", type=int, default= 288 )
     parser.add_argument("--center-size", type=int, default=256)
-    parser.add_argument("--center-crop", type=bool, default=True)
+    parser.add_argument("--center-crop", type=, type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
     parser.add_argument("--vae-type", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--object-category", type=str, default='all')
