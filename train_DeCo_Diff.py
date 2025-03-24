@@ -195,7 +195,7 @@ def main(args):
         with open(f'{args.results_dir}/args.txt', 'w') as f:
             json.dump(args.__dict__, f, indent=2)
         experiment_index = len(glob(f"{args.results_dir}/*"))
-        experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{args.model.replace('/', '-')}"  # Create an experiment folder
+        experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{args.model_size.replace('/', '-')}"  # Create an experiment folder
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
@@ -206,16 +206,16 @@ def main(args):
     # Create model:
     assert args.center_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.actual_image_size // 8
-    model = UNET_models[args.model](latent_size=latent_size)
+    model = UNET_models[args.model_size](latent_size=latent_size)
         
 
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
     model = DDP(model.to(device), device_ids=[rank])
-    diffusion = create_diffusion(timestep_respacing="ddim10", predict_deviation=True, predict_xstart=False, sigma_small=False, learn_sigma = args.learn_sigma)  # default: 1000 steps, linear noise schedule
+    diffusion = create_diffusion(timestep_respacing="ddim10", predict_deviation=True, predict_xstart=False, sigma_small=False)  # default: 1000 steps, linear noise schedule
     val_diffusion = create_diffusion("ddim10", predict_deviation=True, predict_xstart=False, sigma_small=False)
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae_type}").to(device)
     vae.eval()
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -228,12 +228,12 @@ def main(args):
         
     
     if args.dataset=='mvtec':
-        dataset = MVTECDataset('train', object_class=args.object_category, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
+        dataset = MVTECDataset('train', object_class=args.object_category, rootdir=args.data_dir, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
     elif args.dataset=='visa':
-        dataset = VISADataset('train', object_class=args.object_category, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
+        dataset = VISADataset('train', object_class=args.object_category, rootdir=args.data_dir, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
        
-
-    loader = DataLoader(dataset, batch_size=128, shuffle=True, num_workers=4, drop_last=False)
+    batch_size = args.global_batch_size // dist.get_world_size()
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=False)
     accumulation_steps = 1
 
         
@@ -306,7 +306,7 @@ def main(args):
             'mask': mask
             }
             
-            noise_mask = random_mask(x, mask_ratios=np.random.uniform(low=0.0, high=0.3, size = x.shape[0]), mask_patch_size=mask_patch_size)
+            noise_mask = random_mask(x, mask_ratios=np.random.uniform(low=0.0, high=args.patch_shuffle_ratio, size = x.shape[0]), mask_patch_size=mask_patch_size)
             noise = noise_mask * torch.randn_like(x, device=device) + (1-noise_mask) *  shuffle_patches(x, mask_patch_size)
             
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs, noise = noise)
@@ -381,26 +381,27 @@ if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, choices=['mvtec','visa'], default="mvtec")
-    parser.add_argument("--model", type=str, choices=['UNet_XS','UNet_S', 'UNet_M', 'UNet_L', 'UNet_XL'], default='UNet_XS')
+    parser.add_argument("--data-dir", type=str, default='./mvtec-dataset/')
+    parser.add_argument("--model-size", type=str, choices=['UNet_XS','UNet_S', 'UNet_M', 'UNet_L', 'UNet_XL'], default='UNet_XS')
     parser.add_argument("--image-size", type=int, default= 288 )
     parser.add_argument("--center-size", type=int, default=256)
     parser.add_argument("--center-crop", type=bool, default=False)
     parser.add_argument("--epochs", type=int, default=800)
     parser.add_argument("--warmup-epochs", type=int, default=10)
-    parser.add_argument("--global-batch-size", type=int, default=64)
+    parser.add_argument("--global-batch-size", type=int, default=128)
     parser.add_argument("--global-seed", type=int, default=10)
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
+    parser.add_argument("--vae-type", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--ckpt-every", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--local-rank", type=int, default=0)
-    parser.add_argument("--mask-ratio", type=float, default=0.75)
+    parser.add_argument("--mask-ratio", type=float, default=0.7)
+    parser.add_argument("--patch-shuffle-ratio", type=float, default=0.3)
     parser.add_argument("--object-category", type=str, default='all')
     parser.add_argument("--mask-random-ratio", type=bool, default=True)
-    parser.add_argument("--learn-sigma", type=bool, default=False)
-    parser.add_argument("--from-scratch", type=bool, default=False)
-    parser.add_argument("--augmentation", type=bool, default=False)
+    parser.add_argument("--from-scratch", type=bool, default=True)
+    parser.add_argument("--augmentation", type=bool, default=True)
     
     
     args = parser.parse_args()
@@ -408,13 +409,11 @@ if __name__ == "__main__":
         args.num_classes = 15
     elif args.dataset == 'visa':
         args.num_classes = 12
-    args.results_dir = f"./DeCo-Diff_{args.dataset}_{args.object_category}_{args.model}_{args.center_size}"
+    args.results_dir = f"./DeCo-Diff_{args.dataset}_{args.object_category}_{args.model_size}_{args.center_size}"
     if args.center_crop:
         args.results_dir += "_CenterCrop"
         args.actual_image_size = args.center_size
     else:
         args.actual_image_size = args.image_size
-    if args.learn_sigma:
-        args.results_dir += "_learnSigma"
         
     main(args)
