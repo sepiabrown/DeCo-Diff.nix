@@ -80,8 +80,35 @@ python evaluation_DeCo_Diff.py \
             --image-size 288 \
             --center-size 256 \
             --center-crop True \
-            --augmentation True 
+            --augmentation True \
+            --pretrained /path/to/pretrained_weights.pt
 ```
+---
+
+## 📦 Pretrained Weights
+
+For convenience, we provide pretrained weights for DeCo-Diff. These weights can be used for rapid inference and further experimentation:
+
+- **MVTec-AD Pretrained Weights:**  
+  Download from [Google Drive](https://drive.google.com/file/d/1kWXXao57CzLDmatePAmMoTZG5YZsrVRl/view?usp=share_link) 
+  
+- **VisA Pretrained Weights:**  
+  Download from [Google Drive](https://drive.google.com/file/d/1uNE-Vtb7TPeuMkyepTbKFsxUy8472enx/view?usp=share_link) 
+
+---
+
+## 📊 Results
+
+Below are the performances of DeCo-Diff on the MVTec-AD and VisA datasets. These results illustrate the high efficacy of DeCo-Diff in detecting anomalies in multi-class UAD setting.
+
+
+|             |        **Image-level**         |             **Pixel-level**                |
+|**Dataset**  |**AUROC**| **AP** |**f1max**|**AUROC**| **AP** |**f1max**|**AUPRO**|
+|-------------|---------|--------|---------|---------|--------|---------|---------|
+| MVTec-AD   |---------|--------|---------|---------|--------|---------|---------|
+| VisA       |---------|--------|---------|---------|--------|---------|---------|
+
+*Note: These metrics are indicative. Replace them with your actual experimental results.*
 
 ---
 
@@ -92,3 +119,8 @@ Below are some sample outputs showcasing the performance of DeCo-Diff on real da
 ![DeCo-Diff Samples](./assets/Samples.png)
 
 ---
+
+
+
+
+
