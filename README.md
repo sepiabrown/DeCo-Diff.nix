@@ -1,5 +1,5 @@
 # DeCo-Diff
-This Repository contains the PyTorch implementation of the multi-class unsupervised anomaly detection method for: "Correcting Deviations from Normality: A Reformulated Diffusion Model for Unsupervised Anomaly Detection."
+This Repository contains the PyTorch implementation of the multi-class unsupervised anomaly detection method for: "Correcting Deviations from Normality: A Reformulated Diffusion Model for Unsupervised Anomaly Detection", Accepted in CVPR 2025.
 
 ## Approach
 
