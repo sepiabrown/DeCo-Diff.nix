@@ -250,19 +250,16 @@ def evaluation(args):
                 'mask': None
                 }
                 latent_samples = diffusion.ddim_deviation_sample_loop(
-                    # encoded,
                     model, encoded.shape, noise = encoded, clip_denoised=False, 
-                    # start_from_t = True,
-                    start_t = 5,
+                    start_t = args.reverse_steps,
                     model_kwargs=model_kwargs, progress=False, device=device,
-                    # noise_additive = torch.zeros(num_iteration, 4, latent_size, latent_size).cuda(),
                     eta = 0
                 )
 
 
 
-                image_samples = vae.decode(latent_samples / 0.18215).sample #* (1-mask)
-                x0 = vae.decode(encoded / 0.18215).sample #* (1-mask)
+                image_samples = vae.decode(latent_samples / 0.18215).sample 
+                x0 = vae.decode(encoded / 0.18215).sample 
 
 
             x_s += [_x.unsqueeze(0) for _x in x]
@@ -280,7 +277,7 @@ if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, choices=['mvtec','visa'], default="mvtec")
-    parser.add_argument("--data-dir", type=str, default='./mvtec-dataset')
+    parser.add_argument("--data-dir", type=str, default='./mvtec-dataset/')
     parser.add_argument("--model-size", type=str, choices=['UNet_XS','UNet_S', 'UNet_M', 'UNet_L', 'UNet_XL'], default='UNet_L')
     parser.add_argument("--image-size", type=int, default= 288 )
     parser.add_argument("--center-size", type=int, default=256)
@@ -290,6 +287,7 @@ if __name__ == "__main__":
     parser.add_argument("--object-category", type=str, default='all')
     parser.add_argument("--pretrained", type=str, default='.')
     parser.add_argument("--anomaly-class", type=str, default='all')
+    parser.add_argument("--reverse-steps", , type=int, default=5)
     
     
     args = parser.parse_args()
