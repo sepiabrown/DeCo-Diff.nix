@@ -191,19 +191,27 @@ def evaluate(x0_s, segmentation_s, encoded_s,  image_samples_s, latent_samples_s
 
 def evaluation(args):
 
-    vae_model = "stabilityai/sd-vae-ft-ema" #@param ["stabilityai/sd-vae-ft-mse", "stabilityai/sd-vae-ft-ema"]
+    vae_model = f"stabilityai/sd-vae-ft-{args.vae}" #@param ["stabilityai/sd-vae-ft-mse", "stabilityai/sd-vae-ft-ema"]
     vae = AutoencoderKL.from_pretrained(vae_model).to(device)
     vae.eval()
 
-    path = f"./DeCo-Diff_{args.dataset}_{args.object_category}_{args.model}_{args.center_size}"
-
     try:
-        ckpt = sorted(glob(f'{path}/last.pt'))[-1]
+        
+        if args.pretrained != ''
+            ckpt = args.pretrained
+        else:
+            path = f"./DeCo-Diff_{args.dataset}_{args.object_category}_{args.model_size}_{args.center_size}"
+    
+            try:
+                ckpt = sorted(glob(f'{path}/last.pt'))[-1]
+            except:
+                ckpt = sorted(glob(f'{path}/*/last.pt'))[-1]
     except:
-        ckpt = sorted(glob(f'{path}/*/last.pt'))[-1]
+        raise Exception("Please provide the model's pretrained path using --pretrained")
+    
 
     latent_size = int(args.center_size) // 8
-    model = UNET_models[f'UNet_L'](latent_size)
+    model = UNET_models[args.model_size](latent_size)
     
     state_dict = torch.load(ckpt)['model']
     print(model.load_state_dict(state_dict))
@@ -213,11 +221,6 @@ def evaluation(args):
 
 
     for category in args.categories:
-
-        
-
-        anomaly_classes = os.listdir(f'./mvtec-dataset/{category}/ground_truth/')
-        anomaly_classes =  ['good'] + anomaly_classes
 
 
         transform = transforms.Compose([
@@ -236,42 +239,41 @@ def evaluation(args):
         x0_s = []
         segmentation_s = []
         
-        for idx, anomaly_class in enumerate(anomaly_classes):
-            
-            
-            test_dataset = MVTECDataset('test', object_class=category, transform=transform, normal=False, anomaly_class=anomaly_class, image_size=input_size, center_size=center_size, center_crop=True)
-            test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
-            
-            for ii, (x, y, object_cls) in enumerate(test_loader):
-                with torch.no_grad():
-                    # Map input images to latent space + normalize latents:
-                    encoded = vae.encode(x.to(device)).latent_dist.mean.mul_(0.18215)
-                    model_kwargs = {
-                    'context':object_cls.to(device).unsqueeze(1),
-                    'mask': None
-                    }
-                    latent_samples = diffusion.ddim_deviation_sample_loop(
-                        # encoded,
-                        model, encoded.shape, noise = encoded, clip_denoised=False, 
-                        # start_from_t = True,
-                        start_t = 5,
-                        model_kwargs=model_kwargs, progress=False, device=device,
-                        # noise_additive = torch.zeros(num_iteration, 4, latent_size, latent_size).cuda(),
-                        eta = 0
-                    )
+        
+        
+        test_dataset = MVTECDataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=input_size, center_size=center_size, center_crop=True)
+        test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
+        
+        for ii, (x, y, object_cls) in enumerate(test_loader):
+            with torch.no_grad():
+                # Map input images to latent space + normalize latents:
+                encoded = vae.encode(x.to(device)).latent_dist.mean.mul_(0.18215)
+                model_kwargs = {
+                'context':object_cls.to(device).unsqueeze(1),
+                'mask': None
+                }
+                latent_samples = diffusion.ddim_deviation_sample_loop(
+                    # encoded,
+                    model, encoded.shape, noise = encoded, clip_denoised=False, 
+                    # start_from_t = True,
+                    start_t = 5,
+                    model_kwargs=model_kwargs, progress=False, device=device,
+                    # noise_additive = torch.zeros(num_iteration, 4, latent_size, latent_size).cuda(),
+                    eta = 0
+                )
 
 
 
-                    image_samples = vae.decode(latent_samples / 0.18215).sample #* (1-mask)
-                    x0 = vae.decode(encoded / 0.18215).sample #* (1-mask)
+                image_samples = vae.decode(latent_samples / 0.18215).sample #* (1-mask)
+                x0 = vae.decode(encoded / 0.18215).sample #* (1-mask)
 
 
-                x_s += [_x.unsqueeze(0) for _x in x]
-                segmentation_s += [_y.unsqueeze(0) for _y in y]
-                encoded_s += [_encoded.unsqueeze(0) for _encoded in encoded]
-                image_samples_s += [_image_samples.unsqueeze(0) for _image_samples in image_samples]
-                latent_samples_s += [_latent_samples.unsqueeze(0) for _latent_samples in latent_samples]
-                x0_s += [_x0.unsqueeze(0) for _x0 in x0]
+            x_s += [_x.unsqueeze(0) for _x in x]
+            segmentation_s += [_y.unsqueeze(0) for _y in y]
+            encoded_s += [_encoded.unsqueeze(0) for _encoded in encoded]
+            image_samples_s += [_image_samples.unsqueeze(0) for _image_samples in image_samples]
+            latent_samples_s += [_latent_samples.unsqueeze(0) for _latent_samples in latent_samples]
+            x0_s += [_x0.unsqueeze(0) for _x0 in x0]
 
         print(args.center_size, category)
         evaluate(x0_s, segmentation_s, encoded_s,  image_samples_s, latent_samples_s, center_size=args.center_size)
@@ -281,14 +283,16 @@ if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, choices=['mvtec','visa'], default="mvtec")
-    parser.add_argument("--model", type=str, choices=['UNet_XS','UNet_S', 'UNet_M', 'UNet_L', 'UNet_XL'], default='UNet_XS')
+    parser.add_argument("--data-dir", type=str, default='./mvtec-dataset')
+    parser.add_argument("--model-size", type=str, choices=['UNet_XS','UNet_S', 'UNet_M', 'UNet_L', 'UNet_XL'], default='UNet_L')
     parser.add_argument("--image-size", type=int, default= 288 )
     parser.add_argument("--center-size", type=int, default=256)
     parser.add_argument("--center-crop", type=bool, default=True)
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
+    parser.add_argument("--vae-type", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--object-category", type=str, default='all')
-    parser.add_argument("--learn-sigma", type=bool, default=False)
+    parser.add_argument("--pretrained", type=str, default='.')
+    parser.add_argument("--anomaly-class", type=str, default='all')
     
     
     args = parser.parse_args()
@@ -296,14 +300,12 @@ if __name__ == "__main__":
         args.num_classes = 15
     elif args.dataset == 'visa':
         args.num_classes = 12
-    args.results_dir = f"./DeCo-Diff_{args.dataset}_{args.object_category}_{args.model}_{args.center_size}"
+    args.results_dir = f"./DeCo-Diff_{args.dataset}_{args.object_category}_{args.model_size}_{args.center_size}"
     if args.center_crop:
         args.results_dir += "_CenterCrop"
         args.actual_image_size = args.center_size
     else:
         args.actual_image_size = args.image_size
-    if args.learn_sigma:
-        args.results_dir += "_learnSigma"
 
     if args.object_category=='all' and args.dataset=='mvtec':
         args.categories=[
