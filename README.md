@@ -119,7 +119,18 @@ Below are some sample outputs showcasing the performance of DeCo-Diff on real da
 
 ---
 
+## 📚 Citation & Reference
 
+If you find MAD-AD useful in your research, please cite our work:
+
+```bibtex
+@article{beizaee2025cor,
+  title={Correcting Deviations from Normality: A Reformulated Diffusion Model for Multi-Class Unsupervised Anomaly Detection},
+  author={Beizaee, Farzad and Lodygensky, Gregory and Desrosiers, Christian and Dolz, Jose},
+  journal={arXiv preprint arXiv:2503.19357},
+  year={2025}
+}
+```
 
 
 
