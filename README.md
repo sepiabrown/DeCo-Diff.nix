@@ -4,7 +4,7 @@
 **A PyTorch Implementation for Multi-Class Unsupervised Anomaly Detection**
 
 This repository hosts the official PyTorch implementation for our CVPR 2025 paper:  
-![**"Correcting Deviations from Normality: A Reformulated Diffusion Model for Unsupervised Anomaly Detection"**.](https://arxiv.org/abs/2503.19357)
+[**"Correcting Deviations from Normality: A Reformulated Diffusion Model for Unsupervised Anomaly Detection"**.](https://arxiv.org/abs/2503.19357)
 
 ---
 
