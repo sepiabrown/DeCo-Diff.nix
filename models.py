@@ -11,7 +11,7 @@ def create_unet_model(latent_size=32, model_channels=256, num_res_blocks=2, num_
                     dropout=0.4,
                     attention_resolutions=[4,2,1], 
                     channel_mult = channel_mult,
-                    # num_head_channels= 32,
+                    num_head_channels= model_channels//num_heads,
                     use_spatial_transformer= True,
                     ncls=ncls,
                     transformer_depth= 1,

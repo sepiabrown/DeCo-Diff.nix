@@ -1,18 +1,13 @@
 
-import os
 import torch
 from skimage.transform import resize
-from torchvision.utils import save_image
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 from models import UNET_models
 import argparse
-from PIL import Image
 import numpy as np
-from IPython.display import display
 torch.set_grad_enabled(False)
 import torch.nn.functional as F
-import os
 device = "cuda" if torch.cuda.is_available() else "cpu"
 if device == "cpu":
     print("GPU not found. Using CPU instead.")
@@ -24,12 +19,7 @@ from MVTECDataLoader import MVTECDataset
 from scipy.ndimage import gaussian_filter
 
 from anomalib import metrics
-from sklearn.metrics import roc_auc_score, average_precision_score
-
-
-
-
-
+from sklearn.metrics import average_precision_score
 from numpy import ndarray
 import pandas as pd
 from skimage import measure
@@ -121,84 +111,74 @@ def calculate_metrics(ground_truth, prediction):
     aurocsp = auroc(torch.from_numpy(pr_list_sp), torch.from_numpy(gt_list_sp))
     f1sp = f1max(torch.from_numpy(pr_list_sp), torch.from_numpy(gt_list_sp))
     
-    return auroc_score, aupro_score ,f1_max_score, ap, aurocsp, apsp, f1sp
-
-
+    return auroc_score.numpy(), aupro_score ,f1_max_score.numpy(), ap, aurocsp.numpy(), apsp, f1sp.numpy()
 
 
 def smooth_mask(mask, sigma=1.0):
     smoothed_mask = gaussian_filter(mask, sigma=sigma)
     return smoothed_mask
+
+
     
 
-def evaluate(x0_s, segmentation_s, encoded_s,  image_samples_s, latent_samples_s, center_size=256):
-        pr = []
-        pr2 = []
-        gt = []
-        image_differences = []
-        latent_differences = []
-        input_images = []
-        output_images = []
-        for x, segmentation, encoded,  image_samples, latent_samples in zip(x0_s, segmentation_s, encoded_s,  image_samples_s, latent_samples_s):
-                
-                input_image = ((np.clip(x[0].detach().cpu().numpy(), -1, 1).transpose(1,2,0))*127.5+127.5).astype(np.uint8)
-                output_image = ((np.clip(image_samples[0].detach().cpu().numpy(), -1, 1).transpose(1,2,0))*127.5+127.5).astype(np.uint8)
-                input_images.append(input_image)
-                output_images.append(output_image)
+def calculate_anomaly_maps(x0_s, encoded_s,  image_samples_s, latent_samples_s, center_size=256):
+    pred_geometric = []
+    pred_aritmetic = []
+    image_differences = []
+    latent_differences = []
+    input_images = []
+    output_images = []
+    for x, encoded,  image_samples, latent_samples in zip(x0_s, encoded_s,  image_samples_s, latent_samples_s):
+            
+        input_image = ((np.clip(x[0].detach().cpu().numpy(), -1, 1).transpose(1,2,0))*127.5+127.5).astype(np.uint8)
+        output_image = ((np.clip(image_samples[0].detach().cpu().numpy(), -1, 1).transpose(1,2,0))*127.5+127.5).astype(np.uint8)
+        input_images.append(input_image)
+        output_images.append(output_image)
 
-                # image_difference = ((((1-out_image_mask)*((torch.abs(image_samples-x))).to(torch.float32)).sum(axis=0)/((1-out_image_mask).sum(axis=0))).detach().cpu().numpy().transpose(1,2,0).sum(axis=2))
-                image_difference = (((((torch.abs(image_samples-x))).to(torch.float32)).mean(axis=0)).detach().cpu().numpy().transpose(1,2,0).max(axis=2))
-                image_difference = (np.clip(image_difference, 0.0, 0.4) ) * 2.5
-                image_difference = smooth_mask(image_difference, sigma=1)
-                image_differences.append(image_difference)
-                
-                latent_difference = (((((torch.abs(latent_samples-encoded))).to(torch.float32)).mean(axis=0)).detach().cpu().numpy().transpose(1,2,0).mean(axis=2))
-                latent_difference = (np.clip(latent_difference, 0.0 , 0.4)) * 2.5
-                latent_difference = smooth_mask(latent_difference, sigma=1)
-                latent_difference = resize(latent_difference, (center_size, center_size))
-                latent_differences.append(latent_difference)
-                
-                final_anomaly = image_difference * latent_difference
-                final_anomaly = np.sqrt(final_anomaly)
-                final_anomaly = smooth_mask(final_anomaly, sigma=1)
-                final_anomaly2 = 1/2*image_difference + 1/2*latent_difference
-                final_anomaly2 = smooth_mask(final_anomaly2, sigma=1)
-                pr.append(final_anomaly)
-                pr2.append(final_anomaly2)
+        image_difference = (((((torch.abs(image_samples-x))).to(torch.float32)).mean(axis=0)).detach().cpu().numpy().transpose(1,2,0).max(axis=2))
+        image_difference = (np.clip(image_difference, 0.0, 0.4) ) * 2.5
+        image_difference = smooth_mask(image_difference, sigma=3)
+        image_differences.append(image_difference)
+        
+        latent_difference = (((((torch.abs(latent_samples-encoded))).to(torch.float32)).mean(axis=0)).detach().cpu().numpy().transpose(1,2,0).mean(axis=2))
+        latent_difference = (np.clip(latent_difference, 0.0 , 0.4)) * 2.5
+        latent_difference = smooth_mask(latent_difference, sigma=1)
+        latent_difference = resize(latent_difference, (center_size, center_size))
+        latent_differences.append(latent_difference)
+        
+        final_anomaly = image_difference * latent_difference
+        final_anomaly = np.sqrt(final_anomaly)
+        final_anomaly = smooth_mask(final_anomaly, sigma=3)
+        final_anomaly2 = 1/2*image_difference + 1/2*latent_difference
+        final_anomaly2 = smooth_mask(final_anomaly2, sigma=3)
+        pred_geometric.append(final_anomaly)
+        pred_aritmetic.append(final_anomaly2)
+            
+    pred_geometric = np.stack(pred_geometric, axis=0)
+    pred_aritmetic = np.stack(pred_aritmetic, axis=0)
+    latent_differences = np.stack(latent_differences, axis=0)
+    image_differences = np.stack(image_differences, axis=0)
 
-                gt.append(segmentation[0,:,:].cpu().numpy())
-        pr = np.stack(pr, axis=0)
-        pr2 = np.stack(pr2, axis=0)
-        latent_differences = np.stack(latent_differences, axis=0)
-        image_differences = np.stack(image_differences, axis=0)
-        gt = np.stack(gt, axis=0)
-        gt = (gt>0).astype(np.int32)
-
-        auroc_score, aupro_score ,f1_max_score, ap, aurocsp, apsp, f1sp = calculate_metrics(gt, pr)
-        print(f'4-{t}-final_anomaly_geometric: ', {'auroc':auroc_score, 'aupro':np.round(aupro_score, 4),'f1_max':f1_max_score, 'ap':np.round(ap,4), 'aurocsp':aurocsp, 'apsp':apsp, 'f1sp':f1sp})
-        auroc_score, aupro_score ,f1_max_score, ap, aurocsp, apsp, f1sp = calculate_metrics(gt, pr2)
-        print(f'4-{t}-final_anomaly_arithmeti: ', {'auroc':auroc_score, 'aupro':np.round(aupro_score, 4),'f1_max':f1_max_score, 'ap':np.round(ap,4), 'aurocsp':aurocsp, 'apsp':apsp, 'f1sp':f1sp})
-        auroc_score, aupro_score ,f1_max_score, ap, aurocsp, apsp, f1sp = calculate_metrics(gt, image_differences)
-        print(f'4-{t}-image_differences: ', {'auroc':auroc_score, 'aupro':np.round(aupro_score, 4),'f1_max':f1_max_score, 'ap':np.round(ap,4), 'aurocsp':aurocsp, 'apsp':apsp, 'f1sp':f1sp})
-        auroc_score, aupro_score ,f1_max_score, ap, aurocsp, apsp, f1sp = calculate_metrics(gt, latent_differences)
-        print(f'4-{t}-latent_differences: ', {'auroc':auroc_score, 'aupro':np.round(aupro_score, 4),'f1_max':f1_max_score, 'ap':np.round(ap,4), 'aurocsp':aurocsp, 'apsp':apsp, 'f1sp':f1sp})
+    return {'anomaly_geometric':pred_aritmetic, 'anomaly_geometric':pred_aritmetic, 'latent_discrepancy':latent_differences, 'image_discrepancy':image_differences}
 
 
+
+def evaluate_anomaly_maps(anomaly_maps, segmentation):
+    for key in anomaly_maps.keys():
+        auroc_score, aupro_score ,f1_max_score, ap, aurocsp, apsp, f1sp = calculate_metrics(segmentation, anomaly_maps[key])
+        auroc_score, aupro_score, f1_max_score, ap, aurocsp, apsp, f1sp, = np.round(auroc_score, 4), np.round(aupro_score, 4), np.round(f1_max_score, 4), np.round(ap, 4), np.round(aurocsp, 4), np.round(apsp, 4), np.round(f1sp, 4)
+        print('{}: auroc:{:.4f}, aupro:{:.4f}, f1_max:{:.4f}, ap:{:.4f}, aurocsp:{:.4f}, apsp:{:.4f}, f1sp:{:.4f}'.format(key, auroc_score, aupro_score, f1_max_score, ap, aurocsp, apsp, f1sp))
 
 
 def evaluation(args):
-
-    vae_model = f"stabilityai/sd-vae-ft-{args.vae}" #@param ["stabilityai/sd-vae-ft-mse", "stabilityai/sd-vae-ft-ema"]
+    vae_model = f"stabilityai/sd-vae-ft-{args.vae_type}" #@param ["stabilityai/sd-vae-ft-mse", "stabilityai/sd-vae-ft-ema"]
     vae = AutoencoderKL.from_pretrained(vae_model).to(device)
     vae.eval()
-
     try:
-        
-        if args.pretrained != ''
+        if args.pretrained != '':
             ckpt = args.pretrained
         else:
             path = f"./DeCo-Diff_{args.dataset}_{args.object_category}_{args.model_size}_{args.center_size}"
-    
             try:
                 ckpt = sorted(glob(f'{path}/last.pt'))[-1]
             except:
@@ -208,7 +188,7 @@ def evaluation(args):
     
 
     latent_size = int(args.center_size) // 8
-    model = UNET_models[args.model_size](latent_size)
+    model = UNET_models[args.model_size](latent_size=latent_size)
     
     state_dict = torch.load(ckpt)['model']
     print(model.load_state_dict(state_dict))
@@ -216,6 +196,10 @@ def evaluation(args):
     model.cuda()
     print('model loaded')
 
+
+    print('=='*30)
+    print('Starting Evaluation...')
+    print('=='*30)
 
     for category in args.categories:
 
@@ -226,22 +210,20 @@ def evaluation(args):
         ])
             
         # Create diffusion object:
-        diffusion = create_diffusion(f'ddim5', predict_deviation=True, sigma_small=False, predict_xstart=False, diffusion_steps=10)
+        diffusion = create_diffusion(f'ddim{args.reverse_steps}', predict_deviation=True, sigma_small=False, predict_xstart=False, diffusion_steps=10)
             
-        
-        x_s = []
+
         encoded_s = []
         image_samples_s = []
         latent_samples_s = []
         x0_s = []
         segmentation_s = []
         
-        
-        
-        test_dataset = MVTECDataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=input_size, center_size=center_size, center_crop=True)
+    
+        test_dataset = MVTECDataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
         test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
         
-        for ii, (x, y, object_cls) in enumerate(test_loader):
+        for ii, (x, seg, object_cls) in enumerate(test_loader):
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 encoded = vae.encode(x.to(device)).latent_dist.mean.mul_(0.18215)
@@ -256,38 +238,34 @@ def evaluation(args):
                     eta = 0
                 )
 
-
-
                 image_samples = vae.decode(latent_samples / 0.18215).sample 
                 x0 = vae.decode(encoded / 0.18215).sample 
 
-
-            x_s += [_x.unsqueeze(0) for _x in x]
-            segmentation_s += [_y.unsqueeze(0) for _y in y]
+            segmentation_s += [_seg.squeeze() for _seg in seg]
             encoded_s += [_encoded.unsqueeze(0) for _encoded in encoded]
             image_samples_s += [_image_samples.unsqueeze(0) for _image_samples in image_samples]
             latent_samples_s += [_latent_samples.unsqueeze(0) for _latent_samples in latent_samples]
             x0_s += [_x0.unsqueeze(0) for _x0 in x0]
 
-        print(args.center_size, category)
-        evaluate(x0_s, segmentation_s, encoded_s,  image_samples_s, latent_samples_s, center_size=args.center_size)
-            
+        print(category)
+        anomaly_maps = calculate_anomaly_maps(x0_s, encoded_s,  image_samples_s, latent_samples_s, center_size=args.center_size)
+        evaluate_anomaly_maps(anomaly_maps, np.stack(segmentation_s, axis=0))
+        print('=='*30)  
 
 if __name__ == "__main__":
-    # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, choices=['mvtec','visa'], default="mvtec")
     parser.add_argument("--data-dir", type=str, default='./mvtec-dataset/')
     parser.add_argument("--model-size", type=str, choices=['UNet_XS','UNet_S', 'UNet_M', 'UNet_L', 'UNet_XL'], default='UNet_L')
-    parser.add_argument("--image-size", type=int, default= 288 )
+    parser.add_argument("--image-size", type=int, default= 288)
     parser.add_argument("--center-size", type=int, default=256)
-    parser.add_argument("--center-crop", type=, type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
+    parser.add_argument("--center-crop", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
     parser.add_argument("--vae-type", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--object-category", type=str, default='all')
     parser.add_argument("--pretrained", type=str, default='.')
     parser.add_argument("--anomaly-class", type=str, default='all')
-    parser.add_argument("--reverse-steps", , type=int, default=5)
+    parser.add_argument("--reverse-steps", type=int, default=5)
     
     
     args = parser.parse_args()
@@ -314,7 +292,6 @@ if __name__ == "__main__":
             "toothbrush",
             "transistor",
             "zipper",
-
             "carpet",
             "grid",
             "leather",

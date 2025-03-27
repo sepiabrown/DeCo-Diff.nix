@@ -81,8 +81,8 @@ class MVTECDataset(Dataset):
             self.object_classes.append(object_cls_dict[row['object']])
             if row['category']!='good':
                 seg_path = os.path.join(rootdir, row['mask'])
-                seg = np.array(Image.open(seg_path).convert('RGB').resize((self.image_size, self.image_size))).astype(np.uint8)
-                self.segs.append(seg[:,:,0])
+                seg = (np.array(Image.open(seg_path).convert('L').resize((self.image_size, self.image_size)))>0).astype(np.uint8)
+                self.segs.append((seg))
             else:
                 self.segs.append(np.zeros((self.image_size, self.image_size)))
         if self.augment:
