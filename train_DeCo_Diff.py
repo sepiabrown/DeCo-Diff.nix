@@ -171,11 +171,6 @@ def random_mask(x : torch.Tensor, mask_ratios, mask_patch_size=1):
 
 def main(args):
     
-    job_starting_time = time()
-    new_job_submitted = False
-    """
-    Trains a new DiT model.
-    """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup DDP:
@@ -209,15 +204,13 @@ def main(args):
     model = UNET_models[args.model_size](latent_size=latent_size)
         
 
-    # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
     model = DDP(model.to(device), device_ids=[rank])
     diffusion = create_diffusion(timestep_respacing="ddim10", predict_deviation=True, predict_xstart=False, sigma_small=False)  # default: 1000 steps, linear noise schedule
-    val_diffusion = create_diffusion("ddim10", predict_deviation=True, predict_xstart=False, sigma_small=False)
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae_type}").to(device)
     vae.eval()
-    logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    logger.info(f"Number of Parameters: {sum(p.numel() for p in model.parameters()):}")
 
 
     # Setup data:
@@ -272,26 +265,25 @@ def main(args):
     logger.info(f"Training for {adjusted_epochs} epochs...")
     
     for epoch in range(adjusted_epochs):
-        # sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for ii, (x, seg, y) in enumerate(loader):
+        for ii, (x, _, y) in enumerate(loader):
             x = x.to(device)
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
  
-            if args.center_size == 224:
+            if args.actual_image_size == 224:
                 mask_patch_size = np.random.choice([1,2,4,7], 1, p=[0.4, 0.3, 0.2, 0.1]).item()
-            if args.center_size == 256:
+            if args.actual_image_size == 256:
                 mask_patch_size = np.random.choice([1,2,4,8], 1, p=[0.4, 0.3, 0.2, 0.1]).item()
-            if args.center_size == 320:
+            if args.actual_image_size == 320:
                 mask_patch_size = np.random.choice([1,2,4,8], 1, p=[0.4, 0.3, 0.2, 0.1]).item()
-            if args.center_size == 384:
+            if args.actual_image_size == 384:
                 mask_patch_size = np.random.choice([1,2,4,8,12], 1, p=[0.3, 0.25, 0.20, 0.15, 0.1]).item()
-            if args.center_size == 448:
+            if args.actual_image_size == 448:
                 mask_patch_size = np.random.choice([1,2,4,8,14], 1, p=[0.3, 0.25, 0.20, 0.15, 0.1]).item()
-            elif args.center_size == 512:
+            elif args.actual_image_size == 512:
                 mask_patch_size = np.random.choice([1,2,4,8,16], 1, p=[0.3, 0.25, 0.20, 0.15, 0.1]).item()   
             if args.mask_random_ratio:
                 mask_ratios = np.random.uniform(low=0.0, high=0.7, size = x.shape[0])
@@ -322,7 +314,6 @@ def main(args):
             # Log loss values:
             running_loss += loss.item()
             running_mse += loss_dict["mse"].mean().item()
-            # running_mt += loss_dict["mt_prediction"].mean().item()
             
             log_steps += 1
             train_steps += 1
@@ -335,13 +326,10 @@ def main(args):
                 # Reduce loss history over all processes:
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 avg_mse = torch.tensor(running_mse / log_steps, device=device)
-                # avg_mt = torch.tensor(running_mt / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 dist.all_reduce(avg_mse, op=dist.ReduceOp.SUM)
-                # dist.all_reduce(avg_mt, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 avg_mse = avg_mse.item() / dist.get_world_size()
-                # avg_mt = avg_mt.item() / dist.get_world_size()
                 logger.info(f"(category={args.object_category} step={train_steps:07d}) MSE Loss: {avg_mse:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
                 # Reset monitoring variables:
                 running_loss = 0
@@ -350,7 +338,6 @@ def main(args):
                 log_steps = 0
                 start_time = time()
 
-            # Save DiT checkpoint:
         scheduler.step()
         if epoch % args.ckpt_every == 0 and epoch>0:
             if rank == 0: 
@@ -368,17 +355,11 @@ def main(args):
             dist.barrier()
             
 
-
-
-    model.eval()  # important! This disables randomized embedding dropout
-    # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
-
     logger.info("Done!")
     cleanup()
     
 
 if __name__ == "__main__":
-    # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, choices=['mvtec','visa'], default="mvtec")
     parser.add_argument("--data-dir", type=str, default='./mvtec-dataset/')
@@ -415,6 +396,5 @@ if __name__ == "__main__":
         args.actual_image_size = args.center_size
     else:
         args.actual_image_size = args.image_size
-    args.mask_random_ratio = bool(eval(args.mask_random_ratio))
         
     main(args)
