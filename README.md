@@ -54,7 +54,7 @@ The expected file structure (default for MVTec-AD) is as follows:
 Train our model using the following command. This command sets up the RLR training with various options tailored to your dataset and desired augmentations:
 
 ```bash
-torchrun evaluation_DeCo_Diff.py \
+torchrun train_DeCo_Diff.py \
             --dataset mvtec \
             --data-dir ./mvtec-dataset/ \
             --model-size UNet_L \
@@ -72,7 +72,7 @@ torchrun evaluation_DeCo_Diff.py \
 Once the model is trained, test its performance using the command below:
 
 ```bash
-python train_DeCo_Diff.py \
+python evaluation_DeCo_Diff.py \
             --dataset mvtec \
             --data-dir ./mvtec-dataset/ \
             --model-size UNet_L \
