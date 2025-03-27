@@ -58,13 +58,11 @@ torchrun evaluation_DeCo_Diff.py \
             --dataset mvtec \
             --data-dir ./mvtec-dataset/ \
             --model-size UNet_L \
-            --mask-random-ratio True \
             --object-category all  \
             --image-size 288 \
             --center-size 256 \
             --center-crop True \
-            --augmentation True \
-            --ckpt-every 20 
+            --augmentation True 
 ```
 
 ---
@@ -74,7 +72,7 @@ torchrun evaluation_DeCo_Diff.py \
 Once the model is trained, test its performance using the command below:
 
 ```bash
-python evaluation_DeCo_Diff.py \
+python train_DeCo_Diff.py \
             --dataset mvtec \
             --data-dir ./mvtec-dataset/ \
             --model-size UNet_L \
@@ -89,10 +87,10 @@ python evaluation_DeCo_Diff.py \
 
 ## 📦 Pretrained Weights
 
-For convenience, we provide pretrained weights for DeCo-Diff. These weights can be used for rapid inference and further experimentation:
+For convenience, we provide pretrained weights for DeCo-Diff (UNet_L). These weights can be used for rapid inference and further experimentation:
 
 - **MVTec-AD Pretrained Weights:**  
-  Download from [Google Drive](https://drive.google.com/file/d/1kWXXao57CzLDmatePAmMoTZG5YZsrVRl/view?usp=share_link) 
+  Download from [Google Drive](https://drive.google.com/file/d/1M-BQeZxyrXRR911O5Np5pLmd7Ev23EXy/view?usp=share_link) 
   
 - **VisA Pretrained Weights:**  
   Download from [Google Drive](https://drive.google.com/file/d/1uNE-Vtb7TPeuMkyepTbKFsxUy8472enx/view?usp=share_link) 
