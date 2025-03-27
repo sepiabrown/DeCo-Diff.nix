@@ -148,9 +148,9 @@ def calculate_anomaly_maps(x0_s, encoded_s,  image_samples_s, latent_samples_s, 
         
         final_anomaly = image_difference * latent_difference
         final_anomaly = np.sqrt(final_anomaly)
-        final_anomaly = smooth_mask(final_anomaly, sigma=3)
+        final_anomaly = smooth_mask(final_anomaly, sigma=1)
         final_anomaly2 = 1/2*image_difference + 1/2*latent_difference
-        final_anomaly2 = smooth_mask(final_anomaly2, sigma=3)
+        final_anomaly2 = smooth_mask(final_anomaly2, sigma=1)
         pred_geometric.append(final_anomaly)
         pred_aritmetic.append(final_anomaly2)
             
