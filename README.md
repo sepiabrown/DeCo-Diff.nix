@@ -119,7 +119,7 @@ Below are some sample outputs showcasing the performance of DeCo-Diff on real da
 
 ## 📚 Citation & Reference
 
-If you find MAD-AD useful in your research, please cite our work:
+If you find DeCo-Diff useful in your research, please cite our work:
 
 ```bibtex
 @article{beizaee2025correcting,
