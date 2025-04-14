@@ -51,20 +51,20 @@ class VISADataset(Dataset):
 
         if self.object_class == 'all':
             if mode=='train':
-                df = pd.read_csv(os.path.join(root_dir, '1cls.csv')).query(f'split=="{mode}"').reset_index(drop=True)
+                df = pd.read_csv(os.path.join('.', 'splits', 'visa-split.csv')).query(f'split=="{mode}"').reset_index(drop=True)
             else:
                 if normal:
-                    df = pd.read_csv(os.path.join(root_dir, '1cls.csv')).query(f'split=="test"').query('label=="normal"').reset_index(drop=True)
+                    df = pd.read_csv(os.path.join('.', 'splits', 'visa-split.csv')).query(f'split=="test"').query('label=="normal"').reset_index(drop=True)
                 else:
-                    df = pd.read_csv(os.path.join(root_dir, '1cls.csv')).query(f'split=="test"').reset_index(drop=True)
+                    df = pd.read_csv(os.path.join('.', 'splits', 'visa-split.csv')).query(f'split=="test"').reset_index(drop=True)
         else:
             if mode=='train':
-                df = pd.read_csv(os.path.join(root_dir, '1cls.csv')).query(f'split=="{mode}"').query(f'object=="{self.object_class}"').reset_index(drop=True)
+                df = pd.read_csv(os.path.join('.', 'splits', 'visa-split.csv')).query(f'split=="{mode}"').query(f'object=="{self.object_class}"').reset_index(drop=True)
             else:
                 if normal:
-                    df = pd.read_csv(os.path.join(root_dir, '1cls.csv')).query(f'split=="test"').query('label=="normal"').query(f'object=="{self.object_class}"').reset_index(drop=True)
+                    df = pd.read_csv(os.path.join('.', 'splits', 'visa-split.csv')).query(f'split=="test"').query('label=="normal"').query(f'object=="{self.object_class}"').reset_index(drop=True)
                 else:
-                    df = pd.read_csv(os.path.join(root_dir, '1cls.csv')).query(f'split=="test"').query(f'object=="{self.object_class}"').reset_index(drop=True) 
+                    df = pd.read_csv(os.path.join('.', 'splits', 'visa-split.csv')).query(f'split=="test"').query(f'object=="{self.object_class}"').reset_index(drop=True) 
         self.images = []
         self.segs = []
         self.object_classes = []

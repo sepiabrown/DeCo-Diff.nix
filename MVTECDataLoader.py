@@ -52,7 +52,7 @@ class MVTECDataset(Dataset):
         self.object_class = object_class
         self.image_size = image_size
         
-        df = pd.read_csv(os.path.join(rootdir, 'split.csv'))
+        df = pd.read_csv(os.path.join('.', 'splits', 'mvtec-split.csv'))
         if object_class == 'all':
             df = df.query(f'split=="{mode}"')    
         else:
