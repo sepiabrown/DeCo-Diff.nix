@@ -161,6 +161,7 @@ cython_debug/
 
 .DS_Store
 .idea
+.direnv
 
 # files specific to my projects
 /data

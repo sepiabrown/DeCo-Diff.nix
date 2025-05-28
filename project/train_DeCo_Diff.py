@@ -23,6 +23,7 @@ from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 from MVTECDataLoader import MVTECDataset
 from VISADataLoader import VISADataset
+from PCBDataLoader import PCBDataset
 from scipy.ndimage import gaussian_filter
 from transformers import get_cosine_schedule_with_warmup
 
@@ -174,10 +175,12 @@ def _main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup DDP:
+    local_rank = int(os.environ['LOCAL_RANK'])
     dist.init_process_group("nccl")
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
     device = rank % torch.cuda.device_count()
+    torch_device = torch.device(f'cuda:{rank}')
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
@@ -191,6 +194,8 @@ def _main(args):
             json.dump(args.__dict__, f, indent=2)
         experiment_index = len(glob(f"{args.results_dir}/*"))
         experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{args.model_size.replace('/', '-')}"  # Create an experiment folder
+        if args.resume_dir:
+            experiment_dir = args.resume_dir
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
@@ -204,15 +209,15 @@ def _main(args):
     model = UNET_models[args.model_size](latent_size=latent_size)
         
 
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+    ema = deepcopy(model).to(torch_device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
-    model = DDP(model.to(device), device_ids=[rank])
+
+    model = DDP(model.to(torch_device), device_ids=[rank])
     diffusion = create_diffusion(timestep_respacing="ddim10", predict_deviation=True, predict_xstart=False, sigma_small=False)  # default: 1000 steps, linear noise schedule
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae_type}").to(device)
+    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae_type}").to(torch_device)
     vae.eval()
     logger.info(f"Number of Parameters: {sum(p.numel() for p in model.parameters()):}")
-
-
+    
     # Setup data:
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -224,12 +229,14 @@ def _main(args):
         dataset = MVTECDataset('train', object_class=args.object_category, rootdir=args.data_dir, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
     elif args.dataset=='visa':
         dataset = VISADataset('train', object_class=args.object_category, rootdir=args.data_dir, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
-       
+    elif args.dataset=='pcb':
+        dataset = PCBDataset('train', object_class=args.object_category, rootdir=args.data_dir, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
+
     batch_size = args.global_batch_size // dist.get_world_size()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=False)
     accumulation_steps = 1
 
-        
+
     logger.info(f"Dataset contains {len(dataset):,} training images")
 
     adjusted_epochs = args.epochs
@@ -248,6 +255,28 @@ def _main(args):
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
         
+    start_epoch = 0
+    if args.resume_dir:
+        last_ckpt = os.path.join(
+            args.resume_dir, "checkpoints", "last.pt"
+        )
+        if os.path.isfile(last_ckpt):
+            if rank == 0:
+                logger.info(f"Found checkpoint at {last_ckpt!r}, resuming…")
+            dist.barrier()
+            ckpt = torch.load(last_ckpt, map_location=torch_device)
+            model.module.load_state_dict(ckpt["model"])
+            opt.load_state_dict(ckpt["opt"])
+            scheduler.load_state_dict(ckpt["scheduler"])
+            start_epoch = ckpt.get("epoch", 0) + 1
+            dist.barrier()
+        else:
+            if rank == 0:
+                logger.warning(
+                    f"No checkpoint found at {last_ckpt!r}; starting from scratch."
+                )
+            dist.barrier()
+            start_epoch = 0
 
     # Prepare models for training:
     update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
@@ -260,19 +289,21 @@ def _main(args):
     log_steps = 0
     running_loss = 0
     running_mse = 0
+    best_loss = float("inf")
     start_time = time()
 
     logger.info(f"Training for {adjusted_epochs} epochs...")
-    
-    for epoch in range(adjusted_epochs):
+    for epoch in range(start_epoch, adjusted_epochs):
         logger.info(f"Beginning epoch {epoch}...")
         for ii, (x, _, y) in enumerate(loader):
-            x = x.to(device)
+            x = x.to(torch_device)
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
- 
+
+            if args.actual_image_size == 128:
+                mask_patch_size = np.random.choice([1,2,4], 1, p=[0.443, 0.333, 0.224]).item()
             if args.actual_image_size == 224:
                 mask_patch_size = np.random.choice([1,2,4,7], 1, p=[0.4, 0.3, 0.2, 0.1]).item()
             if args.actual_image_size == 256:
@@ -294,7 +325,7 @@ def _main(args):
             mask = random_mask(x, mask_ratios=mask_ratios, mask_patch_size=mask_patch_size)
     
             model_kwargs = {
-            'context' : torch.tensor(y).to(device).int().unsqueeze(1),
+            'context' : torch.tensor(y).to(torch_device).int().unsqueeze(1),
             'mask': mask
             }
             
@@ -331,6 +362,13 @@ def _main(args):
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 avg_mse = avg_mse.item() / dist.get_world_size()
                 logger.info(f"(category={args.object_category} step={train_steps:07d}) MSE Loss: {avg_mse:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                if rank == 0:
+                    if avg_loss < best_loss:
+                        best_loss = avg_loss
+                        torch.save(checkpoint, f"{checkpoint_dir}/best.pt")
+                        logger.info(f"Saved **best** checkpoint (loss={best_loss:.4f}) to {checkpoint_dir}/best.pt")
+                dist.barrier()
+
                 # Reset monitoring variables:
                 running_loss = 0
                 running_mse = 0
@@ -339,20 +377,25 @@ def _main(args):
                 start_time = time()
 
         scheduler.step()
-        if epoch % args.ckpt_every == 0 and epoch>0:
-            if rank == 0: 
-                # Save checkpoint:
-                checkpoint = {
-                    "model": model.module.state_dict(),
-                    # "ema": ema.state_dict(),
-                    # "opt": opt.state_dict(),
-                    "args": args
-                }
-                checkpoint_path = f"{checkpoint_dir}/last.pt"
+        if rank == 0:
+            # Save checkpoint:
+            checkpoint = {
+                "model": model.module.state_dict(),
+                "opt": opt.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "epoch": epoch,
+                "args": args.__dict__
+                ## "ema": ema.state_dict(),
+                ## "opt": opt.state_dict(),
+                #"args": args
+            }
+            torch.save(checkpoint, f"{checkpoint_dir}/last.pt")
+            if epoch % args.ckpt_every == 0 and epoch>0:
+                checkpoint_path = f"{checkpoint_dir}/{epoch}.pt"
                 torch.save(checkpoint, checkpoint_path)
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
 
-            dist.barrier()
+        dist.barrier()
             
 
     logger.info("Done!")
@@ -361,7 +404,7 @@ def _main(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, choices=['mvtec','visa'], default="mvtec")
+    parser.add_argument("--dataset", type=str, choices=['mvtec','visa','pcb'], default="mvtec")
     parser.add_argument("--data-dir", type=str, default='./mvtec-dataset/')
     parser.add_argument("--model-size", type=str, choices=['UNet_XS','UNet_S', 'UNet_M', 'UNet_L', 'UNet_XL'], default='UNet_XS')
     parser.add_argument("--image-size", type=int, default= 288 )
@@ -383,13 +426,20 @@ def main():
     parser.add_argument("--mask-random-ratio", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
     parser.add_argument("--from-scratch", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
     parser.add_argument("--augmentation", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
-    
+    parser.add_argument(
+        "--resume-dir",
+        type=str,
+        default=None,
+        help="Dir to a checkpoint/last.pt file to resume training from"
+    )
     
     args = parser.parse_args()
     if args.dataset == 'mvtec':
         args.num_classes = 15
     elif args.dataset == 'visa':
         args.num_classes = 12
+    elif args.dataset == 'pcb':
+        args.num_classes = 1
     args.results_dir = f"./DeCo-Diff_{args.dataset}_{args.object_category}_{args.model_size}_{args.center_size}"
     if args.center_crop:
         args.results_dir += "_CenterCrop"
