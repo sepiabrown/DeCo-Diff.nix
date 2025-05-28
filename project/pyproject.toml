@@ -1,0 +1,45 @@
+[project]
+name = "deco-diff"
+version = "0.0.1"  # match the one from setup.py if this is the source of truth
+description = "A PyTorch Implementation for Multi-Class Unsupervised Anomaly Detection"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "accelerate==0.33.0",
+  "albumentations==1.4.21",
+  "anomalib==1.1.0",
+  "diffusers==0.29.2",
+  "einops==0.8.0",
+  "huggingface-hub==0.24.5",
+  "kornia==0.7.3",
+  "numpy==1.26.4",
+  "scikit_image==0.24.0",
+  "scikit_learn==1.5.0",
+  "scipy==1.14.1",
+  "taming-transformers==0.0.1",
+  "timm==1.0.8",
+  "torch==2.3.1",
+  "torchaudio==2.3.1",
+  "torchmetrics==1.4.0.post0",
+  "torchvision==0.18.1",
+  "tqdm==4.66.4",
+  "transformers==4.46.1",
+  "pandas",
+]
+
+[project.scripts]
+train_deco_diff = "train_DeCo_Diff:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6.7",
+    "jupyter",
+    "ipykernel",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]

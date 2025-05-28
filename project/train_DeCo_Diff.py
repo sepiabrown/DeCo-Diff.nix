@@ -169,7 +169,7 @@ def random_mask(x : torch.Tensor, mask_ratios, mask_patch_size=1):
 #                                  Training Loop                                #
 #################################################################################
 
-def main(args):
+def _main(args):
     
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
@@ -359,7 +359,7 @@ def main(args):
     cleanup()
     
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, choices=['mvtec','visa'], default="mvtec")
     parser.add_argument("--data-dir", type=str, default='./mvtec-dataset/')
@@ -397,4 +397,7 @@ if __name__ == "__main__":
     else:
         args.actual_image_size = args.image_size
         
-    main(args)
+    _main(args)
+
+if __name__ == "__main__":
+    main()
