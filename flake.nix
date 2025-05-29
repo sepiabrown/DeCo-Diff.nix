@@ -75,6 +75,15 @@
           ;
       };
 
+      apps.x86_64-linux = import ./apps {
+        inherit
+          self
+          pkgs
+          workspace
+          pythonSet
+          ;
+      };
+
       formatter.x86_64-linux = pkgs.nixfmt-tree;
 
     };

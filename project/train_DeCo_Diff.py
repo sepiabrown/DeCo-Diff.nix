@@ -365,6 +365,13 @@ def _main(args):
                 if rank == 0:
                     if avg_loss < best_loss:
                         best_loss = avg_loss
+                        checkpoint = {
+                            "model": model.module.state_dict(),
+                            "opt": opt.state_dict(),
+                            "scheduler": scheduler.state_dict(),
+                            "epoch": epoch,
+                            "args": args.__dict__
+                        }
                         torch.save(checkpoint, f"{checkpoint_dir}/best.pt")
                         logger.info(f"Saved **best** checkpoint (loss={best_loss:.4f}) to {checkpoint_dir}/best.pt")
                 dist.barrier()
