@@ -1,8 +1,7 @@
-
 import torch
 from skimage.transform import resize
 from diffusion import create_diffusion
-from diffusers.models import AutoencoderKL
+from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from models import UNET_models
 import argparse
 import numpy as np
@@ -16,6 +15,8 @@ from glob import glob
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from MVTECDataLoader import MVTECDataset
+from VISADataLoader import VISADataset
+from PCBDataLoader import PCBDataset
 from scipy.ndimage import gaussian_filter
 
 from anomalib import metrics
@@ -24,6 +25,15 @@ from numpy import ndarray
 import pandas as pd
 from skimage import measure
 from sklearn.metrics import auc
+
+import os
+import sys
+import torch
+from torchmetrics.functional.image import learned_perceptual_image_patch_similarity, structural_similarity_index_measure
+from dataclasses import dataclass
+from typing import List
+import matplotlib.pyplot as plt
+from collections import defaultdict
 
 def compute_pro(masks: ndarray, amaps: ndarray, num_th: int = 200) -> None:
     """Compute the area under the curve of per-region overlaping (PRO) and 0 to 0.3 FPR
@@ -202,8 +212,6 @@ def evaluation(args):
     print('=='*30)
 
     for category in args.categories:
-
-
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
@@ -217,10 +225,16 @@ def evaluation(args):
         image_samples_s = []
         latent_samples_s = []
         x0_s = []
+        x_s = []
         segmentation_s = []
         
-    
-        test_dataset = MVTECDataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
+
+        if args.dataset == 'mvtec':
+            test_dataset = MVTECDataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
+        elif args.dataset == 'visa':
+            test_dataset = VISADataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
+        elif args.dataset == 'pcb':
+            test_dataset = PCBDataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
         test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
         
         for ii, (x, seg, object_cls) in enumerate(test_loader):
@@ -246,15 +260,99 @@ def evaluation(args):
             image_samples_s += [_image_samples.unsqueeze(0) for _image_samples in image_samples]
             latent_samples_s += [_latent_samples.unsqueeze(0) for _latent_samples in latent_samples]
             x0_s += [_x0.unsqueeze(0) for _x0 in x0]
+            x_s += [_x.unsqueeze(0) for _x in x]
 
-        print(category)
-        anomaly_maps = calculate_anomaly_maps(x0_s, encoded_s,  image_samples_s, latent_samples_s, center_size=args.center_size)
-        evaluate_anomaly_maps(anomaly_maps, np.stack(segmentation_s, axis=0))
+        records = [
+            ImagePairRecord(
+                split="test",
+                original_image=torch.clamp(img1, -1.0, 1.0).cpu().numpy() if hasattr(img1, 'cpu') else np.clip(img1, -1.0, 1.0),
+                reconstructed_image=torch.clamp(img2, -1.0, 1.0).cpu().numpy() if hasattr(img2, 'cpu') else np.clip(img2, -1.0, 1.0)
+            )
+            for img1, img2 in zip(x_s, image_samples_s)
+        ]
+
+        plot_distribution(records, device=device)
+
+        #anomaly_maps = calculate_anomaly_maps(x0_s, encoded_s,  image_samples_s, latent_samples_s, center_size=args.center_size)
+        
+        #evaluate_anomaly_maps(anomaly_maps, np.stack(segmentation_s, axis=0))
         print('=='*30)  
 
+def cal_similarity(img1, img2, device=None, similarity_type='lpips'):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def to_tensor(img):
+        if isinstance(img, np.ndarray):
+            img = torch.from_numpy(img)
+        if img.dtype != torch.float32:
+            img = img.float()
+        if img.ndim == 3 and img.shape[-1] == 3:
+            img = img.permute(2, 0, 1)
+        if img.ndim == 4 and img.shape[-1] == 3:
+            img = img.permute(0, 3, 1, 2)
+        if img.ndim == 2:
+            img = img.unsqueeze(0)
+        if img.ndim == 3:
+            img = img.unsqueeze(0)
+        return img
+    img1 = to_tensor(img1)
+    img2 = to_tensor(img2)
+    img1 = img1.to(device)
+    img2 = img2.to(device)
+    
+    if similarity_type == 'lpips':
+        sim = learned_perceptual_image_patch_similarity(img1, img2, net_type='alex')
+    elif similarity_type == 'ssim':
+        sim = structural_similarity_index_measure(img1, img2)
+    else:
+        raise ValueError(f"Invalid similarity type: {similarity_type}")
+    return sim.cpu().item()
+
+@dataclass(frozen=True)
+class ImagePairRecord:
+    split: str  # 'train', 'val', or 'test'
+    original_image: object  # np.ndarray or torch.Tensor
+    reconstructed_image: object  # np.ndarray or torch.Tensor
+
+def plot_distribution(records: List[ImagePairRecord], device=None):
+    if not isinstance(records, list):
+        raise TypeError("records must be a list of ImagePairRecord")
+    if not all(isinstance(rec, ImagePairRecord) for rec in records):
+        raise TypeError("All elements in records must be of type ImagePairRecord")
+
+    splits = defaultdict(list)
+    for rec in records:
+        splits[rec.split].append((rec.original_image, rec.reconstructed_image))
+    plt.figure(figsize=(10, 6))
+    for split, pairs in splits.items():
+        scores = [cal_similarity(orig, recon, device=device) for orig, recon in pairs]
+        plt.hist(scores, bins=30, alpha=0.5, label=split, density=True)
+    plt.xlabel('LPIPS Similarity')
+    plt.ylabel('Density')
+    plt.title('Distribution of LPIPS Similarity Scores by Split')
+    plt.legend()
+    plt.show()
+
 if __name__ == "__main__":
+    REPO_ROOT = os.environ.get('REPO_ROOT', None)
+    if REPO_ROOT is not None:
+        os.chdir(os.path.dirname(REPO_ROOT))
+        print("Current path:", os.getcwd())
+        if "ipykernel_launcher" in sys.argv[0]:
+            sys.argv = [
+                "" ,
+                "--dataset", "pcb",
+                "--data-dir", os.path.expanduser("~/dataset/PCB/Huang/PCB_DATASET/PCB_gray_128"),
+                "--model-size", "UNet_L",
+                "--object-category", "all",
+                "--anomaly-class", "all",
+                "--image-size", "128",
+                "--center-size", "128",
+                "--center-crop", "False",
+                "--pretrained", "DeCo-Diff_pcb_all_UNet_L_128_CenterCrop/001-UNet_L/checkpoints/best.pt",
+            ]
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, choices=['mvtec','visa'], default="mvtec")
+    parser.add_argument("--dataset", type=str, choices=['mvtec','visa','pcb'], default="mvtec")
     parser.add_argument("--data-dir", type=str, default='./mvtec-dataset/')
     parser.add_argument("--model-size", type=str, choices=['UNet_XS','UNet_S', 'UNet_M', 'UNet_L', 'UNet_XL'], default='UNet_L')
     parser.add_argument("--image-size", type=int, default= 288)
@@ -266,13 +364,15 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained", type=str, default='.')
     parser.add_argument("--anomaly-class", type=str, default='all')
     parser.add_argument("--reverse-steps", type=int, default=5)
-    
+
     
     args = parser.parse_args()
     if args.dataset == 'mvtec':
         args.num_classes = 15
     elif args.dataset == 'visa':
         args.num_classes = 12
+    elif args.dataset == 'pcb':
+        args.num_classes = 1
     args.results_dir = f"./DeCo-Diff_{args.dataset}_{args.object_category}_{args.model_size}_{args.center_size}"
     if args.center_crop:
         args.results_dir += "_CenterCrop"
@@ -313,7 +413,16 @@ if __name__ == "__main__":
             "pcb3",
             "pipe_fryum"
             ]
+    elif args.object_category=='all' and args.dataset=='pcb':
+        args.categories=[
+            "pcb",
+            ]
     else:
         args.categories = [args.object_category]
         
     evaluation(args)
+
+# Below are cell makrkers used in VSCode
+# %%
+#
+# %%
