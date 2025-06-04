@@ -25,6 +25,7 @@ dependencies = [
   "tqdm==4.66.4",
   "transformers==4.46.1",
   "pandas",
+  "matplotlib",
 ]
 
 [project.scripts]
