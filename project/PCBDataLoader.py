@@ -47,7 +47,7 @@ class PCBDataset(Dataset):
             
         if anomaly_class=='good' or self.normal:
             df = df.query(f'category=="good"') 
-        elif anomaly_class=='all': 
+        elif anomaly_class=='all':
             pass
         else:
             df = df.query(f'category=="{anomaly_class}"')    
@@ -60,12 +60,14 @@ class PCBDataset(Dataset):
         self.segs = []
         self.object_classes = []
         self.image_paths = []
+        self.anomaly_classes = []
         for i, row in df.iterrows():
             data_path = os.path.join(rootdir, row['image'])
             img = np.array(Image.open(data_path).convert('RGB').resize((self.image_size, self.image_size))).astype(np.uint8)
             self.image_paths.append(data_path)
             self.images.append(img)
             self.object_classes.append(object_cls_dict[row['object']])
+            self.anomaly_classes.append(row['category'])
             if row['category']!='good':
                 seg_path = os.path.join(rootdir, row['mask'])
                 seg = (np.array(Image.open(seg_path).convert('L').resize((self.image_size, self.image_size)))>0).astype(np.uint8)
@@ -107,4 +109,4 @@ class PCBDataset(Dataset):
         else:
             img = self.transform_volume(img)
             img = (img-0.5)/0.5
-        return img, seg.astype(np.float32), int(y), self.image_paths[index]
+        return img, seg.astype(np.float32), int(y), self.image_paths[index], self.anomaly_classes[index]
