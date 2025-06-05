@@ -26,10 +26,12 @@ dependencies = [
   "transformers==4.46.1",
   "pandas",
   "matplotlib",
+  "openpyxl"
 ]
 
 [project.scripts]
 train_deco_diff = "train_DeCo_Diff:main"
+evaluation_deco_diff = "evaluation_DeCo_Diff:main"
 
 [build-system]
 requires = ["hatchling"]
