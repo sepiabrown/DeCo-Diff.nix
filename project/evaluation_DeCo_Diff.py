@@ -249,14 +249,11 @@ def evaluation(args):
             test_dataset = VISADataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
         elif args.dataset == 'pcb':
             train_dataset = PCBDataset('train', object_class=category, rootdir=args.data_dir, transform=transform, normal=True, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
-            val_dataset = PCBDataset('val', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
             test_dataset = PCBDataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
         train_loader = DataLoader(train_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
-        val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
         test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
 
         records += process_split(train_loader, 'train', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
-        records += process_split(val_loader, 'val', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
         records += process_split(test_loader, 'test', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
 
         plot_distribution(records, device=device)
@@ -337,35 +334,39 @@ def cal_similarity(img1, img2, device=None, similarity_type='lpips'):
 @dataclass(frozen=True)
 class Images:
     split: str  # 'train', 'val', or 'test'
+    image_path: str
     orig: object
     encoded: object
     latent: object
     encoded_recon: object
-    dod_recon: object  # np.ndarray or torch.Tensor
-    orig_dodrecon_diff: object  # np.ndarray or torch.Tensor
-    orig_dodrecon_binary: object  # np.ndarray or torch.Tensor
-    orig_encodedrecon_diff: object  # np.ndarray or torch.Tensor
-    orig_encodedrecon_binary: object  # np.ndarray or torch.Tensor
-    encoded_latent_diff: object  # np.ndarray or torch.Tensor
-    encoded_latent_binary: object  # np.ndarray or torch.Tensor
-    anomaly_map: object  # np.ndarray or torch.Tensor
-    anomaly_map_geometric: object  # np.ndarray or torch.Tensor
+    dod_recon: object
+    orig_dodrecon_diff: object
+    orig_dodrecon_binary: object
+    orig_encodedrecon_diff: object
+    orig_encodedrecon_binary: object
+    encodedrecon_dodrecon_diff: object
+    encodedrecon_dodrecon_binary: object
+    encoded_latent_diff: object
+    encoded_latent_binary: object
+    anomaly_map: object
+    anomaly_map_geometric: object
 
 @dataclass(frozen=True)
 class ImagesWithMetrics(Images):
-    lpips: float  # LPIPS similarity score
-    ssim: float   # SSIM similarity score
-    mse: float   # MSE similarity score
+    lpips: float
+    ssim: float
+    mse: float
 
     @classmethod
     def from_images(cls, record: Images, device=None):
-        # Calculate similarity metrics
+
         lpips_score = cal_similarity(record.orig, record.dod_recon, device=device, similarity_type='lpips')
         ssim_score = cal_similarity(record.orig, record.dod_recon, device=device, similarity_type='ssim')
         mse_score = cal_similarity(record.orig, record.dod_recon, device=device, similarity_type='mse')
-        # Create new instance with all fields from parent plus metrics
+
         return cls(
             split=record.split,
+            image_path=record.image_path,
             orig=record.orig,
             encoded=record.encoded,
             latent=record.latent,
@@ -375,6 +376,8 @@ class ImagesWithMetrics(Images):
             orig_dodrecon_binary=record.orig_dodrecon_binary,
             orig_encodedrecon_diff=record.orig_encodedrecon_diff,
             orig_encodedrecon_binary=record.orig_encodedrecon_binary,
+            encodedrecon_dodrecon_diff=record.encodedrecon_dodrecon_diff,
+            encodedrecon_dodrecon_binary=record.encodedrecon_dodrecon_binary,
             encoded_latent_diff=record.encoded_latent_diff,
             encoded_latent_binary=record.encoded_latent_binary,
             anomaly_map=record.anomaly_map,
@@ -420,11 +423,13 @@ def process_split(dataloader, split, diffusion, model, vae, reverse_steps, cente
     orig_dodrecon_binary_s = []
     orig_encodedrecon_diff_s = []
     orig_encodedrecon_binary_s = []
+    encodedrecon_dodrecon_diff_s = []
+    encodedrecon_dodrecon_binary_s = []
     encoded_latent_diff_s = []
     encoded_latent_binary_s = []
     anomaly_map_s = []
     anomaly_map_geometric_s = []
-    for ii, (x, seg, object_cls) in enumerate(tqdm(dataloader, desc=f"{split} split")):
+    for ii, (x, seg, object_cls, image_paths) in enumerate(tqdm(dataloader, desc=f"{split} split")):
         if ii >= batch_num:
             break
         with torch.no_grad():
@@ -457,6 +462,11 @@ def process_split(dataloader, split, diffusion, model, vae, reverse_steps, cente
             orig_encodedrecon_threshold = 10 / 255
             orig_encodedrecon_binary = (orig_encodedrecon_abs_diff > orig_encodedrecon_threshold).float() * 2 - 1
 
+            encodedrecon_dodrecon_diff = (x0 - image_samples).mean(dim=1, keepdim=True) / 2
+            encodedrecon_dodrecon_abs_diff = torch.abs(encodedrecon_dodrecon_diff)
+            encodedrecon_dodrecon_threshold = 10 / 255
+            encodedrecon_dodrecon_binary = (encodedrecon_dodrecon_abs_diff > encodedrecon_dodrecon_threshold).float() * 2 - 1
+
             encoded_latent_diff = (latent_samples - encoded).max(dim=1, keepdim=True).values
             encoded_latent_abs_diff = torch.abs(encoded_latent_diff)
             encoded_latent_threshold = 10 / 255
@@ -478,7 +488,8 @@ def process_split(dataloader, split, diffusion, model, vae, reverse_steps, cente
         orig_dodrecon_binary_s += [_orig_dodrecon_binary.unsqueeze(0) for _orig_dodrecon_binary in orig_dodrecon_binary]
         orig_encodedrecon_diff_s += [_orig_encodedrecon_diff.unsqueeze(0) for _orig_encodedrecon_diff in orig_encodedrecon_diff]
         orig_encodedrecon_binary_s += [_orig_encodedrecon_binary.unsqueeze(0) for _orig_encodedrecon_binary in orig_encodedrecon_binary]
-        
+        encodedrecon_dodrecon_diff_s += [_encodedrecon_dodrecon_diff.unsqueeze(0) for _encodedrecon_dodrecon_diff in encodedrecon_dodrecon_diff]
+        encodedrecon_dodrecon_binary_s += [_encodedrecon_dodrecon_binary.unsqueeze(0) for _encodedrecon_dodrecon_binary in encodedrecon_dodrecon_binary]
 
         encoded_latent_diff_s += [_encoded_latent_diff.unsqueeze(0) for _encoded_latent_diff in encoded_latent_diff]
         encoded_latent_binary_s += [_encoded_latent_binary.unsqueeze(0) for _encoded_latent_binary in encoded_latent_binary]
@@ -489,6 +500,7 @@ def process_split(dataloader, split, diffusion, model, vae, reverse_steps, cente
     return [
             ImagesWithMetrics.from_images(Images(
                 split=split,
+                image_path=image_path,
                 orig=img1.cpu().numpy() if hasattr(img1, 'cpu') else img1,
                 encoded=img2.cpu().numpy() if hasattr(img2, 'cpu') else img2,
                 latent=img3.cpu().numpy() if hasattr(img3, 'cpu') else img3,
@@ -498,13 +510,15 @@ def process_split(dataloader, split, diffusion, model, vae, reverse_steps, cente
                 orig_dodrecon_binary=img7.cpu().numpy() if hasattr(img7, 'cpu') else img7,
                 orig_encodedrecon_diff=img8.cpu().numpy() if hasattr(img8, 'cpu') else img8,
                 orig_encodedrecon_binary=img9.cpu().numpy() if hasattr(img9, 'cpu') else img9,
-                encoded_latent_diff=img10.cpu().numpy() if hasattr(img10, 'cpu') else img10,
-                encoded_latent_binary=img11.cpu().numpy() if hasattr(img11, 'cpu') else img11,
-                anomaly_map=img12.cpu().numpy() if hasattr(img12, 'cpu') else img12,
-                anomaly_map_geometric=img13.cpu().numpy() if hasattr(img13, 'cpu') else img13,
+                encodedrecon_dodrecon_diff=img10.cpu().numpy() if hasattr(img10, 'cpu') else img10,
+                encodedrecon_dodrecon_binary=img11.cpu().numpy() if hasattr(img11, 'cpu') else img11,
+                encoded_latent_diff=img12.cpu().numpy() if hasattr(img12, 'cpu') else img12,
+                encoded_latent_binary=img13.cpu().numpy() if hasattr(img13, 'cpu') else img13,
+                anomaly_map=img14.cpu().numpy() if hasattr(img14, 'cpu') else img14,
+                anomaly_map_geometric=img15.cpu().numpy() if hasattr(img15, 'cpu') else img15,
             ))
-            for img1, img2, img3, img4, img5, img6, img7, img8, img9, img10, img11, img12, img13 in 
-            zip(x_s, encoded_s, latent_samples_s, x0_s, image_samples_s, orig_dodrecon_diff_s, orig_dodrecon_binary_s, orig_encodedrecon_diff_s, orig_encodedrecon_binary_s, encoded_latent_diff_s, encoded_latent_binary_s, anomaly_map_s, anomaly_map_geometric_s)
+            for image_path, img1, img2, img3, img4, img5, img6, img7, img8, img9, img10, img11, img12, img13, img14, img15 in 
+            zip(image_paths, x_s, encoded_s, latent_samples_s, x0_s, image_samples_s, orig_dodrecon_diff_s, orig_dodrecon_binary_s, orig_encodedrecon_diff_s, orig_encodedrecon_binary_s, encodedrecon_dodrecon_diff_s, encodedrecon_dodrecon_binary_s, encoded_latent_diff_s, encoded_latent_binary_s, anomaly_map_s, anomaly_map_geometric_s)
         ]
 
 
@@ -513,9 +527,9 @@ def make_excel(records: List[ImagesWithMetrics], image_size, save_dir="report", 
         os.makedirs(save_dir)
 
     # Fields to export as images
-    image_fields = ["orig", "dod_recon", "orig_dodrecon_diff", "orig_dodrecon_binary", "encoded_recon", "orig_encodedrecon_diff", "orig_encodedrecon_binary"]
+    image_fields = ["orig", "dod_recon", "orig_dodrecon_diff", "orig_dodrecon_binary", "encoded_recon", "orig_encodedrecon_diff", "orig_encodedrecon_binary", "encodedrecon_dodrecon_diff", "encodedrecon_dodrecon_binary"]
     metric_fields = ["lpips", "ssim", "mse"]
-    other_fields = ["split"]
+    other_fields = ["split", "image_path"]
 
     wb = Workbook()
     ws = wb.active

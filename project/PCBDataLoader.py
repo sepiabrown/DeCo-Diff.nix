@@ -59,10 +59,11 @@ class PCBDataset(Dataset):
         self.images = []
         self.segs = []
         self.object_classes = []
+        self.image_paths = []
         for i, row in df.iterrows():
             data_path = os.path.join(rootdir, row['image'])
             img = np.array(Image.open(data_path).convert('RGB').resize((self.image_size, self.image_size))).astype(np.uint8)
-            
+            self.image_paths.append(data_path)
             self.images.append(img)
             self.object_classes.append(object_cls_dict[row['object']])
             if row['category']!='good':
@@ -93,6 +94,7 @@ class PCBDataset(Dataset):
     def __getitem__(self, index):
         img = self.images[index].astype(np.uint8)
         seg = self.segs[index].astype(np.int32)
+
         if self.center_crop:
             augmented = self.aug(image=img, mask=seg)
             img = augmented['image']
@@ -105,4 +107,4 @@ class PCBDataset(Dataset):
         else:
             img = self.transform_volume(img)
             img = (img-0.5)/0.5
-        return img, seg.astype(np.float32), int(y)
+        return img, seg.astype(np.float32), int(y), self.image_paths[index]
