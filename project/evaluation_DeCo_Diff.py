@@ -1,5 +1,6 @@
 # %%
-from datetime import datetime, time
+from __future__ import annotations
+from datetime import datetime
 import torch
 from skimage.transform import resize
 from diffusion import create_diffusion
@@ -27,7 +28,6 @@ from sklearn.metrics import auc
 
 import os
 import sys
-import torch
 from torchmetrics.functional.image import learned_perceptual_image_patch_similarity, structural_similarity_index_measure
 from dataclasses import dataclass
 from typing import List
@@ -38,13 +38,302 @@ from tqdm import tqdm
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
-import tempfile
 from PIL import Image as PILImage
+from typing import Sequence
+
+from io import BytesIO
+from pathlib import Path
+import tempfile
+
 
 torch.set_grad_enabled(False)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 if device == "cpu":
     print("GPU not found. Using CPU instead.")
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_DIFF_SCALE = 2.0
+_THRESHOLD = 10.0 / 255.0
+_LATENT_SCALE = 0.18215
+
+# ────────────────────────────────────────────────────────────────────────────
+# Dataclasses
+# ────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class Images:
+    # meta
+    split: str
+    image_path: str
+    anomaly_class: str
+
+    # main images
+    orig: object
+    encoded: object
+    latent: object
+    encoded_recon: object
+    dod_recon: object
+
+    # diff / masks
+    orig_dodrecon_diff: object
+    orig_dodrecon_binary: object
+    orig_encodedrecon_diff: object
+    orig_encodedrecon_binary: object
+    encodedrecon_dodrecon_diff: object
+    encodedrecon_dodrecon_binary: object
+    encoded_latent_diff: object
+    encoded_latent_binary: object
+    anomaly_map_arithmetic: object
+    anomaly_map_geometric: object
+
+    # four grayscale latent slices
+    latent_ch0: object
+    latent_ch1: object
+    latent_ch2: object
+    latent_ch3: object
+
+
+@dataclass(frozen=True)
+class ImagesWithMetrics(Images):
+    lpips: float
+    ssim: float
+    mse: float
+
+    @classmethod
+    def from_images(cls, record: "Images", *, device=None):
+        lpips_score = cal_similarity(record.orig, record.dod_recon,
+                                     device=device, similarity_type="lpips")
+        ssim_score  = cal_similarity(record.orig, record.dod_recon,
+                                     device=device, similarity_type="ssim")
+        mse_score   = cal_similarity(record.orig, record.dod_recon,
+                                     device=device, similarity_type="mse")
+        return cls(**record.__dict__,
+                   lpips=lpips_score,
+                   ssim=ssim_score,
+                   mse=mse_score)
+
+@dataclass(frozen=True, slots=True)
+class _Col:
+    name: str   # attribute on ImagesWithMetrics
+    kind: str   # 'other' | 'image' | 'metric'
+
+_COLS: tuple[_Col, ...] = (
+    # metadata
+    _Col("split", "other"), _Col("image_path", "other"), _Col("anomaly_class", "other"),
+    # thumbnails
+    _Col("orig", "image"), _Col("dod_recon", "image"),
+    _Col("orig_dodrecon_diff", "image"), _Col("orig_dodrecon_binary", "image"),
+    _Col("encoded_recon", "image"), _Col("orig_encodedrecon_diff", "image"),
+    _Col("orig_encodedrecon_binary", "image"),
+    _Col("encodedrecon_dodrecon_diff", "image"), _Col("encodedrecon_dodrecon_binary", "image"),
+    # latent grayscale slices
+    _Col("latent_ch0", "image"), _Col("latent_ch1", "image"),
+    _Col("latent_ch2", "image"), _Col("latent_ch3", "image"),
+    # metrics
+    _Col("lpips", "metric"), _Col("ssim", "metric"), _Col("mse", "metric"),
+)
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+def _compute_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Return the mean channel‑wise difference *scaled* by ``_DIFF_SCALE``."""
+    return (a - b).mean(dim=1, keepdim=True) / _DIFF_SCALE
+
+
+def _binary_mask(diff: torch.Tensor, threshold: float = _THRESHOLD) -> torch.Tensor:
+    """Return a binary mask in ``{-1, 1}`` based on *absolute* diff magnitude."""
+    return (diff.abs() > threshold).float() * 2.0 - 1.0
+
+
+def _to_numpy(t: torch.Tensor) -> "Sequence | torch.Tensor":  # keep Images API compatibility
+    """Detach, move to CPU and convert to ``numpy`` if ``t`` is a tensor."""
+    return t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t
+
+def _tensor_to_xlimage(arr, size: int) -> XLImage:
+    if isinstance(arr, torch.Tensor):
+        arr = arr.detach().cpu().numpy()
+    arr = np.squeeze(arr)
+    if arr.ndim == 2:
+        arr = arr[..., None]
+    if arr.ndim == 3 and arr.shape[0] in (1, 3):
+        arr = np.transpose(arr, (1, 2, 0))
+    c = arr.shape[2]
+    if c == 1:
+        arr = np.repeat(arr, 3, axis=2)
+    elif c != 3:
+        raise ValueError(f"unsupported channels: {c}")
+    arr = ((np.clip(arr, -1, 1) + 1) / 2 * 255).astype(np.uint8)
+
+    buf = BytesIO()
+    PILImage.fromarray(arr, mode="RGB").save(buf, format="PNG")
+    buf.seek(0)
+    img = XLImage(buf)
+    img.width = img.height = size
+    return img
+
+def _write_row(ws, row_idx: int, rec, size: int):
+    scalars, embeds = [], []
+    for col_idx, col in enumerate(_COLS, 1):
+        val = getattr(rec, col.name)
+        if col.kind == "image":
+            embeds.append((col_idx, _tensor_to_xlimage(val, size)))
+            scalars.append("")
+        else:
+            scalars.append(val)
+    ws.append(scalars)
+    ws.row_dimensions[row_idx].height = size * 0.75
+    for col_idx, img in embeds:
+        ws.add_image(img, f"{get_column_letter(col_idx)}{row_idx}")
+
+# ---------------------------------------------------------------------------
+# Functions
+# ---------------------------------------------------------------------------
+
+def process_split(
+    dataloader,
+    split: str,
+    diffusion,
+    model,
+    vae,
+    reverse_steps: int,
+    center_size: int,
+    batch_num: int,
+    device: torch.device | None = None,
+) -> List[ImagesWithMetrics]:
+    """Run a forward‑&‑reverse pass on *one* dataset split and collect metrics.
+
+    Parameters
+    ----------
+    dataloader : torch.utils.data.DataLoader
+        Yields ``(x, seg, object_cls, image_paths, anomaly_classes)``.
+    split : str
+        Name of the split (e.g. ``"train"`` or ``"test"``).
+    diffusion, model, vae : nn.Module‑like
+        Components used for the DDIM deviation sampling pipeline.
+    reverse_steps : int
+        DDIM reverse steps.
+    center_size : int
+        Spatial size to which the latent anomaly map is resized.
+    batch_num : int
+        Maximum number of *mini‑batches* to process.
+    device : torch.device | None, default = ``cuda`` if available
+        Target device for all computations.
+
+    Returns
+    -------
+    List[ImagesWithMetrics]
+        One entry per *image* in the processed subset.
+    """
+
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    results: List[ImagesWithMetrics] = []
+
+    for idx, (x, seg, object_cls, image_paths, anomaly_classes) in enumerate(  # noqa: B905
+        tqdm(dataloader, desc=f"{split} split")
+    ):
+        if idx >= batch_num:
+            break
+
+        with torch.no_grad():
+            # -----------------------------------------------------------------
+            # Forward pass through VAE encoder (to latent space)
+            # -----------------------------------------------------------------
+            x = x.to(device)
+            object_cls = object_cls.to(device)
+
+            encoded = vae.encode(x).latent_dist.mean * _LATENT_SCALE
+
+            # -----------------------------------------------------------------
+            # Reverse DDIM sampling conditioned on encoder latents
+            # -----------------------------------------------------------------
+            model_kwargs = {"context": object_cls.unsqueeze(1), "mask": None}
+            latent_samples = diffusion.ddim_deviation_sample_loop(
+                model,
+                shape=encoded.shape,
+                noise=encoded,
+                clip_denoised=False,
+                start_t=reverse_steps,
+                model_kwargs=model_kwargs,
+                progress=False,
+                device=device,
+                eta=0.0,
+            )
+
+            # -----------------------------------------------------------------
+            # Reconstructions & other intermediate images
+            # -----------------------------------------------------------------
+            image_samples = vae.decode(latent_samples / _LATENT_SCALE).sample
+            x0 = vae.decode(encoded / _LATENT_SCALE).sample
+
+            # -----------------------------------------------------------------
+            # Difference / binary maps
+            # -----------------------------------------------------------------
+            orig_dodrecon_diff = _compute_diff(x, image_samples)
+            orig_encodedrecon_diff = _compute_diff(x, x0)
+            encodedrecon_dodrecon_diff = _compute_diff(x0, image_samples)
+
+            orig_dodrecon_binary = _binary_mask(orig_dodrecon_diff)
+            orig_encodedrecon_binary = _binary_mask(orig_encodedrecon_diff)
+            encodedrecon_dodrecon_binary = _binary_mask(encodedrecon_dodrecon_diff)
+
+            encoded_latent_diff = (latent_samples - encoded).max(dim=1, keepdim=True).values
+            encoded_latent_binary = _binary_mask(encoded_latent_diff)
+
+            encoded_latent_abs_diff_resized = F.interpolate(
+                encoded_latent_diff.abs(),
+                size=(center_size, center_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+            # -----------------------------------------------------------------
+            # Composite anomaly maps
+            # -----------------------------------------------------------------
+            anomaly_map_arithmetic = 0.5 * (orig_dodrecon_diff + encoded_latent_abs_diff_resized)
+            anomaly_map_geometric = orig_dodrecon_diff * encoded_latent_abs_diff_resized
+            lat_slices = [latent_samples[:, i:i+1] for i in range(4)]
+
+        # ---------------------------------------------------------------------
+        # Per‑sample aggregation (no unsqueeze gymnastics)
+        # ---------------------------------------------------------------------
+        batch_size = x.size(0)
+        for b in range(batch_size):
+            results.append(
+                ImagesWithMetrics.from_images(
+                    Images(
+                        split=split,
+                        image_path=image_paths[b],
+                        anomaly_class=anomaly_classes[b],
+                        orig=_to_numpy(x[b]),
+                        encoded=_to_numpy(encoded[b]),
+                        latent=_to_numpy(latent_samples[b]),
+                        encoded_recon=_to_numpy(x0[b]),
+                        dod_recon=_to_numpy(image_samples[b]),
+                        orig_dodrecon_diff=_to_numpy(orig_dodrecon_diff[b]),
+                        orig_dodrecon_binary=_to_numpy(orig_dodrecon_binary[b]),
+                        orig_encodedrecon_diff=_to_numpy(orig_encodedrecon_diff[b]),
+                        orig_encodedrecon_binary=_to_numpy(orig_encodedrecon_binary[b]),
+                        encodedrecon_dodrecon_diff=_to_numpy(encodedrecon_dodrecon_diff[b]),
+                        encodedrecon_dodrecon_binary=_to_numpy(encodedrecon_dodrecon_binary[b]),
+                        encoded_latent_diff=_to_numpy(encoded_latent_diff[b]),
+                        encoded_latent_binary=_to_numpy(encoded_latent_binary[b]),
+                        anomaly_map_arithmetic=_to_numpy(anomaly_map_arithmetic[b]),
+                        anomaly_map_geometric=_to_numpy(anomaly_map_geometric[b]),
+                        latent_ch0=_to_numpy(lat_slices[0][b]),
+                        latent_ch1=_to_numpy(lat_slices[1][b]),
+                        latent_ch2=_to_numpy(lat_slices[2][b]),
+                        latent_ch3=_to_numpy(lat_slices[3][b]),
+                    )
+                )
+            )
+
+    return results
 
 def compute_pro(masks: ndarray, amaps: ndarray, num_th: int = 200) -> None:
     """Compute the area under the curve of per-region overlaping (PRO) and 0 to 0.3 FPR
@@ -94,8 +383,6 @@ def compute_pro(masks: ndarray, amaps: ndarray, num_th: int = 200) -> None:
 
     pro_auc = auc(df["fpr"], df["pro"])
     return pro_auc
-
-
 
 
 def calculate_metrics(ground_truth, prediction):
@@ -253,9 +540,10 @@ def evaluation(args):
         train_loader = DataLoader(train_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
         test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
 
-        records += process_split(train_loader, 'train', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
-        records += process_split(test_loader, 'test', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
+        records_train = process_split(train_loader, 'train', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
+        records_test = process_split(test_loader, 'test', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
 
+        records = records_train + records_test
         plot_distribution(records, device=device)
         make_excel(records, args.image_size)
 
@@ -331,63 +619,6 @@ def cal_similarity(img1, img2, device=None, similarity_type='lpips'):
         raise ValueError(f"Invalid similarity type: {similarity_type}")
     return sim.cpu().item()
 
-@dataclass(frozen=True)
-class Images:
-    split: str  # 'train', 'val', or 'test'
-    image_path: str
-    anomaly_class: str
-    orig: object
-    encoded: object
-    latent: object
-    encoded_recon: object
-    dod_recon: object
-    orig_dodrecon_diff: object
-    orig_dodrecon_binary: object
-    orig_encodedrecon_diff: object
-    orig_encodedrecon_binary: object
-    encodedrecon_dodrecon_diff: object
-    encodedrecon_dodrecon_binary: object
-    encoded_latent_diff: object
-    encoded_latent_binary: object
-    anomaly_map_arithmetic: object
-    anomaly_map_geometric: object
-
-@dataclass(frozen=True)
-class ImagesWithMetrics(Images):
-    lpips: float
-    ssim: float
-    mse: float
-
-    @classmethod
-    def from_images(cls, record: Images, device=None):
-
-        lpips_score = cal_similarity(record.orig, record.dod_recon, device=device, similarity_type='lpips')
-        ssim_score = cal_similarity(record.orig, record.dod_recon, device=device, similarity_type='ssim')
-        mse_score = cal_similarity(record.orig, record.dod_recon, device=device, similarity_type='mse')
-
-        return cls(
-            split=record.split,
-            image_path=record.image_path,
-            anomaly_class=record.anomaly_class,
-            orig=record.orig,
-            encoded=record.encoded,
-            latent=record.latent,
-            encoded_recon=record.encoded_recon,
-            dod_recon=record.dod_recon,
-            orig_dodrecon_diff=record.orig_dodrecon_diff,
-            orig_dodrecon_binary=record.orig_dodrecon_binary,
-            orig_encodedrecon_diff=record.orig_encodedrecon_diff,
-            orig_encodedrecon_binary=record.orig_encodedrecon_binary,
-            encodedrecon_dodrecon_diff=record.encodedrecon_dodrecon_diff,
-            encodedrecon_dodrecon_binary=record.encodedrecon_dodrecon_binary,
-            encoded_latent_diff=record.encoded_latent_diff,
-            encoded_latent_binary=record.encoded_latent_binary,
-            anomaly_map_arithmetic=record.anomaly_map_arithmetic,
-            anomaly_map_geometric=record.anomaly_map_geometric,
-            lpips=lpips_score,
-            ssim=ssim_score,
-            mse=mse_score
-        )
 
 def plot_distribution(records: List[ImagesWithMetrics], device=None, save_dir='similarity_distribution', save_filename=datetime.now().strftime('%y%m%d_%H%M%S')):
     if not all(isinstance(rec, Images) for rec in records):
@@ -413,129 +644,38 @@ def plot_distribution(records: List[ImagesWithMetrics], device=None, save_dir='s
         plt.savefig(os.path.join(save_dir, f"{similarity_type}_{save_filename}.png"))
         plt.close()
 
-def process_split(dataloader, split, diffusion, model, vae, reverse_steps, center_size, batch_num, device=None):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    image_paths_s = []
-    anomaly_classes_s = []
-    encoded_s = []
-    image_samples_s = []
-    latent_samples_s = []
-    x0_s = []
-    x_s = []
-    orig_dodrecon_diff_s = []
-    orig_dodrecon_binary_s = []
-    orig_encodedrecon_diff_s = []
-    orig_encodedrecon_binary_s = []
-    encodedrecon_dodrecon_diff_s = []
-    encodedrecon_dodrecon_binary_s = []
-    encoded_latent_diff_s = []
-    encoded_latent_binary_s = []
-    anomaly_map_arithmetic_s = []
-    anomaly_map_geometric_s = []
-    for ii, (x, seg, object_cls, image_paths, anomaly_classes) in enumerate(tqdm(dataloader, desc=f"{split} split")):
-        if ii >= batch_num:
-            break
-        with torch.no_grad():
-            x = x.to(device)
-            object_cls = object_cls.to(device)
-            encoded = vae.encode(x).latent_dist.mean.mul_(0.18215)
 
-            model_kwargs = {
-            'context':object_cls.unsqueeze(1),
-            'mask': None
-            }
-            latent_samples = diffusion.ddim_deviation_sample_loop(
-                model, encoded.shape, noise = encoded, clip_denoised=False, 
-                start_t = reverse_steps,
-                model_kwargs=model_kwargs, progress=False, device=device,
-                eta = 0
-            )
+def make_excel2(
+    records: List[ImagesWithMetrics],
+    image_size: int,
+    save_dir: str | Path = "report",
+    save_filename: str | None = None,
+) -> Path:
+    save_dir = Path(save_dir).expanduser()
+    save_dir.mkdir(parents=True, exist_ok=True)
+    if save_filename is None:
+        save_filename = datetime.now().strftime("%y%m%d_%H%M%S")
 
-            image_samples = vae.decode(latent_samples / 0.18215).sample.to(device)
-            x0 = vae.decode(encoded / 0.18215).sample.to(device)
+    wb, ws = Workbook(), Workbook().active
+    ws.title = "Report"
+    ws.append([c.name for c in _COLS])   # header
 
-            #orig_dodrecon_diff = x - image_samples
-            orig_dodrecon_diff = (x - image_samples).mean(dim=1, keepdim=True) / 2
-            orig_dodrecon_abs_diff = torch.abs(orig_dodrecon_diff)
-            orig_dodrecon_threshold = 10 / 255
-            orig_dodrecon_binary = (orig_dodrecon_abs_diff > orig_dodrecon_threshold).float() * 2 - 1
+    for r, rec in enumerate(records, start=2):          # header = row 1
+        _write_row(ws, r, rec, image_size)
 
-            orig_encodedrecon_diff = (x - x0).mean(dim=1, keepdim=True) / 2
-            orig_encodedrecon_abs_diff = torch.abs(orig_encodedrecon_diff)
-            orig_encodedrecon_threshold = 10 / 255
-            orig_encodedrecon_binary = (orig_encodedrecon_abs_diff > orig_encodedrecon_threshold).float() * 2 - 1
+    for c in range(1, len(_COLS) + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 18
 
-            encodedrecon_dodrecon_diff = (x0 - image_samples).mean(dim=1, keepdim=True) / 2
-            encodedrecon_dodrecon_abs_diff = torch.abs(encodedrecon_dodrecon_diff)
-            encodedrecon_dodrecon_threshold = 10 / 255
-            encodedrecon_dodrecon_binary = (encodedrecon_dodrecon_abs_diff > encodedrecon_dodrecon_threshold).float() * 2 - 1
-
-            encoded_latent_diff = (latent_samples - encoded).max(dim=1, keepdim=True).values
-            encoded_latent_abs_diff = torch.abs(encoded_latent_diff)
-            encoded_latent_threshold = 10 / 255
-            encoded_latent_binary = (encoded_latent_abs_diff > encoded_latent_threshold).float() * 2 - 1
-            
-            encoded_latent_abs_diff_resized = F.interpolate(
-                encoded_latent_abs_diff, size=(center_size, center_size), mode='bilinear'
-            )
-
-            anomaly_map_arithmetic = 1/2*orig_dodrecon_diff + 1/2*encoded_latent_abs_diff_resized
-            anomaly_map_geometric = orig_dodrecon_diff * encoded_latent_abs_diff_resized
-
-        image_paths_s += image_paths
-        anomaly_classes_s += anomaly_classes
-        x_s += [_x.unsqueeze(0) for _x in x]
-        encoded_s += [_encoded.unsqueeze(0) for _encoded in encoded]
-        latent_samples_s += [_latent_samples.unsqueeze(0) for _latent_samples in latent_samples]
-        x0_s += [_x0.unsqueeze(0) for _x0 in x0]
-        image_samples_s += [_image_samples.unsqueeze(0) for _image_samples in image_samples]
-        orig_dodrecon_diff_s += [_orig_dodrecon_diff.unsqueeze(0) for _orig_dodrecon_diff in orig_dodrecon_diff]
-        orig_dodrecon_binary_s += [_orig_dodrecon_binary.unsqueeze(0) for _orig_dodrecon_binary in orig_dodrecon_binary]
-        orig_encodedrecon_diff_s += [_orig_encodedrecon_diff.unsqueeze(0) for _orig_encodedrecon_diff in orig_encodedrecon_diff]
-        orig_encodedrecon_binary_s += [_orig_encodedrecon_binary.unsqueeze(0) for _orig_encodedrecon_binary in orig_encodedrecon_binary]
-        encodedrecon_dodrecon_diff_s += [_encodedrecon_dodrecon_diff.unsqueeze(0) for _encodedrecon_dodrecon_diff in encodedrecon_dodrecon_diff]
-        encodedrecon_dodrecon_binary_s += [_encodedrecon_dodrecon_binary.unsqueeze(0) for _encodedrecon_dodrecon_binary in encodedrecon_dodrecon_binary]
-
-        encoded_latent_diff_s += [_encoded_latent_diff.unsqueeze(0) for _encoded_latent_diff in encoded_latent_diff]
-        encoded_latent_binary_s += [_encoded_latent_binary.unsqueeze(0) for _encoded_latent_binary in encoded_latent_binary]
-        anomaly_map_arithmetic_s += [_anomaly_map_arithmetic.unsqueeze(0) for _anomaly_map_arithmetic in anomaly_map_arithmetic]
-        anomaly_map_geometric_s += [_anomaly_map_geometric.unsqueeze(0) for _anomaly_map_geometric in anomaly_map_geometric]
-
-    # Optionally, print total images processed
-    results = [
-            ImagesWithMetrics.from_images(Images(
-                split=split,
-                image_path=image_path,
-                anomaly_class=anomaly_class,
-                orig=img1.cpu().numpy() if hasattr(img1, 'cpu') else img1,
-                encoded=img2.cpu().numpy() if hasattr(img2, 'cpu') else img2,
-                latent=img3.cpu().numpy() if hasattr(img3, 'cpu') else img3,
-                encoded_recon=img4.cpu().numpy() if hasattr(img4, 'cpu') else img4,
-                dod_recon=img5.cpu().numpy() if hasattr(img5, 'cpu') else img5,
-                orig_dodrecon_diff=img6.cpu().numpy() if hasattr(img6, 'cpu') else img6,
-                orig_dodrecon_binary=img7.cpu().numpy() if hasattr(img7, 'cpu') else img7,
-                orig_encodedrecon_diff=img8.cpu().numpy() if hasattr(img8, 'cpu') else img8,
-                orig_encodedrecon_binary=img9.cpu().numpy() if hasattr(img9, 'cpu') else img9,
-                encodedrecon_dodrecon_diff=img10.cpu().numpy() if hasattr(img10, 'cpu') else img10,
-                encodedrecon_dodrecon_binary=img11.cpu().numpy() if hasattr(img11, 'cpu') else img11,
-                encoded_latent_diff=img12.cpu().numpy() if hasattr(img12, 'cpu') else img12,
-                encoded_latent_binary=img13.cpu().numpy() if hasattr(img13, 'cpu') else img13,
-                anomaly_map_arithmetic=img14.cpu().numpy() if hasattr(img14, 'cpu') else img14,
-                anomaly_map_geometric=img15.cpu().numpy() if hasattr(img15, 'cpu') else img15,
-            ))
-            for image_path, anomaly_class, img1, img2, img3, img4, img5, img6, img7, img8, img9, img10, img11, img12, img13, img14, img15 in 
-            zip(image_paths_s, anomaly_classes_s, x_s, encoded_s, latent_samples_s, x0_s, image_samples_s, orig_dodrecon_diff_s, orig_dodrecon_binary_s, orig_encodedrecon_diff_s, orig_encodedrecon_binary_s, encodedrecon_dodrecon_diff_s, encodedrecon_dodrecon_binary_s, encoded_latent_diff_s, encoded_latent_binary_s, anomaly_map_arithmetic_s, anomaly_map_geometric_s)
-        ]
-    return results
-
+    out_path = save_dir / f"report_{save_filename}.xlsx"
+    wb.save(out_path)
+    return out_path
 
 def make_excel(records: List[ImagesWithMetrics], image_size, save_dir="report", save_filename=datetime.now().strftime('%y%m%d_%H%M%S')):
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
     # Fields to export as images
-    image_fields = ["orig", "dod_recon", "orig_dodrecon_diff", "orig_dodrecon_binary", "encoded_recon", "orig_encodedrecon_diff", "orig_encodedrecon_binary", "encodedrecon_dodrecon_diff", "encodedrecon_dodrecon_binary"]
+    image_fields = ["orig", "dod_recon", "orig_dodrecon_diff", "orig_dodrecon_binary", "encoded_recon", "orig_encodedrecon_diff", "orig_encodedrecon_binary", "encodedrecon_dodrecon_diff", "encodedrecon_dodrecon_binary", "latent_ch0", "latent_ch1", "latent_ch2", "latent_ch3"]
     metric_fields = ["lpips", "ssim", "mse"]
     other_fields = ["split", "image_path", "anomaly_class"]
 
@@ -598,20 +738,20 @@ def main():
     if REPO_ROOT is not None:
         os.chdir(os.path.dirname(REPO_ROOT))
         print("Current path:", os.getcwd())
-        if "ipykernel_launcher" in sys.argv[0]:
-            sys.argv = [
-                "" ,
-                "--dataset", "pcb",
-                "--data-dir", os.path.expanduser("~/dataset/PCB/Huang/PCB_DATASET/PCB_gray_128"),
-                "--model-size", "UNet_L",
-                "--object-category", "all",
-                "--anomaly-class", "all",
-                "--image-size", "128",
-                "--center-size", "128",
-                "--center-crop", "False",
-                "--batch-num", "1",
-                "--pretrained", "DeCo-Diff_pcb_all_UNet_L_128_CenterCrop/001-UNet_L/checkpoints/best.pt",
-            ]
+        #if "ipykernel_launcher" in sys.argv[0]:
+        sys.argv = [
+            "" ,
+            "--dataset", "pcb",
+            "--data-dir", os.path.expanduser("~/dataset/PCB/Huang/PCB_DATASET/PCB-gray-128___deco-diff"),
+            "--model-size", "UNet_L",
+            "--object-category", "all",
+            "--anomaly-class", "all",
+            "--image-size", "128",
+            "--center-size", "128",
+            "--center-crop", "False",
+            "--batch-num", "1",
+            "--pretrained", "DeCo-Diff_pcb_all_UNet_L_128_CenterCrop/001-UNet_L/checkpoints/best.pt",
+        ]
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, choices=['mvtec','visa','pcb'], default="mvtec")
     parser.add_argument("--data-dir", type=str, default='./mvtec-dataset/')
