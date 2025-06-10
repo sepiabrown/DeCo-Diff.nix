@@ -645,7 +645,7 @@ def plot_distribution(records: List[ImagesWithMetrics], device=None, save_dir='s
         plt.close()
 
 
-def make_excel2(
+def make_excel(
     records: List[ImagesWithMetrics],
     image_size: int,
     save_dir: str | Path = "report",
@@ -656,7 +656,8 @@ def make_excel2(
     if save_filename is None:
         save_filename = datetime.now().strftime("%y%m%d_%H%M%S")
 
-    wb, ws = Workbook(), Workbook().active
+    wb = Workbook()
+    ws = wb.active
     ws.title = "Report"
     ws.append([c.name for c in _COLS])   # header
 
@@ -669,69 +670,6 @@ def make_excel2(
     out_path = save_dir / f"report_{save_filename}.xlsx"
     wb.save(out_path)
     return out_path
-
-def make_excel(records: List[ImagesWithMetrics], image_size, save_dir="report", save_filename=datetime.now().strftime('%y%m%d_%H%M%S')):
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-
-    # Fields to export as images
-    image_fields = ["orig", "dod_recon", "orig_dodrecon_diff", "orig_dodrecon_binary", "encoded_recon", "orig_encodedrecon_diff", "orig_encodedrecon_binary", "encodedrecon_dodrecon_diff", "encodedrecon_dodrecon_binary", "latent_ch0", "latent_ch1", "latent_ch2", "latent_ch3"]
-    metric_fields = ["lpips", "ssim", "mse"]
-    other_fields = ["split", "image_path", "anomaly_class"]
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Report"
-
-    # Header
-    headers = other_fields + image_fields + metric_fields
-    ws.append(headers)
-
-    temp_files = []
-    for idx, rec in enumerate(records):
-        row = [getattr(rec, f) for f in other_fields]
-        img_paths = []
-        for field in image_fields:
-            arr = getattr(rec, field)
-            if hasattr(arr, 'cpu'):
-                arr = arr.cpu().numpy()
-            arr = np.squeeze(arr)
-            if arr.ndim == 2:
-                arr = np.stack([arr]*3, axis=-1)
-            elif arr.ndim == 3 and arr.shape[0] in [1,3]:
-                arr = np.transpose(arr, (1,2,0))
-            arr = np.clip(arr, -1, 1)
-            arr = ((arr + 1) / 2 * 255).astype(np.uint8)
-            tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-            PILImage.fromarray(arr).save(tmp.name)
-            img_paths.append(tmp.name)
-            temp_files.append(tmp.name)
-            row.append("")  # Placeholder for image cell
-        # Add metrics
-        for field in metric_fields:
-            row.append(getattr(rec, field))
-        ws.append(row)
-        # Set the row height to match the image height (in points; 1 point ≈ 1.33 px)
-        row_number = idx + 2  # +2 because header is row 1
-        ws.row_dimensions[row_number].height = image_size * 0.75  # 1 point = 1/72 inch, Excel uses 0.75 * px
-        # Insert images
-        for i, img_path in enumerate(img_paths):
-            col = other_fields.__len__() + i + 1
-            cell = f"{get_column_letter(col)}{idx+2}"
-            img = XLImage(img_path)
-            img.width = image_size
-            img.height = image_size
-            ws.add_image(img, cell)
-    # Adjust column widths
-    for i in range(1, len(headers)+1):
-        ws.column_dimensions[get_column_letter(i)].width = 18
-    wb.save(os.path.join(save_dir, f"report_{save_filename}.xlsx"))
-    # Clean up temp files
-    for f in temp_files:
-        try:
-            os.remove(f)
-        except Exception:
-            pass
 
 def main():
     REPO_ROOT = os.environ.get('REPO_ROOT', None)
