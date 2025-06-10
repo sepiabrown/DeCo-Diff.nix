@@ -44,6 +44,7 @@ from typing import Sequence
 from io import BytesIO
 from pathlib import Path
 import tempfile
+from synthetic_scratch import add_scratch_controlled
 
 
 torch.set_grad_enabled(False)
@@ -203,7 +204,7 @@ def process_split(
     reverse_steps: int,
     center_size: int,
     batch_num: int,
-    device: torch.device | None = None,
+    device: torch.device | None = None
 ) -> List[ImagesWithMetrics]:
     """Run a forward‑&‑reverse pass on *one* dataset split and collect metrics.
 
@@ -514,6 +515,9 @@ def evaluation(args):
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
         ])
+        transform_defect = transforms.Compose([
+            lambda img: transform(add_scratch_controlled(img))
+        ])
             
         # Create diffusion object:
         diffusion = create_diffusion(f'ddim{args.reverse_steps}', predict_deviation=True, sigma_small=False, predict_xstart=False, diffusion_steps=10)
@@ -536,14 +540,24 @@ def evaluation(args):
             test_dataset = VISADataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
         elif args.dataset == 'pcb':
             train_dataset = PCBDataset('train', object_class=category, rootdir=args.data_dir, transform=transform, normal=True, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
-            test_dataset = PCBDataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
+            train_dataset_defect = PCBDataset('train', object_class=category, rootdir=args.data_dir, transform=transform, normal=True, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True, synthetic_defect=True)
+            
+            #test_dataset = PCBDataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
         train_loader = DataLoader(train_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
-        test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
+        train_loader_defect = DataLoader(train_dataset_defect, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
+        #test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
 
         records_train = process_split(train_loader, 'train', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
-        records_test = process_split(test_loader, 'test', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
+        records_train_defect = process_split(train_loader_defect, 'train', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
+        #records_test = process_split(test_loader, 'test', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
+        for i in range(len(records_train)):
+            record_train = records_train[i]
+            record_train_defect = records_train_defect[i]
+            record_diff = diff_records(record_train, record_train_defect)
+            records.append(record_train)
+            records.append(record_train_defect)
+            records.append(record_diff)
 
-        records = records_train + records_test
         plot_distribution(records, device=device)
         make_excel(records, args.image_size)
 
@@ -588,6 +602,35 @@ def evaluation(args):
         evaluate_anomaly_maps(anomaly_maps, np.stack(segmentation_s, axis=0))
         '''
         print('=='*30)  
+
+def diff_records(records_train: ImagesWithMetrics, records_train_defect: ImagesWithMetrics):
+    return ImagesWithMetrics(
+        split="diff",
+        image_path=records_train.image_path,
+        anomaly_class="diff",
+        orig=records_train.orig - records_train_defect.orig,
+        encoded=records_train.encoded - records_train_defect.encoded,
+        latent=records_train.latent - records_train_defect.latent,
+        encoded_recon=records_train.encoded_recon - records_train_defect.encoded_recon,
+        dod_recon=records_train.dod_recon - records_train_defect.dod_recon,
+        orig_dodrecon_diff=records_train.orig_dodrecon_diff - records_train_defect.orig_dodrecon_diff,
+        orig_dodrecon_binary=records_train.orig_dodrecon_binary - records_train_defect.orig_dodrecon_binary,
+        orig_encodedrecon_diff=records_train.orig_encodedrecon_diff - records_train_defect.orig_encodedrecon_diff,
+        orig_encodedrecon_binary=records_train.orig_encodedrecon_binary - records_train_defect.orig_encodedrecon_binary,
+        encodedrecon_dodrecon_diff=records_train.encodedrecon_dodrecon_diff - records_train_defect.encodedrecon_dodrecon_diff,
+        encodedrecon_dodrecon_binary=records_train.encodedrecon_dodrecon_binary - records_train_defect.encodedrecon_dodrecon_binary,
+        encoded_latent_diff=records_train.encoded_latent_diff - records_train_defect.encoded_latent_diff,
+        encoded_latent_binary=records_train.encoded_latent_binary - records_train_defect.encoded_latent_binary,
+        anomaly_map_arithmetic=records_train.anomaly_map_arithmetic - records_train_defect.anomaly_map_arithmetic,
+        anomaly_map_geometric=records_train.anomaly_map_geometric - records_train_defect.anomaly_map_geometric,
+        latent_ch0=records_train.latent_ch0 - records_train_defect.latent_ch0,
+        latent_ch1=records_train.latent_ch1 - records_train_defect.latent_ch1,
+        latent_ch2=records_train.latent_ch2 - records_train_defect.latent_ch2,
+        latent_ch3=records_train.latent_ch3 - records_train_defect.latent_ch3,
+        lpips=records_train.lpips - records_train_defect.lpips,
+        ssim=records_train.ssim - records_train_defect.ssim,
+        mse=records_train.mse - records_train_defect.mse,
+    )
 
 def cal_similarity(img1, img2, device=None, similarity_type='lpips'):
     if device is None:
