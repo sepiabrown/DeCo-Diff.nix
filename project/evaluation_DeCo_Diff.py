@@ -254,7 +254,19 @@ def process_split(
             # Reverse DDIM sampling conditioned on encoder latents
             # -----------------------------------------------------------------
             model_kwargs = {"context": object_cls.unsqueeze(1), "mask": None}
-            latent_samples = diffusion.ddim_deviation_sample_loop(
+            #latent_samples = diffusion.ddim_deviation_sample_loop(
+            #    model,
+            #    shape=encoded.shape,
+            #    noise=encoded,
+            #    clip_denoised=False,
+            #    start_t=reverse_steps,
+            #    model_kwargs=model_kwargs,
+            #    progress=False,
+            #    device=device,
+            #    eta=0.0,
+            #)
+            latent_samples_list = []
+            for samples in diffusion.ddim_deviation_sample_loop_progressive(
                 model,
                 shape=encoded.shape,
                 noise=encoded,
@@ -264,7 +276,15 @@ def process_split(
                 progress=False,
                 device=device,
                 eta=0.0,
-            )
+            ):
+                latent_samples_list.append(samples["sample"])
+            latent_samples = latent_samples_list[-1]
+
+            image_samples_list = []
+            lat_slices_list = []
+            for latent_samples in latent_samples_list:
+                lat_slices_list.append([latent_samples[:, i:i+1] for i in range(4)])
+                image_samples_list.append(vae.decode(latent_samples / _LATENT_SCALE).sample)
 
             # -----------------------------------------------------------------
             # Reconstructions & other intermediate images
@@ -299,7 +319,6 @@ def process_split(
             anomaly_map_arithmetic = 0.5 * (orig_dodrecon_diff + encoded_latent_abs_diff_resized)
             anomaly_map_geometric = orig_dodrecon_diff * encoded_latent_abs_diff_resized
             lat_slices = [latent_samples[:, i:i+1] for i in range(4)]
-
         # ---------------------------------------------------------------------
         # Per‑sample aggregation (no unsqueeze gymnastics)
         # ---------------------------------------------------------------------
@@ -326,10 +345,10 @@ def process_split(
                         encoded_latent_binary=_to_numpy(encoded_latent_binary[b]),
                         anomaly_map_arithmetic=_to_numpy(anomaly_map_arithmetic[b]),
                         anomaly_map_geometric=_to_numpy(anomaly_map_geometric[b]),
-                        latent_ch0=_to_numpy(lat_slices[0][b]),
-                        latent_ch1=_to_numpy(lat_slices[1][b]),
-                        latent_ch2=_to_numpy(lat_slices[2][b]),
-                        latent_ch3=_to_numpy(lat_slices[3][b]),
+                        latent_ch0=_to_numpy(lat_slices_list[0][0][b]),
+                        latent_ch1=_to_numpy(lat_slices_list[0][1][b]),
+                        latent_ch2=_to_numpy(lat_slices_list[0][2][b]),
+                        latent_ch3=_to_numpy(lat_slices_list[0][3][b]),
                     )
                 )
             )
