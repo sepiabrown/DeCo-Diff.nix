@@ -34,7 +34,7 @@ def add_scratch_controlled(
     thickness: int = 2,
     length_range: Tuple[int, int] = (30, 80),
     curvature: float = 0.0,
-    deviation_range: Tuple[int, int] = (-60, 60),
+    deviation_range: Tuple[int, int] = (10, 10),
     sigma: float = 0.0  # Gaussian noise σ per pixel
 ) -> Tuple[np.ndarray, np.ndarray, List[dict]]:
     """

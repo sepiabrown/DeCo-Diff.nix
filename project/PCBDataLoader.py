@@ -9,13 +9,13 @@ from PIL import Image
 import warnings
 from glob import glob
 import albumentations as A
-
+from synthetic_scratch import add_scratch_controlled
 warnings.filterwarnings("ignore")
 
 class PCBDataset(Dataset):
     """ABIDE dataset."""
 
-    def __init__(self, mode, object_class, rootdir= './pcb-dataset/',transform=None,  normal=True, anomaly_class='good', image_size=288, center_size=256, augment=False, center_crop=False):
+    def __init__(self, mode, object_class, rootdir= './pcb-dataset/',transform=None,  normal=True, anomaly_class='good', image_size=288, center_size=256, augment=False, center_crop=False, synthetic_defect=False):
         """
         Args:
             mode: 'train','val','test'
@@ -23,6 +23,7 @@ class PCBDataset(Dataset):
             transform (callable, optional): Optional transform to be applied on a sample.
             df_root_path (string): dataframe directory containing csv files
         """
+        self.synthetic_defect = synthetic_defect
         self.mode = mode
         self.center_size = center_size
         if mode == 'train' and normal==False:
@@ -96,12 +97,14 @@ class PCBDataset(Dataset):
     def __getitem__(self, index):
         img = self.images[index].astype(np.uint8)
         seg = self.segs[index].astype(np.int32)
-
         if self.center_crop:
             augmented = self.aug(image=img, mask=seg)
             img = augmented['image']
             seg = augmented['mask']
-            
+
+        if self.synthetic_defect:
+            img, _, _ = add_scratch_controlled(img)
+
         img = img.astype(np.float32) / 255.0
         y = self.object_classes[index]
         if self.transform:

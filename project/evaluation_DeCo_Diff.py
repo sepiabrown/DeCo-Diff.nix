@@ -64,7 +64,7 @@ if device == "cpu":
 # ---------------------------------------------------------------------------
 
 _DIFF_SCALE = 2.0
-_THRESHOLD = 10.0 / 255.0
+_THRESHOLD = 5.0 / 255.0
 _LATENT_SCALE = 0.18215
 
 Kinded = Tuple[str, Any] # (kind, value)
@@ -329,7 +329,7 @@ def process_split(
                 eta=0.0,
             ):
                 latent_samples_list.append(samples["sample"])
-            latent_samples = latent_samples_list[-1]
+            latent_samples_final = latent_samples_list[-2]
 
             image_samples_list = []
             #lat_slices_list = []
@@ -340,7 +340,7 @@ def process_split(
             # -----------------------------------------------------------------
             # Reconstructions & other intermediate images
             # -----------------------------------------------------------------
-            image_samples = vae.decode(latent_samples / _LATENT_SCALE).sample
+            image_samples = vae.decode(latent_samples_final / _LATENT_SCALE).sample
             x0 = vae.decode(encoded / _LATENT_SCALE).sample
 
             # -----------------------------------------------------------------
@@ -354,7 +354,7 @@ def process_split(
             orig_encodedrecon_binary = _binary_mask(orig_encodedrecon_diff)
             encodedrecon_dodrecon_binary = _binary_mask(encodedrecon_dodrecon_diff)
 
-            encoded_latent_diff = (latent_samples - encoded).max(dim=1, keepdim=True).values
+            encoded_latent_diff = (latent_samples_final - encoded).max(dim=1, keepdim=True).values
             encoded_latent_binary = _binary_mask(encoded_latent_diff)
 
             encoded_latent_abs_diff_resized = F.interpolate(
@@ -367,8 +367,10 @@ def process_split(
             # -----------------------------------------------------------------
             # Composite anomaly maps
             # -----------------------------------------------------------------
-            anomaly_map_arithmetic = 0.5 * (orig_dodrecon_diff + encoded_latent_abs_diff_resized)
-            anomaly_map_geometric = orig_dodrecon_diff * encoded_latent_abs_diff_resized
+            anomaly_map_arithmetic = 0.5 * (encodedrecon_dodrecon_diff + encoded_latent_abs_diff_resized)
+            anomaly_map_arithmetic_binary = _binary_mask(anomaly_map_arithmetic)
+            anomaly_map_geometric = encodedrecon_dodrecon_diff * encoded_latent_abs_diff_resized
+            anomaly_map_geometric_binary = _binary_mask(anomaly_map_geometric)
             #lat_slices = [latent_samples[:, i:i+1] for i in range(4)]
         # ---------------------------------------------------------------------
         # Per‑sample aggregation (no unsqueeze gymnastics)
@@ -381,7 +383,7 @@ def process_split(
                 anomaly_class=("meta", anomaly_classes[b]),
                 orig=("image", _to_numpy(x[b])),
                 dod_recon=("image", _to_numpy(image_samples[b])),
-                #encoded_recon=("image", _to_numpy(x0[b])),
+                encoded_recon=("image", _to_numpy(x0[b])),
                 orig_dodrecon_diff=("image", _to_numpy(orig_dodrecon_diff[b])),
                 orig_dodrecon_binary=("image", _to_numpy(orig_dodrecon_binary[b])),
                 orig_encodedrecon_diff=("image", _to_numpy(orig_encodedrecon_diff[b])),
@@ -392,19 +394,22 @@ def process_split(
                 encoded_latent_binary=("image", _to_numpy(encoded_latent_binary[b])),
                 anomaly_map_arithmetic=("image", _to_numpy(anomaly_map_arithmetic[b])),
                 anomaly_map_geometric=("image", _to_numpy(anomaly_map_geometric[b])),
+                anomaly_map_arithmetic_binary=("image", _to_numpy(anomaly_map_arithmetic_binary[b])),
+                anomaly_map_geometric_binary=("image", _to_numpy(anomaly_map_geometric_binary[b])),
                 encoded=("image", _to_numpy(encoded[b])),
             )
             for i in range(len(image_samples_list)):
                 rec[f"encoded_samples_{i}"] = ("image", _to_numpy(latent_samples_list[i][b]))
-                if i == 0:
-                    rec[f"encoded_samples_diff_{i}"] = ("image", _to_numpy(latent_samples_list[i][b] - encoded[b]))
-                else:
-                    rec[f"encoded_samples_diff_{i}"] = ("image", _to_numpy(latent_samples_list[i][b] - latent_samples_list[i-1][b]))
-                rec[f"image_samples_{i}"] = ("image", _to_numpy(image_samples_list[i][b]))
-                if i == 0:
-                    rec[f"image_samples_diff_{i}"] = ("image", _to_numpy(image_samples_list[i][b] - x[b]))
-                else:
-                    rec[f"image_samples_diff_{i}"] = ("image", _to_numpy(image_samples_list[i][b] - image_samples_list[i-1][b]))
+                if i % 10 == 0:
+                    if i == 0:
+                        rec[f"encoded_samples_diff_{i}"] = ("image", _to_numpy(latent_samples_list[i][b] - encoded[b]))
+                    else:
+                        rec[f"encoded_samples_diff_{i}"] = ("image", _to_numpy(latent_samples_list[i][b] - latent_samples_list[i-1][b]))
+                    rec[f"image_samples_{i}"] = ("image", _to_numpy(image_samples_list[i][b]))
+                    if i == 0:
+                        rec[f"image_samples_diff_{i}"] = ("image", _to_numpy(image_samples_list[i][b] - x[b]))
+                    else:
+                        rec[f"image_samples_diff_{i}"] = ("image", _to_numpy(image_samples_list[i][b] - image_samples_list[i-1][b]))
 
             add_metric_fields(rec, device=device)
             results.append(rec)
@@ -595,7 +600,7 @@ def evaluation(args):
         ])
             
         # Create diffusion object:
-        diffusion = create_diffusion(f'ddim{args.reverse_steps}', predict_deviation=True, sigma_small=False, predict_xstart=False, diffusion_steps=10)
+        diffusion = create_diffusion(f'ddim{args.reverse_steps}', predict_deviation=True, sigma_small=False, predict_xstart=False, diffusion_steps=100)
 
         encoded_s = []
         image_samples_s = []
@@ -622,8 +627,8 @@ def evaluation(args):
         train_loader_defect = DataLoader(train_dataset_defect, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
         #test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
 
-        records_train = process_split(train_loader, 'train', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
-        records_train_defect = process_split(train_loader_defect, 'train', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
+        records_train = process_split(train_loader, 'test', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
+        records_train_defect = process_split(train_loader_defect, 'test', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
         #records_test = process_split(test_loader, 'test', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
         for i in range(len(records_train)):
             record_train = records_train[i]
@@ -786,6 +791,7 @@ def make_excel(
 
     out_path = save_dir / f"report_{save_filename}.xlsx"
     wb.save(out_path)
+    print(f"Report saved to {out_path}")
     return out_path
 
 
