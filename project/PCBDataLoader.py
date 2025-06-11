@@ -1,13 +1,11 @@
-from operator import index
 import os
 import torch
 import pandas as pd
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from PIL import Image
 # import torchio as tio
 import warnings
-from glob import glob
 import albumentations as A
 from synthetic_scratch import add_scratch_controlled
 warnings.filterwarnings("ignore")
@@ -26,7 +24,7 @@ class PCBDataset(Dataset):
         self.synthetic_defect = synthetic_defect
         self.mode = mode
         self.center_size = center_size
-        if mode == 'train' and normal==False:
+        if mode == 'train' and not normal:
             raise Exception('training data should be normal')
         self.augment = augment
         self.normal = normal
@@ -47,7 +45,7 @@ class PCBDataset(Dataset):
               
             
         if anomaly_class=='good' or self.normal:
-            df = df.query(f'category=="good"') 
+            df = df.query('category=="good"')
         elif anomaly_class=='all':
             pass
         else:

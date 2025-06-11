@@ -42,13 +42,9 @@ from typing import Sequence
 
 from io import BytesIO
 from pathlib import Path
-import tempfile
-from synthetic_scratch import add_scratch_controlled
 
-from collections import OrderedDict
 from typing import Any, Tuple
 
-import torch.nn.functional as F
 from torchmetrics.functional.image import (
     learned_perceptual_image_patch_similarity as _lpips,
     structural_similarity_index_measure as _ssim,
@@ -69,83 +65,6 @@ _LATENT_SCALE = 0.18215
 
 Kinded = Tuple[str, Any] # (kind, value)
 Record = OrderedDict[str, Kinded]
-
-# ────────────────────────────────────────────────────────────────────────────
-# Dataclasses
-# ────────────────────────────────────────────────────────────────────────────
-
-@dataclass(frozen=True)
-class Images:
-    # meta
-    split: str
-    image_path: str
-    anomaly_class: str
-
-    # main images
-    orig: object
-    encoded: object
-    latent: object
-    encoded_recon: object
-    dod_recon: object
-
-    # diff / masks
-    orig_dodrecon_diff: object
-    orig_dodrecon_binary: object
-    orig_encodedrecon_diff: object
-    orig_encodedrecon_binary: object
-    encodedrecon_dodrecon_diff: object
-    encodedrecon_dodrecon_binary: object
-    encoded_latent_diff: object
-    encoded_latent_binary: object
-    anomaly_map_arithmetic: object
-    anomaly_map_geometric: object
-
-    # four grayscale latent slices
-    latent_ch0: object
-    latent_ch1: object
-    latent_ch2: object
-    latent_ch3: object
-
-
-@dataclass(frozen=True)
-class ImagesWithMetrics(Images):
-    lpips: float
-    ssim: float
-    mse: float
-
-    @classmethod
-    def from_images(cls, record: "Images", *, device=None):
-        lpips_score = cal_similarity(record.orig, record.dod_recon,
-                                     device=device, similarity_type="lpips")
-        ssim_score  = cal_similarity(record.orig, record.dod_recon,
-                                     device=device, similarity_type="ssim")
-        mse_score   = cal_similarity(record.orig, record.dod_recon,
-                                     device=device, similarity_type="mse")
-        return cls(**record.__dict__,
-                   lpips=lpips_score,
-                   ssim=ssim_score,
-                   mse=mse_score)
-
-@dataclass(frozen=True, slots=True)
-class _Col:
-    name: str   # attribute on ImagesWithMetrics
-    kind: str   # 'other' | 'image' | 'metric'
-
-_COLS: tuple[_Col, ...] = (
-    # metadata
-    _Col("split", "other"), _Col("image_path", "other"), _Col("anomaly_class", "other"),
-    # thumbnails
-    _Col("orig", "image"), _Col("dod_recon", "image"),
-    _Col("orig_dodrecon_diff", "image"), _Col("orig_dodrecon_binary", "image"),
-    _Col("encoded_recon", "image"), _Col("orig_encodedrecon_diff", "image"),
-    _Col("orig_encodedrecon_binary", "image"),
-    _Col("encodedrecon_dodrecon_diff", "image"), _Col("encodedrecon_dodrecon_binary", "image"),
-    # latent grayscale slices
-    _Col("latent_ch0", "image"), _Col("latent_ch1", "image"),
-    _Col("latent_ch2", "image"), _Col("latent_ch3", "image"),
-    # metrics
-    _Col("lpips", "metric"), _Col("ssim", "metric"), _Col("mse", "metric"),
-)
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -205,8 +124,8 @@ def _tensor_to_xlimage(arr, size: int) -> XLImage:
         # Split the image into 4 quadrants if c == 4 (e.g., 4-channel image)
         # We'll arrange the 4 channels as 2x2 grid: [0|1]
         #                                             [2|3]
-        h, w = arr.shape[0], arr.shape[1]
-        h2, w2 = h // 2, w // 2
+        #h, w = arr.shape[0], arr.shape[1]
+        #h2, w2 = h // 2, w // 2
         # If the image is not square, just split in half along each axis
         # Each channel is a grayscale image, so we tile them
         q0 = arr[..., 0]
@@ -256,7 +175,7 @@ def process_split(
     center_size: int,
     batch_num: int,
     device: torch.device | None = None
-) -> List[ImagesWithMetrics]:
+) -> List[Record]:
     """Run a forward‑&‑reverse pass on *one* dataset split and collect metrics.
 
     Parameters
@@ -278,13 +197,13 @@ def process_split(
 
     Returns
     -------
-    List[ImagesWithMetrics]
+    List[Record]
         One entry per *image* in the processed subset.
     """
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    results: List[ImagesWithMetrics] = []
+    results: List[Record] = []
 
     for idx, (x, seg, object_cls, image_paths, anomaly_classes) in enumerate(  # noqa: B905
         tqdm(dataloader, desc=f"{split} split")
@@ -329,7 +248,7 @@ def process_split(
                 eta=0.0,
             ):
                 latent_samples_list.append(samples["sample"])
-            latent_samples_final = latent_samples_list[-2]
+            latent_samples_final = latent_samples_list[-1]
 
             image_samples_list = []
             #lat_slices_list = []
@@ -399,8 +318,8 @@ def process_split(
                 encoded=("image", _to_numpy(encoded[b])),
             )
             for i in range(len(image_samples_list)):
-                rec[f"encoded_samples_{i}"] = ("image", _to_numpy(latent_samples_list[i][b]))
-                if i % 10 == 0:
+                if i < 5 or i % 10 == 0 or i >= len(image_samples_list) - 5:
+                    rec[f"encoded_samples_{i}"] = ("image", _to_numpy(latent_samples_list[i][b]))
                     if i == 0:
                         rec[f"encoded_samples_diff_{i}"] = ("image", _to_numpy(latent_samples_list[i][b] - encoded[b]))
                     else:
@@ -595,19 +514,10 @@ def evaluation(args):
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
         ])
-        transform_defect = transforms.Compose([
-            lambda img: transform(add_scratch_controlled(img))
-        ])
             
         # Create diffusion object:
-        diffusion = create_diffusion(f'ddim{args.reverse_steps}', predict_deviation=True, sigma_small=False, predict_xstart=False, diffusion_steps=100)
+        diffusion = create_diffusion(f'ddim{args.reverse_steps}', predict_deviation=True, sigma_small=False, predict_xstart=False, diffusion_steps=1000)
 
-        encoded_s = []
-        image_samples_s = []
-        latent_samples_s = []
-        x0_s = []
-        x_s = []
-        segmentation_s = []
         records = []
 
         if args.dataset == 'mvtec':
@@ -642,6 +552,12 @@ def evaluation(args):
         make_excel(records, args.image_size)
 
         '''
+        encoded_s = []
+        image_samples_s = []
+        latent_samples_s = []
+        x0_s = []
+        x_s = []
+        segmentation_s = []
         for ii, (x, seg, object_cls) in enumerate(test_loader):
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:

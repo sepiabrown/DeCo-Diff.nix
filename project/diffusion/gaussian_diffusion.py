@@ -886,7 +886,7 @@ class GaussianDiffusion:
 
 
 
-    def ddim_deviation_sample(
+    def ddim_deviation_sample_original(
         self,
         model,
         x,
@@ -914,7 +914,60 @@ class GaussianDiffusion:
             sample = x0_pred #+ deviation_direction_previous
             
         return {"sample": sample}
+
+    def ddim_deviation_sample_rev(
+        self,
+        model,
+        x,
+        t,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        eta=0.0,
+    ):
+        """
+        Sample x_{t-1} from the model using DDIM.
+        Same usage as p_sample().
+        """
+        deviation_direction, extra = self.model_prediction(model, x, t, model_kwargs)
+
+
+
+        x0_pred = x - _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x.shape) * deviation_direction
+
+        sample = x0_pred
+
+        return {"sample": sample}
+
     
+    def ddim_deviation_sample(
+        self,
+        model,
+        x,
+        t,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        eta=0.0,
+    ):
+        """
+        Sample x_{t-1} from the model using DDIM.
+        Same usage as p_sample().
+        """
+        deviation_direction, extra = self.model_prediction(model, x, t, model_kwargs)
+        deviation_direction_previous, extra = self.model_prediction(model, x, t-1, model_kwargs)
+
+
+        x0_pred = x - _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x.shape) * deviation_direction
+        # deviation_direction_previous =  deviation_direction - (_extract_into_tensor(self.deviatoin_coeff, t-1, x.shape) - _extract_into_tensor(self.deviatoin_coeff, t, x.shape)) * x0_pred
+        if t[0]!=0:
+            sample = x0_pred + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t-1, x.shape) * deviation_direction_previous
+        else:
+            sample = x0_pred #+ deviation_direction_previous
+
+        return {"sample": sample}
 
     def ddim_deviation_sample_loop(
         self,
