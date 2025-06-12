@@ -28,7 +28,6 @@ from sklearn.metrics import auc
 
 import os
 import sys
-from dataclasses import dataclass
 from typing import List
 import matplotlib.pyplot as plt
 from collections import OrderedDict, defaultdict
@@ -49,6 +48,8 @@ from torchmetrics.functional.image import (
     learned_perceptual_image_patch_similarity as _lpips,
     structural_similarity_index_measure as _ssim,
 )
+from sklearn.metrics import roc_curve
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 
 torch.set_grad_enabled(False)
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -519,7 +520,6 @@ def evaluation(args):
         diffusion = create_diffusion(f'ddim{args.reverse_steps}', predict_deviation=True, sigma_small=False, predict_xstart=False, diffusion_steps=1000)
 
         records = []
-
         if args.dataset == 'mvtec':
             train_dataset = MVTECDataset('train', object_class=category, rootdir=args.data_dir, transform=transform, normal=True, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
             val_dataset = MVTECDataset('val', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
@@ -529,16 +529,16 @@ def evaluation(args):
             val_dataset = VISADataset('val', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
             test_dataset = VISADataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
         elif args.dataset == 'pcb':
-            train_dataset = PCBDataset('train', object_class=category, rootdir=args.data_dir, transform=transform, normal=True, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
-            train_dataset_defect = PCBDataset('train', object_class=category, rootdir=args.data_dir, transform=transform, normal=True, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True, synthetic_defect=True)
+            train_dataset = PCBDataset(args.split, object_class=category, rootdir=args.data_dir, transform=transform, normal=True, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
+            train_dataset_defect = PCBDataset(args.split, object_class=category, rootdir=args.data_dir, transform=transform, normal=True, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True, synthetic_defect=True)
             
             #test_dataset = PCBDataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
         train_loader = DataLoader(train_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
         train_loader_defect = DataLoader(train_dataset_defect, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
         #test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
 
-        records_train = process_split(train_loader, 'test', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
-        records_train_defect = process_split(train_loader_defect, 'test', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
+        records_train = process_split(train_loader, args.split, diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
+        records_train_defect = process_split(train_loader_defect, args.split, diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
         #records_test = process_split(test_loader, 'test', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
         for i in range(len(records_train)):
             record_train = records_train[i]
@@ -548,7 +548,8 @@ def evaluation(args):
             records.append(record_train_defect)
             records.append(record_diff)
 
-        plot_distribution(records, device=device)
+        plot_roc_curve_confusion_matrix(records_train, records_train_defect)
+        plot_distribution(records)
         make_excel(records, args.image_size)
 
         '''
@@ -656,7 +657,7 @@ def cal_similarity(img1, img2, device=None, similarity_type='lpips'):
     return sim.cpu().item()
 
 
-def plot_distribution(records: List[dict], device=None, save_dir='similarity_distribution', save_filename=datetime.now().strftime('%y%m%d_%H%M%S')):
+def plot_distribution(records: List[dict], save_dir='similarity_distribution', save_filename=datetime.now().strftime('%y%m%d_%H%M%S')):
     if not all(isinstance(rec, dict) for rec in records):
         raise TypeError("All elements in records must be of type dict")
     if not os.path.exists(save_dir):
@@ -711,25 +712,83 @@ def make_excel(
     return out_path
 
 
+def plot_roc_curve_confusion_matrix(records_good, records_anomaly, save_dir='roc_curve_confusion_matrix', save_filename=datetime.now().strftime('%y%m%d_%H%M%S')):
+    """
+    Plot ROC curve and confusion matrix using two record lists: records_good (all normal) and records_anomaly (all anomalous).
+    The score is the number of white pixels in anomaly_map_arithmetic_binary.
+    """
+    if not all(isinstance(rec, dict) for rec in records_good + records_anomaly):
+        raise TypeError("All elements in records must be of type dict")
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    print("Processing ROC curve")
+    y_true = []
+    y_score = []
+    for rec in records_good:
+        y_true.append(0)
+        mask = rec["anomaly_map_arithmetic_binary"][1] if isinstance(rec["anomaly_map_arithmetic_binary"], tuple) else rec["anomaly_map_arithmetic_binary"]
+        num_white = np.sum(mask == 1)
+        y_score.append(num_white)
+    for rec in records_anomaly:
+        y_true.append(1)
+        mask = rec["anomaly_map_arithmetic_binary"][1] if isinstance(rec["anomaly_map_arithmetic_binary"], tuple) else rec["anomaly_map_arithmetic_binary"]
+        num_white = np.sum(mask == 1)
+        y_score.append(num_white)
+
+    y_true = np.array(y_true)
+    y_score = np.array(y_score)
+
+    fpr, tpr, thresholds = roc_curve(y_true, y_score)
+    roc_auc = auc(fpr, tpr)
+
+    plt.figure()
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curve (White Pixel Count in Anomaly Map)')
+    plt.legend(loc="lower right")
+    plt.savefig(os.path.join(save_dir, f"roc_curve_{save_filename}.png"))
+    plt.close()
+
+    youden_j = tpr - fpr
+    best_idx = np.argmax(youden_j)
+    best_threshold = thresholds[best_idx]
+    print(f"Best threshold: {best_threshold}")
+
+    # Predict using the best threshold
+    y_pred = (y_score >= best_threshold).astype(int)
+
+    # Compute confusion matrix
+    cm = confusion_matrix(y_true, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Good", "Anomaly"])
+    disp.plot(cmap=plt.cm.Blues)
+    plt.title(f'Confusion Matrix (Threshold={best_threshold:.2f})')
+    plt.savefig(os.path.join(save_dir, f"confusion_matrix_{save_filename}.png"))
+    plt.close()
+
 def main():
     REPO_ROOT = os.environ.get('REPO_ROOT', None)
     if REPO_ROOT is not None:
         os.chdir(os.path.dirname(REPO_ROOT))
         print("Current path:", os.getcwd())
-        if "ipykernel_launcher" in sys.argv[0]:
-            sys.argv = [
-                "" ,
-                "--dataset", "pcb",
-                "--data-dir", os.path.expanduser("~/dataset/PCB/Huang/PCB_DATASET/PCB-gray-128___deco-diff"),
-                "--model-size", "UNet_L",
-                "--object-category", "all",
-                "--anomaly-class", "all",
-                "--image-size", "128",
-                "--center-size", "128",
-                "--center-crop", "False",
-                "--batch-num", "1",
-                "--pretrained", "DeCo-Diff_pcb_all_UNet_L_128_CenterCrop/001-UNet_L/checkpoints/best.pt",
-            ]
+    if "ipykernel_launcher" in sys.argv[0]:
+        sys.argv = [
+            "" ,
+            "--dataset", "pcb",
+            "--data-dir", os.path.expanduser("~/dataset/PCB/Huang/PCB_DATASET/PCB-gray-128___deco-diff"),
+            "--model-size", "UNet_L",
+            "--object-category", "all",
+            "--anomaly-class", "all",
+            "--image-size", "128",
+            "--center-size", "128",
+            "--center-crop", "False",
+            "--batch-num", "1",
+            "--pretrained", "DeCo-Diff_pcb_all_UNet_L_128_CenterCrop/001-UNet_L/checkpoints/best.pt",
+            "--split", "test",
+        ]
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, choices=['mvtec','visa','pcb'], default="mvtec")
     parser.add_argument("--data-dir", type=str, default='./mvtec-dataset/')
@@ -744,7 +803,7 @@ def main():
     parser.add_argument("--pretrained", type=str, default='.')
     parser.add_argument("--anomaly-class", type=str, default='all')
     parser.add_argument("--reverse-steps", type=int, default=5)
-
+    parser.add_argument("--split", type=str, default='test')
     
     args = parser.parse_args()
     if args.dataset == 'mvtec':

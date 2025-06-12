@@ -95,6 +95,7 @@ class PCBDataset(Dataset):
     def __getitem__(self, index):
         img = self.images[index].astype(np.uint8)
         seg = self.segs[index].astype(np.int32)
+        anomaly_class = self.anomaly_classes[index]
         if self.center_crop:
             augmented = self.aug(image=img, mask=seg)
             img = augmented['image']
@@ -102,7 +103,7 @@ class PCBDataset(Dataset):
 
         if self.synthetic_defect:
             img, _, _ = add_scratch_controlled(img)
-
+            anomaly_class = 'defect'
         img = img.astype(np.float32) / 255.0
         y = self.object_classes[index]
         if self.transform:
@@ -110,4 +111,4 @@ class PCBDataset(Dataset):
         else:
             img = self.transform_volume(img)
             img = (img-0.5)/0.5
-        return img, seg.astype(np.float32), int(y), self.image_paths[index], self.anomaly_classes[index]
+        return img, seg.astype(np.float32), int(y), self.image_paths[index], anomaly_class
