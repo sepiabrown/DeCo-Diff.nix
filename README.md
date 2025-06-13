@@ -58,7 +58,7 @@ torchrun train_DeCo_Diff.py \
             --dataset mvtec \
             --data-dir ./mvtec-dataset/ \
             --model-size UNet_L \
-            --object-category all  \
+            --object-class all  \
             --image-size 288 \
             --center-size 256 \
             --center-crop True \
@@ -76,7 +76,7 @@ python evaluation_DeCo_Diff.py \
             --dataset mvtec \
             --data-dir ./mvtec-dataset/ \
             --model-size UNet_L \
-            --object-category all  \
+            --object-class all  \
             --anomaly-class all  \
             --image-size 288 \
             --center-size 256 \

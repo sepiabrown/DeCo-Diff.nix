@@ -46,7 +46,7 @@ rec {
           --dataset pcb \
           --data-dir ~/dataset/PCB/Huang/PCB_DATASET/PCB_gray_128 \
           --model-size UNet_L \
-          --object-category all \
+          --object-class all \
           --augment False \
           --ckpt-every 1 \
           --resume-dir DeCo-Diff_pcb_all_UNet_L_128_CenterCrop/001-UNet_L \

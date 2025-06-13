@@ -30,9 +30,10 @@ class PCBDataset(Dataset):
         center_size=256,
         augment=False,
         center_crop=False,
-        synthetic_defect=False,
-        brightness: float = None,
-        shift: tuple = None,
+        scratch: bool = False,
+        brightness: int = None,
+        shift_x: int = None,
+        shift_y: int = None,
         blur: int = None,
         noise: int = None,
     ):
@@ -43,7 +44,7 @@ class PCBDataset(Dataset):
             transform (callable, optional): Optional transform to be applied on a sample.
             df_root_path (string): dataframe directory containing csv files
         """
-        self.synthetic_defect = synthetic_defect
+        self.scratch = scratch
         self.mode = mode
         self.center_size = center_size
         if mode == "train" and not normal:
@@ -59,10 +60,10 @@ class PCBDataset(Dataset):
         self.object_class = object_class
         self.image_size = image_size
         self.brightness = brightness
-        self.shift = shift
+        self.shift_x = shift_x
+        self.shift_y = shift_y
         self.blur = blur
         self.noise = noise
-
         df = pd.read_csv(os.path.join(".", "splits", "pcb-split.csv"))
         if object_class == "all":
             df = df.query(f'split=="{mode}"')
@@ -142,21 +143,30 @@ class PCBDataset(Dataset):
             img = augmented["image"]
             seg = augmented["mask"]
 
-        if self.synthetic_defect:
+        if self.scratch:
             img, _, _ = add_scratch_controlled(img)
             anomaly_class = "defect"
         # Randomly apply additional synthetic defects
         # 1. Random brightness
         if self.brightness is not None:
             factor = self.brightness
-            img = np.clip(img.astype(np.float32) * factor, 0, 255).astype(np.uint8)
+            img = np.clip(img.astype(np.float32) + factor, 0, 255).astype(np.uint8)
         # 2. Random shift
-        if self.shift is not None:
-            tx, ty = self.shift
+        if self.shift_x is not None:
+            tx = self.shift_x
             assert (
-                abs(tx) < img.shape[0] and abs(ty) < img.shape[1]
+                abs(tx) < img.shape[0]
             ), "shift should be less than the image size"
-            M = np.float32([[1, 0, tx], [0, 1, ty]])
+            M = np.float32([[1, 0, tx], [0, 1, 0]])
+            img = cv2.warpAffine(
+                img, M, (img.shape[1], img.shape[0]), borderMode=cv2.BORDER_REFLECT
+            )
+        if self.shift_y is not None:
+            ty = self.shift_y
+            assert (
+                abs(ty) < img.shape[1]
+            ), "shift should be less than the image size"
+            M = np.float32([[1, 0, 0], [0, 1, ty]])
             img = cv2.warpAffine(
                 img, M, (img.shape[1], img.shape[0]), borderMode=cv2.BORDER_REFLECT
             )
@@ -166,7 +176,12 @@ class PCBDataset(Dataset):
             img = cv2.GaussianBlur(img, (ksize, ksize), 0)
         # 4. Random noise
         if self.noise is not None:
-            img = np.clip(img.astype(np.int16) + self.noise, 0, 255).astype(np.uint8)
+            num_salt = self.noise
+            coords = [
+                np.random.randint(0, i, num_salt)
+                for i in img.shape
+            ]
+            img[tuple(coords)] = 255
         img = img.astype(np.float32) / 255.0
         y = self.object_classes[index]
         if self.transform:

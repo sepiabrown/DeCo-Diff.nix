@@ -226,11 +226,11 @@ def _main(args):
         
     
     if args.dataset=='mvtec':
-        dataset = MVTECDataset('train', object_class=args.object_category, rootdir=args.data_dir, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
+        dataset = MVTECDataset('train', object_class=args.object_class, rootdir=args.data_dir, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
     elif args.dataset=='visa':
-        dataset = VISADataset('train', object_class=args.object_category, rootdir=args.data_dir, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
+        dataset = VISADataset('train', object_class=args.object_class, rootdir=args.data_dir, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
     elif args.dataset=='pcb':
-        dataset = PCBDataset('train', object_class=args.object_category, rootdir=args.data_dir, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
+        dataset = PCBDataset('train', object_class=args.object_class, rootdir=args.data_dir, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
 
     batch_size = args.global_batch_size // dist.get_world_size()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=False)
@@ -361,7 +361,7 @@ def _main(args):
                 dist.all_reduce(avg_mse, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 avg_mse = avg_mse.item() / dist.get_world_size()
-                logger.info(f"(category={args.object_category} step={train_steps:07d}) MSE Loss: {avg_mse:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                logger.info(f"(category={args.object_class} step={train_steps:07d}) MSE Loss: {avg_mse:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
                 if rank == 0:
                     if avg_loss < best_loss:
                         best_loss = avg_loss
@@ -429,7 +429,7 @@ def main():
     parser.add_argument("--local-rank", type=int, default=0)
     parser.add_argument("--mask-ratio", type=float, default=0.7)
     parser.add_argument("--patch-shuffle-ratio", type=float, default=0.3)
-    parser.add_argument("--object-category", type=str, default='all')
+    parser.add_argument("--object-class", type=str, default='all')
     parser.add_argument("--mask-random-ratio", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
     parser.add_argument("--from-scratch", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
     parser.add_argument("--augmentation", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
@@ -447,7 +447,7 @@ def main():
         args.num_classes = 12
     elif args.dataset == 'pcb':
         args.num_classes = 1
-    args.results_dir = f"./DeCo-Diff_{args.dataset}_{args.object_category}_{args.model_size}_{args.center_size}"
+    args.results_dir = f"./DeCo-Diff_{args.dataset}_{args.object_class}_{args.model_size}_{args.center_size}"
     if args.center_crop:
         args.results_dir += "_CenterCrop"
         args.actual_image_size = args.center_size
