@@ -509,48 +509,121 @@ def evaluation(args):
     print('=='*30)
     print('Starting Evaluation...')
     print('=='*30)
+    diffusion = create_diffusion(f'ddim{args.reverse_steps}', predict_deviation=True, sigma_small=False, predict_xstart=False, diffusion_steps=1000)
 
     for category in args.categories:
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
         ])
+
+        if args.perturbation == "brightness" or args.perturbation == "all":
+            plot_accuracy_vs_brightness(
+                brightness_range=np.arange(0.1, 2.1, 0.05),
+                split=args.split,
+                category=category,
+                rootdir=args.data_dir,
+                transform=transform,
+                normal=True,
+                anomaly_class=args.anomaly_class,
+                image_size=args.image_size,
+                center_size=args.actual_image_size,
+                center_crop=True,
+                process_split_fn=process_split,
+                diffusion=diffusion,
+                model=model,
+                vae=vae,
+                reverse_steps=args.reverse_steps,
+                batch_num=args.batch_num,
+                device=device
+            )
+        if args.perturbation == "shift" or args.perturbation == "all":
+            plot_accuracy_vs_shift_x(
+                shift_range=np.arange(-128, 128, 128),
+                split=args.split,
+                category=category,
+                rootdir=args.data_dir,
+                transform=transform,
+                normal=True,
+                anomaly_class=args.anomaly_class,
+                image_size=args.image_size,
+                center_size=args.actual_image_size,
+                center_crop=True,
+                process_split_fn=process_split,
+                diffusion=diffusion,
+                model=model,
+                vae=vae,
+                reverse_steps=args.reverse_steps,
+                batch_num=args.batch_num,
+                device=device
+            )
+            #plot_accuracy_vs_noise(
+            #    split=args.split,
+            #    category=category,
+            #    rootdir=args.data_dir,
+            #    transform=transform,
+            #    normal=True,
+            #    anomaly_class=args.anomaly_class,
+            #    image_size=args.image_size,
+            #    center_size=args.actual_image_size,
+            #    center_crop=True,
+            #    process_split_fn=process_split,
+            #    diffusion=diffusion,
+            #    model=model,
+            #    vae=vae,
+            #    reverse_steps=args.reverse_steps,
+            #    batch_num=args.batch_num,
+            #    device=device
+            #)
+        if args.perturbation == "blur" or args.perturbation == "all":
+            plot_accuracy_vs_blur(
+                blur_range=np.arange(1, 128, 64),
+                split=args.split,
+                category=category,
+                rootdir=args.data_dir,
+                transform=transform,
+                normal=True,
+                anomaly_class=args.anomaly_class,
+                image_size=args.image_size,
+                center_size=args.actual_image_size,
+                center_crop=True,
+                process_split_fn=process_split,
+                diffusion=diffusion,
+                model=model,
+                vae=vae,
+                reverse_steps=args.reverse_steps,
+                batch_num=args.batch_num,
+                device=device
+            )
             
         # Create diffusion object:
-        diffusion = create_diffusion(f'ddim{args.reverse_steps}', predict_deviation=True, sigma_small=False, predict_xstart=False, diffusion_steps=1000)
+        
+        #records = []
+        #if args.dataset == 'mvtec':
+        #    train_dataset = MVTECDataset('train', object_class=category, rootdir=args.data_dir, transform=transform, normal=True, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
+        #    val_dataset = MVTECDataset('val', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
+        #    test_dataset = MVTECDataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
+        #elif args.dataset == 'visa':
+        #    train_dataset = VISADataset('train', object_class=category, rootdir=args.data_dir, transform=transform, normal=True, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
+        #    val_dataset = VISADataset('val', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
+        #    test_dataset = VISADataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
+        #elif args.dataset == 'pcb':
+        #    dataset = PCBDataset(args.split, object_class=category, rootdir=args.data_dir, transform=transform, normal=True, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
+        #    dataset_defect = PCBDataset(args.split, object_class=category, rootdir=args.data_dir, transform=transform, normal=True, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True, synthetic_defect=True)
+        #    
+        #    #test_dataset = PCBDataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
+        #loader = DataLoader(dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
+        #loader_defect = DataLoader(dataset_defect, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
+        ##test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
 
-        records = []
-        if args.dataset == 'mvtec':
-            train_dataset = MVTECDataset('train', object_class=category, rootdir=args.data_dir, transform=transform, normal=True, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
-            val_dataset = MVTECDataset('val', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
-            test_dataset = MVTECDataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
-        elif args.dataset == 'visa':
-            train_dataset = VISADataset('train', object_class=category, rootdir=args.data_dir, transform=transform, normal=True, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
-            val_dataset = VISADataset('val', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
-            test_dataset = VISADataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
-        elif args.dataset == 'pcb':
-            train_dataset = PCBDataset(args.split, object_class=category, rootdir=args.data_dir, transform=transform, normal=True, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
-            train_dataset_defect = PCBDataset(args.split, object_class=category, rootdir=args.data_dir, transform=transform, normal=True, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True, synthetic_defect=True)
-            
-            #test_dataset = PCBDataset('test', object_class=category, rootdir=args.data_dir, transform=transform, normal=False, anomaly_class=args.anomaly_class, image_size=args.image_size, center_size=args.actual_image_size, center_crop=True)
-        train_loader = DataLoader(train_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
-        train_loader_defect = DataLoader(train_dataset_defect, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
-        #test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
+        #records = process_split(loader, args.split, diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
+        #records_defect = process_split(loader_defect, args.split, diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
+        ##records_test = process_split(test_loader, 'test', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
 
-        records_train = process_split(train_loader, args.split, diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
-        records_train_defect = process_split(train_loader_defect, args.split, diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
-        #records_test = process_split(test_loader, 'test', diffusion, model, vae, args.reverse_steps, args.center_size, args.batch_num, device)
-        for i in range(len(records_train)):
-            record_train = records_train[i]
-            record_train_defect = records_train_defect[i]
-            record_diff = diff_records(record_train, record_train_defect)
-            records.append(record_train)
-            records.append(record_train_defect)
-            records.append(record_diff)
-
-        plot_roc_curve_confusion_matrix(records_train, records_train_defect)
-        plot_distribution(records)
-        make_excel(records, args.image_size)
+        #plot_roc_curve_confusion_matrix(records, records_defect)
+        #plot_distribution(records)
+        #
+        #make_excel(records, args.image_size)
 
         '''
         encoded_s = []
@@ -769,6 +842,173 @@ def plot_roc_curve_confusion_matrix(records_good, records_anomaly, save_dir='roc
     plt.savefig(os.path.join(save_dir, f"confusion_matrix_{save_filename}.png"))
     plt.close()
 
+def plot_accuracy_vs_param(
+    param_name: str,
+    param_values,
+    split: str,
+    category: str,
+    rootdir: str,
+    transform,
+    normal: bool,
+    anomaly_class: str,
+    image_size: int,
+    center_size: int,
+    center_crop: bool,
+    process_split_fn,
+    diffusion,
+    model,
+    vae,
+    reverse_steps,
+    batch_num,
+    device=None,
+    save_dir='accuracy_vs_param',
+    save_filename=datetime.now().strftime('%y%m%d_%H%M%S')
+):
+    save_dir = Path(save_dir).expanduser()
+    save_dir.mkdir(parents=True, exist_ok=True)
+    if save_filename is None:
+        save_filename = datetime.now().strftime("%y%m%d_%H%M%S")
+    
+    accuracies = []
+
+    for i, val in enumerate(param_values):
+        kwargs = {
+            "split": split,
+            "object_class": category,
+            "rootdir": rootdir,
+            "transform": transform,
+            "normal": normal,
+            "anomaly_class": anomaly_class,
+            "image_size": image_size,
+            "center_size": center_size,
+            "center_crop": center_crop,
+            "synthetic_defect": True,
+            param_name: val,
+        }
+        split_val = kwargs.pop("split")
+        dataset = PCBDataset(
+            split_val,
+            object_class=kwargs["object_class"],
+            rootdir=kwargs["rootdir"],
+            transform=kwargs["transform"],
+            normal=kwargs["normal"],
+            anomaly_class=kwargs["anomaly_class"],
+            image_size=kwargs["image_size"],
+            center_size=kwargs["center_size"],
+            center_crop=kwargs["center_crop"],
+            synthetic_defect=False,
+            brightness=kwargs.get("brightness", None),
+            shift=kwargs.get("shift", None),
+            noise=kwargs.get("noise", None),
+            blur=kwargs.get("blur", None),
+        )
+        dataset_defect = PCBDataset(
+            split_val,
+            object_class=kwargs["object_class"],
+            rootdir=kwargs["rootdir"],
+            transform=kwargs["transform"],
+            normal=kwargs["normal"],
+            anomaly_class=kwargs["anomaly_class"],
+            image_size=kwargs["image_size"],
+            center_size=kwargs["center_size"],
+            center_crop=kwargs["center_crop"],
+            synthetic_defect=kwargs.get("synthetic_defect", False),
+            brightness=kwargs.get("brightness", None),
+            shift=kwargs.get("shift", None),
+            noise=kwargs.get("noise", None),
+            blur=kwargs.get("blur", None),
+        )
+        loader = DataLoader(dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
+        loader_defect = DataLoader(dataset_defect, batch_size=8, shuffle=False, num_workers=4, drop_last=False)
+        records = process_split_fn(loader, split, diffusion, model, vae, reverse_steps, center_size, batch_num, device)
+        records_defect = process_split_fn(loader_defect, split, diffusion, model, vae, reverse_steps, center_size, batch_num, device)
+        y_true = []
+        y_score = []
+        for rec in records:
+            y_true.append(0)
+            mask = rec["anomaly_map_arithmetic_binary"][1] if isinstance(rec["anomaly_map_arithmetic_binary"], tuple) else rec["anomaly_map_arithmetic_binary"]
+            num_white = np.sum(mask == 1)
+            y_score.append(num_white)
+        for rec in records_defect:
+            y_true.append(1)
+            mask = rec["anomaly_map_arithmetic_binary"][1] if isinstance(rec["anomaly_map_arithmetic_binary"], tuple) else rec["anomaly_map_arithmetic_binary"]
+            num_white = np.sum(mask == 1)
+            y_score.append(num_white)
+
+        y_score = np.array(y_score)
+        fpr, tpr, thresholds_ = roc_curve(y_true, y_score)
+        youden_j = tpr - fpr
+        best_idx = np.argmax(youden_j)
+        best_threshold = thresholds_[best_idx]
+        y_pred = (y_score >= best_threshold).astype(int)
+        accuracy = np.mean(y_pred == y_true)
+        accuracies.append(accuracy)
+        if param_name == "shift_x":
+            breakpoint()
+        print(f"{param_name} {val}: Accuracy {accuracy:.4f} (threshold={best_threshold})")
+    plt.figure()
+    plt.plot(param_values, accuracies, marker='o')
+    plt.xlabel(param_name)
+    plt.ylabel('Accuracy')
+    plt.title(f'Accuracy vs {param_name.capitalize()} (synthetic defect)')
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, f"{param_name}_{save_filename}.png"))
+    plt.close()
+
+def plot_accuracy_vs_brightness(brightness_range=None, **kwargs):
+    if brightness_range is None:
+        brightness_range = np.linspace(0.5, 1.5, 100)
+    plot_accuracy_vs_param(
+        param_name="brightness",
+        param_values=brightness_range,
+        **kwargs
+    )
+
+def plot_accuracy_vs_shift(shift_range=None, **kwargs):
+    if shift_range is None:
+        shift_range = np.arange(-10, 11, 2)
+    plot_accuracy_vs_param(
+        param_name="shift",
+        param_values=[(s, s) for s in shift_range],
+        **kwargs
+    )
+
+def plot_accuracy_vs_shift_x(shift_range=None, **kwargs):
+    if shift_range is None:
+        shift_range = np.arange(-10, 11, 2)
+    plot_accuracy_vs_param(
+        param_name="shift_x",
+        param_values=[(s, 0) for s in shift_range],
+        **kwargs
+    )
+
+def plot_accuracy_vs_shift_y(shift_range=None, **kwargs):
+    if shift_range is None:
+        shift_range = np.arange(-10, 11, 2)
+    plot_accuracy_vs_param(
+        param_name="shift_y",
+        param_values=[(0, s) for s in shift_range],
+        **kwargs
+    )
+
+def plot_accuracy_vs_noise(noise_range=None, **kwargs):
+    if noise_range is None:
+        noise_range = np.linspace(0, 50, 11)
+    plot_accuracy_vs_param(
+        param_name="noise",
+        param_values=noise_range,
+        **kwargs
+    )
+
+def plot_accuracy_vs_blur(blur_range=None, **kwargs):
+    if blur_range is None:
+        blur_range = [1, 3, 5, 7, 9]
+    plot_accuracy_vs_param(
+        param_name="blur",
+        param_values=blur_range,
+        **kwargs
+    )
+
 def main():
     REPO_ROOT = os.environ.get('REPO_ROOT', None)
     if REPO_ROOT is not None:
@@ -804,6 +1044,7 @@ def main():
     parser.add_argument("--anomaly-class", type=str, default='all')
     parser.add_argument("--reverse-steps", type=int, default=5)
     parser.add_argument("--split", type=str, default='test')
+    parser.add_argument("--perturbation", type=str, default=None)
     
     args = parser.parse_args()
     if args.dataset == 'mvtec':
