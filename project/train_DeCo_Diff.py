@@ -295,7 +295,7 @@ def _main(args):
     logger.info(f"Training for {adjusted_epochs} epochs...")
     for epoch in range(start_epoch, adjusted_epochs):
         logger.info(f"Beginning epoch {epoch}...")
-        for ii, (x, _, y) in enumerate(loader):
+        for ii, (x, _, y, _, _) in enumerate(loader):
             x = x.to(torch_device)
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
