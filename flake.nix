@@ -2,7 +2,9 @@
   description = "DeCo Diff";
 
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    haedosa.url = "git+ssh://gitea@gitea.internal/Haedosa/flakes";
+
+    nixpkgs.follows = "haedosa/nixpkgs";
 
     pyproject-nix = {
       url = "github:pyproject-nix/pyproject.nix";

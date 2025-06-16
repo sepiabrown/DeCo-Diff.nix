@@ -547,6 +547,7 @@ dependencies = [
     { name = "torch" },
     { name = "torchaudio" },
     { name = "torchmetrics" },
+    { name = "torchshow" },
     { name = "torchvision" },
     { name = "tqdm" },
     { name = "transformers" },
@@ -580,6 +581,7 @@ requires-dist = [
     { name = "torch", specifier = "==2.3.1" },
     { name = "torchaudio", specifier = "==2.3.1" },
     { name = "torchmetrics", specifier = "==1.4.0.post0" },
+    { name = "torchshow" },
     { name = "torchvision", specifier = "==0.18.1" },
     { name = "tqdm", specifier = "==4.66.4" },
     { name = "transformers", specifier = "==4.46.1" },
@@ -3251,6 +3253,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c0/20/aadde4c9b15a814e03eb08e5c5e2527be3b81694620f6b9b35354f6506c9/torchmetrics-1.4.0.post0.tar.gz", hash = "sha256:ab9bcfe80e65dbabbddb6cecd9be21f1f1d5207bb74051ef95260740f2762358", size = 507259, upload-time = "2024-05-15T11:31:20.75Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6d/e6/e51997d1818a4c1a1ad2b1c7ca5ff9dd95969596add58b2ed39479026964/torchmetrics-1.4.0.post0-py3-none-any.whl", hash = "sha256:ab234216598e3fbd8d62ee4541a0e74e7e8fc935d099683af5b8da50f745b3c8", size = 868845, upload-time = "2024-05-15T11:31:18.596Z" },
+]
+
+[[package]]
+name = "torchshow"
+version = "0.5.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "matplotlib" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c9/43/91488b3addef178f3c9c89fae53a131139eac6ead3884df6cca9fcb90d6a/torchshow-0.5.2.tar.gz", hash = "sha256:130beb4883916686f4f51d577716a0fe8579ead203271f7a7f78c61e9af303cc", size = 21633, upload-time = "2025-03-20T06:05:53.204Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b0/33/b6f2d7d5b2baa18dfc8b7b4323547ce959e8c7ef3d611361db856aac277f/torchshow-0.5.2-py3-none-any.whl", hash = "sha256:8ebc3d5ad71c8f61164f7dbb03da3dcba680fb6edb1d24f57dd5835131b1ffd2", size = 17342, upload-time = "2025-03-20T06:05:51.74Z" },
 ]
 
 [[package]]

@@ -26,7 +26,8 @@ dependencies = [
   "transformers==4.46.1",
   "pandas",
   "matplotlib",
-  "openpyxl"
+  "openpyxl",
+  "torchshow",
 ]
 
 [project.scripts]
