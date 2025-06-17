@@ -672,6 +672,14 @@ def evaluation(args):
             batch_num=args.batch_num,
             device=device,
         )
+        if args.dataset == "pcb":
+            common_args["dataset_class"] = PCBDataset
+        elif args.dataset == "mvtec":
+            common_args["dataset_class"] = MVTECDataset
+        elif args.dataset == "visa":
+            common_args["dataset_class"] = VISADataset
+        else:
+            raise ValueError(f"Invalid dataset: {args.dataset}")
         if args.perturbation is not None:
             if args.perturbation == "brightness":
                 param_values = np.arange(-20, 21, 1)
@@ -699,9 +707,9 @@ def evaluation(args):
                     param_name="blur", param_values=param_values, **common_args
                 )
             if args.perturbation == "scratch":
-                param_values = [True]
+                param_values = [0]
                 record_pairs = collect_records_for_params(
-                    param_name="scratch", param_values=param_values, **common_args
+                    param_name="brightness", param_values=param_values, **common_args
                 )
             y_true_score_list = compute_y_true_y_score(record_pairs)
             roc_stats = compute_metrics_from_y_true_y_score(y_true_score_list)
@@ -1038,6 +1046,7 @@ def collect_records_for_params(
     reverse_steps,
     batch_num,
     device=None,
+    dataset_class,
 ):
     common_args = dict(
         mode=split,
@@ -1056,7 +1065,7 @@ def collect_records_for_params(
         print(f"Processing {param_name} = {val}")
         kwargs = common_args.copy()
         kwargs[param_name] = val
-        dataset = PCBDataset(**kwargs)
+        dataset = dataset_class(**kwargs)
         loader = DataLoader(
             dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False
         )
@@ -1073,7 +1082,7 @@ def collect_records_for_params(
         )
 
         kwargs["scratch"] = True
-        dataset_defect = PCBDataset(**kwargs)
+        dataset_defect = dataset_class(**kwargs)
         loader_defect = DataLoader(
             dataset_defect, batch_size=8, shuffle=False, num_workers=4, drop_last=False
         )
