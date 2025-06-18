@@ -23,7 +23,6 @@ class MVTECDataset(Dataset):
         object_class,
         rootdir="./mvtec-dataset/",
         transform=None,
-        normal=True,
         anomaly_class="good",
         image_size=288,
         center_size=256,
@@ -46,10 +45,7 @@ class MVTECDataset(Dataset):
         self.scratch = scratch
         self.mode = mode
         self.center_size = center_size
-        if mode == "train" and normal == False:
-            raise Exception("training data should be normal")
         self.augment = augment
-        self.normal = normal
         self.center_crop = center_crop
         object_cls_dict = {
             "capsule": 0,
@@ -84,7 +80,7 @@ class MVTECDataset(Dataset):
         else:
             df = df.query(f'split=="{mode}" and object=="{object_class}"')
 
-        if anomaly_class == "good" or self.normal:
+        if anomaly_class == "good":
             df = df.query('category=="good"')
         elif anomaly_class == "all":
             pass

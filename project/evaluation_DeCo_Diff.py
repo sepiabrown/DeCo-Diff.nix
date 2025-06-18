@@ -659,7 +659,6 @@ def evaluation(args):
             object_class=object_class,
             rootdir=args.data_dir,
             transform=transform,
-            normal=True,
             anomaly_class=args.anomaly_class,
             image_size=args.image_size,
             center_size=args.actual_image_size,
@@ -692,7 +691,7 @@ def evaluation(args):
                     param_name="shift_x", param_values=param_values, **common_args
                 )
             if args.perturbation == "shift_y":
-                param_values = np.arange(-10, 11, 1)
+                param_values = np.arange(-20, 21, 1)
                 record_pairs = collect_records_for_params(
                     param_name="shift_y", param_values=param_values, **common_args
                 )
@@ -719,16 +718,19 @@ def evaluation(args):
                 param_values=param_values,
                 accuracies=roc_stats["accuracies"],
                 color="red",
+                save_dir=args.results_dir,
             )
             plot_roc_curves(
                 param_name=args.perturbation,
                 roc_stats=roc_stats,
                 param_values=param_values,
+                save_dir=args.results_dir,
             )
             plot_confusion_matrices(
                 param_name=args.perturbation,
                 roc_stats=roc_stats,
                 param_values=param_values,
+                save_dir=args.results_dir,
             )
             records = []
             for i in range(len(record_pairs[0][0])):
@@ -740,8 +742,8 @@ def evaluation(args):
                     records.append(record_train_defect)
                     records.append(record_diff)
 
-            make_excel(records, args.image_size)
-            plot_distribution(records)
+            make_excel(records, args.image_size, save_dir=args.results_dir)
+            plot_distribution(records, save_dir=args.results_dir)
 
         # Create diffusion object:
 
@@ -1034,7 +1036,6 @@ def collect_records_for_params(
     object_class: str,
     rootdir: str,
     transform,
-    normal: bool,
     anomaly_class: str,
     image_size: int,
     center_size: int,
@@ -1053,14 +1054,12 @@ def collect_records_for_params(
         object_class=object_class,
         rootdir=rootdir,
         transform=transform,
-        normal=normal,
         anomaly_class=anomaly_class,
         image_size=image_size,
         center_size=center_size,
         center_crop=center_crop,
     )
     all_records = []
-
     for val in param_values:
         print(f"Processing {param_name} = {val}")
         kwargs = common_args.copy()
@@ -1439,62 +1438,133 @@ def main():
         choices=[None, "brightness", "shift_x", "shift_y", "noise", "blur", "scratch"],
         default=None,
     )
+    parser.add_argument(
+        "--input-json",
+        type=str,
+        help="Path to JSON file containing multiple test configurations"
+    )
 
     args = parser.parse_args()
-    if args.dataset == "mvtec":
-        args.num_classes = 15
-    elif args.dataset == "visa":
-        args.num_classes = 12
-    elif args.dataset == "pcb":
-        args.num_classes = 1
-    args.results_dir = f"./DeCo-Diff_{args.dataset}_{args.object_class}_{args.model_size}_{args.center_size}"
-    if args.center_crop:
-        args.results_dir += "_CenterCrop"
-        args.actual_image_size = args.center_size
-    else:
-        args.actual_image_size = args.image_size
+    
+    # Handle input JSON if provided
+    if args.input_json:
+        import json
+        with open(args.input_json, 'r') as f:
+            test_configs = json.load(f)
+            
+        # Run evaluation for each test configuration
+        for test_name, test_args in test_configs.items():
+            print(f"\nRunning evaluation for {test_name}")
+            print(test_args)
+            # Update args with test configuration
+            for key, value in test_args.items():
+                # Convert key from kebab-case to snake_case
+                key = key.replace('-', '_')
+                if hasattr(args, key):
+                    # Convert string values to appropriate types
+                    if key in ['image_size', 'center_size', 'batch_num', 'reverse_steps']:
+                        value = int(value)
+                    elif key == 'center_crop':
+                        value = value.lower() in ('yes', 'true', 't', 'y', '1')
+                    elif key in ['pretrained', 'data_dir']:
+                        value = os.path.expanduser(value)
+                    setattr(args, key, value)
+            
+            # Set up derived arguments
+            if args.dataset == "mvtec":
+                args.num_classes = 15
+            elif args.dataset == "visa":
+                args.num_classes = 12
+            elif args.dataset == "pcb":
+                args.num_classes = 1
+            current_time = datetime.now().strftime("%y%m%d_%H%M%S")
+            args.results_dir = f"results/{test_name}_{current_time}"
+            os.makedirs(args.results_dir, exist_ok=True)
+            # INSERT_YOUR_CODE
+            # Save the current test_args (key-value pairs) into the results_dir as a JSON file
+            config_save_path = os.path.join(args.results_dir, "config.json")
+            with open(config_save_path, "w") as config_file:
+                json.dump(test_args, config_file, indent=2)
+            if args.center_crop:
+                args.actual_image_size = args.center_size
+            else:
+                args.actual_image_size = args.image_size
 
-    if args.object_class == "all" and args.dataset == "mvtec":
-        args.object_classes = [
-            "bottle",
-            "cable",
-            "capsule",
-            "hazelnut",
-            "metal_nut",
-            "pill",
-            "screw",
-            "toothbrush",
-            "transistor",
-            "zipper",
-            "carpet",
-            "grid",
-            "leather",
-            "tile",
-            "wood",
-        ]
-    elif args.object_class == "all" and args.dataset == "visa":
-        args.object_classes = [
-            "candle",
-            "cashew",
-            "fryum",
-            "macaroni2",
-            "pcb2",
-            "pcb4",
-            "capsules",
-            "chewinggum",
-            "macaroni1",
-            "pcb1",
-            "pcb3",
-            "pipe_fryum",
-        ]
-    elif args.object_class == "all" and args.dataset == "pcb":
-        args.object_classes = [
-            "pcb",
-        ]
+            # Set up object classes
+            if args.object_class == "all" and args.dataset == "mvtec":
+                args.object_classes = [
+                    "bottle", "cable", "capsule", "hazelnut", "metal_nut",
+                    "pill", "screw", "toothbrush", "transistor", "zipper",
+                    "carpet", "grid", "leather", "tile", "wood",
+                ]
+            elif args.object_class == "all" and args.dataset == "visa":
+                args.object_classes = [
+                    "candle", "cashew", "fryum", "macaroni2", "pcb2", "pcb4",
+                    "capsules", "chewinggum", "macaroni1", "pcb1", "pcb3", "pipe_fryum",
+                ]
+            elif args.object_class == "all" and args.dataset == "pcb":
+                args.object_classes = ["pcb"]
+            else:
+                args.object_classes = [args.object_class]
+                
+            # Run evaluation for this configuration
+            evaluation(args)
     else:
-        args.object_classes = [args.object_class]
+        # Original single configuration evaluation
+        if args.dataset == "mvtec":
+            args.num_classes = 15
+        elif args.dataset == "visa":
+            args.num_classes = 12
+        elif args.dataset == "pcb":
+            args.num_classes = 1
+        args.results_dir = f"./DeCo-Diff_{args.dataset}_{args.object_class}_{args.model_size}_{args.center_size}"
+        if args.center_crop:
+            args.results_dir += "_CenterCrop"
+            args.actual_image_size = args.center_size
+        else:
+            args.actual_image_size = args.image_size
 
-    evaluation(args)
+        if args.object_class == "all" and args.dataset == "mvtec":
+            args.object_classes = [
+                "bottle",
+                "cable",
+                "capsule",
+                "hazelnut",
+                "metal_nut",
+                "pill",
+                "screw",
+                "toothbrush",
+                "transistor",
+                "zipper",
+                "carpet",
+                "grid",
+                "leather",
+                "tile",
+                "wood",
+            ]
+        elif args.object_class == "all" and args.dataset == "visa":
+            args.object_classes = [
+                "candle",
+                "cashew",
+                "fryum",
+                "macaroni2",
+                "pcb2",
+                "pcb4",
+                "capsules",
+                "chewinggum",
+                "macaroni1",
+                "pcb1",
+                "pcb3",
+                "pipe_fryum",
+            ]
+        elif args.object_class == "all" and args.dataset == "pcb":
+            args.object_classes = [
+                "pcb",
+            ]
+        else:
+            args.object_classes = [args.object_class]
+
+        evaluation(args)
 
 
 # %%

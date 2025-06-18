@@ -24,7 +24,6 @@ class PCBDataset(Dataset):
         object_class: str,
         rootdir="./pcb-dataset/",
         transform=None,
-        normal=True,
         anomaly_class="good",
         image_size=288,
         center_size=256,
@@ -47,10 +46,7 @@ class PCBDataset(Dataset):
         self.scratch = scratch
         self.mode = mode
         self.center_size = center_size
-        if mode == "train" and not normal:
-            raise Exception("training data should be normal")
         self.augment = augment
-        self.normal = normal
         self.center_crop = center_crop
         object_cls_dict = {
             "pcb": 0,
@@ -70,7 +66,7 @@ class PCBDataset(Dataset):
         else:
             df = df.query(f'split=="{mode}" and object=="{object_class}"')
 
-        if anomaly_class == "good" or self.normal:
+        if anomaly_class == "good":
             df = df.query('category=="good"')
         elif anomaly_class == "all":
             pass
@@ -113,8 +109,8 @@ class PCBDataset(Dataset):
             self.aug = A.Compose(
                 [
                     A.Affine(
-                        translate_px=int(self.image_size / 8 - self.center_size / 8),
-                        p=0.8,
+                        translate_px=(-10, 10),
+                        p=1,
                     ),
                     A.RandomBrightnessContrast(
                         brightness_limit=0.05, contrast_limit=0.05, p=0.5
