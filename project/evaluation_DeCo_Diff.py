@@ -50,6 +50,7 @@ from torchmetrics.functional.image import (
 )
 from sklearn.metrics import roc_curve
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import json
 
 torch.set_grad_enabled(False)
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -90,7 +91,7 @@ def add_metric_fields(rec: Record, *, device=None) -> None:
                 x = x.unsqueeze(0)
             return x.to(device).clamp(-1, 1)
 
-    a = to4d(rec["orig"][1])
+    a = to4d(rec["encoded_recon"][1])
     b = to4d(rec["dod_recon"][1])
     rec["lpips"] = ("metric", _lpips(a, b, net_type="alex").item())
     rec["ssim"] = ("metric", _ssim(a, b).item())
@@ -620,9 +621,9 @@ def evaluation(args):
             path = f"./DeCo-Diff_{args.dataset}_{args.object_class}_{args.model_size}_{args.center_size}"
             try:
                 ckpt = sorted(glob(f"{path}/last.pt"))[-1]
-            except:
+            except (IndexError, FileNotFoundError):
                 ckpt = sorted(glob(f"{path}/*/last.pt"))[-1]
-    except:
+    except (IndexError, FileNotFoundError, OSError):
         raise Exception("Please provide the model's pretrained path using --pretrained")
 
     latent_size = int(args.center_size) // 8
@@ -712,6 +713,12 @@ def evaluation(args):
                 )
             y_true_score_list = compute_y_true_y_score(record_pairs)
             roc_stats = compute_metrics_from_y_true_y_score(y_true_score_list)
+            save_perturbation_results(
+                param_name=args.perturbation,
+                roc_stats=roc_stats,
+                param_values=param_values,
+                save_dir=args.results_dir,
+            )
 
             plot_accuracy_results(
                 param_name=args.perturbation,
@@ -720,30 +727,29 @@ def evaluation(args):
                 color="red",
                 save_dir=args.results_dir,
             )
-            plot_roc_curves(
-                param_name=args.perturbation,
-                roc_stats=roc_stats,
-                param_values=param_values,
-                save_dir=args.results_dir,
-            )
-            plot_confusion_matrices(
-                param_name=args.perturbation,
-                roc_stats=roc_stats,
-                param_values=param_values,
-                save_dir=args.results_dir,
-            )
-            records = []
-            for i in range(len(record_pairs[0][0])):
-                for record_pair in record_pairs:
-                    record_train = record_pair[0][i]
-                    records.append(record_train)
-                    record_train_defect = record_pair[1][i]
-                    record_diff = diff_records(record_train, record_train_defect)
-                    records.append(record_train_defect)
-                    records.append(record_diff)
-
-            make_excel(records, args.image_size, save_dir=args.results_dir)
-            plot_distribution(records, save_dir=args.results_dir)
+            #plot_roc_curves(
+            #    param_name=args.perturbation,
+            #    roc_stats=roc_stats,
+            #    param_values=param_values,
+            #    save_dir=args.results_dir,
+            #)
+            #plot_confusion_matrices(
+            #    param_name=args.perturbation,
+            #    roc_stats=roc_stats,
+            #    param_values=param_values,
+            #    save_dir=args.results_dir,
+            #)
+            #records = []
+            #for i in range(len(record_pairs[0][0])):
+            #    for record_pair in record_pairs:
+            #        record_train = record_pair[0][i]
+            #        records.append(record_train)
+            #        record_train_defect = record_pair[1][i]
+            #        record_diff = diff_records(record_train, record_train_defect)
+            #        records.append(record_train_defect)
+            #        records.append(record_diff)
+            #make_excel(records, args.image_size, save_dir=args.results_dir)
+            #plot_distribution(records, save_dir=args.results_dir)
 
         # Create diffusion object:
 
@@ -1219,6 +1225,7 @@ def plot_accuracy_results(
     plt.xlabel(xlabel or param_name)
     plt.ylabel(ylabel)
     plt.title(title or f"Accuracy vs {param_name.capitalize()} (synthetic defect)")
+    plt.ylim(0.5, 1.0)
     plt.grid(grid)
     out_path = os.path.join(save_dir, f"accuracy_vs_{param_name}_{save_filename}.png")
     plt.savefig(out_path)
@@ -1366,6 +1373,55 @@ def plot_confusion_matrices(
     plt.savefig(out_path, bbox_inches="tight")
     print(f"Confusion matrices saved to {out_path}")
     plt.close()
+
+
+def save_perturbation_results(
+    param_name: str,
+    roc_stats: dict,
+    param_values: list,
+    save_dir: str,
+):
+    """
+    Save perturbation experiment data (roc_stats and param_values) to a specified folder in JSON format.
+
+    Args:
+        param_name: Name of the perturbation parameter
+        roc_stats: Dictionary containing ROC statistics
+        param_values: List of parameter values
+        save_dir: Directory to save the results
+    """
+    save_dir = Path(save_dir).expanduser()
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Convert numpy arrays to lists for JSON serialization
+    def convert_for_json(obj):
+        if hasattr(obj, 'tolist'):  # numpy arrays
+            return obj.tolist()
+        elif isinstance(obj, list):
+            return [convert_for_json(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {key: convert_for_json(value) for key, value in obj.items()}
+        else:
+            return obj
+
+    # Convert roc_stats to JSON-serializable format
+    roc_stats_json = convert_for_json(roc_stats)
+    
+    # Convert param_values to JSON-serializable format
+    param_values_json = convert_for_json(param_values)
+
+    # Save both roc_stats and param_values in a single JSON file
+    results_data = {
+        "param_name": param_name,
+        "param_values": param_values_json,
+        "roc_stats": roc_stats_json
+    }
+    
+    json_path = os.path.join(save_dir, f"{param_name}_results.json")
+    with open(json_path, "w") as f:
+        json.dump(results_data, f, indent=2)
+
+    print(f"Perturbation results saved to {json_path}")
 
 
 def main():
