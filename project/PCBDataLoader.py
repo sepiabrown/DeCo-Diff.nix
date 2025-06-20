@@ -35,6 +35,7 @@ class PCBDataset(Dataset):
         shift_y: int = None,
         blur: int = None,
         noise: int = None,
+        num_datafile: int = None,
     ):
         """
         Args:
@@ -61,6 +62,8 @@ class PCBDataset(Dataset):
         self.blur = blur
         self.noise = noise
         df = pd.read_csv(os.path.join(".", "splits", "pcb-split.csv"))
+        if num_datafile is not None:
+            df = df.sample(n=num_datafile)
         if object_class == "all":
             df = df.query(f'split=="{mode}"')
         else:
@@ -84,9 +87,8 @@ class PCBDataset(Dataset):
         for i, row in df.iterrows():
             data_path = os.path.join(rootdir, row["image"])
             img = np.array(
-                Image.open(data_path)
-                .convert("RGB")
-                .resize((self.image_size, self.image_size))
+                Image.open(data_path).convert("RGB")
+                # .resize((self.image_size, self.image_size))
             ).astype(np.uint8)
             self.image_paths.append(data_path)
             self.images.append(img)
@@ -96,32 +98,36 @@ class PCBDataset(Dataset):
                 seg_path = os.path.join(rootdir, row["mask"])
                 seg = (
                     np.array(
-                        Image.open(seg_path)
-                        .convert("L")
-                        .resize((self.image_size, self.image_size))
+                        Image.open(seg_path).convert("L")
+                        # .resize((self.image_size, self.image_size))
                     )
                     > 0
                 ).astype(np.uint8)
                 self.segs.append((seg))
             else:
-                self.segs.append(np.zeros((self.image_size, self.image_size)))
+                seg_path = os.path.join(rootdir, row["image"])
+                if os.path.exists(seg_path):
+                    seg_shape = np.array(Image.open(seg_path)).shape
+                else:
+                    seg_shape = (self.image_size, self.image_size)
+                self.segs.append(np.zeros(seg_shape))
         if self.augment:
             self.aug = A.Compose(
                 [
-                    A.Affine(
-                        translate_px=(-10, 10),
-                        p=1,
-                    ),
                     A.RandomBrightnessContrast(
                         brightness_limit=0.05, contrast_limit=0.05, p=0.5
                     ),
-                    A.CenterCrop(p=1, height=self.center_size, width=self.center_size),
+                    A.Rotate(
+                        limit=5,
+                        p=1,
+                        interpolation=cv2.INTER_NEAREST,
+                        border_mode=cv2.BORDER_REPLICATE,
+                    ),
+                    A.RandomCrop(p=1, height=self.image_size, width=self.image_size),
                 ]
             )
         else:
-            self.aug = A.CenterCrop(
-                p=1, height=self.center_size, width=self.center_size
-            )
+            self.aug = A.CenterCrop(p=1, height=self.image_size, width=self.image_size)
 
     def transform_volume(self, x):
         x = torch.from_numpy(x.transpose((-1, 0, 1)))
@@ -134,7 +140,7 @@ class PCBDataset(Dataset):
         img = self.images[index].astype(np.uint8)
         seg = self.segs[index].astype(np.int32)
         anomaly_class = self.anomaly_classes[index]
-        if self.center_crop:
+        if self.augment:
             augmented = self.aug(image=img, mask=seg)
             img = augmented["image"]
             seg = augmented["mask"]
@@ -150,18 +156,14 @@ class PCBDataset(Dataset):
         # 2. Random shift
         if self.shift_x is not None:
             tx = self.shift_x
-            assert (
-                abs(tx) < img.shape[0]
-            ), "shift should be less than the image size"
+            assert abs(tx) < img.shape[0], "shift should be less than the image size"
             M = np.float32([[1, 0, tx], [0, 1, 0]])
             img = cv2.warpAffine(
                 img, M, (img.shape[1], img.shape[0]), borderMode=cv2.BORDER_REFLECT
             )
         if self.shift_y is not None:
             ty = self.shift_y
-            assert (
-                abs(ty) < img.shape[1]
-            ), "shift should be less than the image size"
+            assert abs(ty) < img.shape[1], "shift should be less than the image size"
             M = np.float32([[1, 0, 0], [0, 1, ty]])
             img = cv2.warpAffine(
                 img, M, (img.shape[1], img.shape[0]), borderMode=cv2.BORDER_REFLECT
@@ -173,10 +175,7 @@ class PCBDataset(Dataset):
         # 4. Random noise
         if self.noise is not None:
             num_salt = self.noise
-            coords = [
-                np.random.randint(0, i, num_salt)
-                for i in img.shape
-            ]
+            coords = [np.random.randint(0, i, num_salt) for i in img.shape]
             img[tuple(coords)] = 255
         img = img.astype(np.float32) / 255.0
         y = self.object_classes[index]

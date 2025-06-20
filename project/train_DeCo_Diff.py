@@ -1,7 +1,4 @@
 import torch
-# the first flag below was False when we tested this script but True makes A100 training a lot faster:
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -27,8 +24,13 @@ from PCBDataLoader import PCBDataset
 from scipy.ndimage import gaussian_filter
 from transformers import get_cosine_schedule_with_warmup
 
-
 import torch.nn as nn
+
+# the first flag below was False when we tested this script but True makes A100 training a lot faster:
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
 class ClassEmbedder(nn.Module):
     def __init__(self, embed_dim, n_classes=15):
         super().__init__()
@@ -43,9 +45,11 @@ def smooth_mask(mask, sigma=1.0):
     smoothed_mask = gaussian_filter(mask, sigma=sigma)
     return smoothed_mask
 
+
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
+
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -78,10 +82,14 @@ def cleanup():
 def shuffle_patches(image, patch_size):
     N, C, H, W = image.shape
     P = patch_size
-    assert H % P == 0 and W % P == 0, "Image dimensions should be divisible by patch size."
+    assert H % P == 0 and W % P == 0, (
+        "Image dimensions should be divisible by patch size."
+    )
 
     # Extract patches
-    unfolded = F.unfold(image, kernel_size=patch_size, stride=patch_size)  # Shape: (N*C*P*P, num_patches)
+    unfolded = F.unfold(
+        image, kernel_size=patch_size, stride=patch_size
+    )  # Shape: (N*C*P*P, num_patches)
 
     # Reshape unfolded patches to (N, C, P, P, num_patches)
     num_patches = unfolded.shape[-1]
@@ -89,7 +97,9 @@ def shuffle_patches(image, patch_size):
 
     # Shuffle patches across the batch dimension
     unfolded = unfolded.permute(0, 4, 1, 2, 3)  # Shape: (N, num_patches, C, P, P)
-    unfolded = unfolded.reshape(N * num_patches, C, P, P)  # Shape: (N * num_patches, C, P, P)
+    unfolded = unfolded.reshape(
+        N * num_patches, C, P, P
+    )  # Shape: (N * num_patches, C, P, P)
 
     # Shuffle patches
     indices = torch.randperm(N * num_patches)
@@ -97,17 +107,20 @@ def shuffle_patches(image, patch_size):
 
     # Reshape back to original format
     shuffled_unfolded = shuffled_unfolded.view(N, num_patches, C, P, P)
-    shuffled_unfolded = shuffled_unfolded.permute(0, 2, 3, 4, 1)  # Shape: (N, C, P, P, num_patches)
+    shuffled_unfolded = shuffled_unfolded.permute(
+        0, 2, 3, 4, 1
+    )  # Shape: (N, C, P, P, num_patches)
 
     # Reconstruct the image
     shuffled_unfolded = shuffled_unfolded.contiguous().view(N * C * P * P, num_patches)
-    folded = F.fold(shuffled_unfolded, output_size=(H, W), kernel_size=patch_size, stride=patch_size)
+    folded = F.fold(
+        shuffled_unfolded, output_size=(H, W), kernel_size=patch_size, stride=patch_size
+    )
 
     # Fold operation does not include channels; need to reshape and combine
     folded = folded.view(N, C, H, W)
-    
-    return folded
 
+    return folded
 
 
 def create_logger(logging_dir):
@@ -117,9 +130,12 @@ def create_logger(logging_dir):
     if dist.get_rank() == 0:  # real logger
         logging.basicConfig(
             level=logging.INFO,
-            format='[\033[34m%(asctime)s\033[0m] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
+            format="[\033[34m%(asctime)s\033[0m] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler(f"{logging_dir}/log.txt"),
+            ],
         )
         logger = logging.getLogger(__name__)
     else:  # dummy logger (does nothing)
@@ -146,23 +162,26 @@ def center_crop_arr(pil_image, image_size):
     arr = np.array(pil_image)
     crop_y = (arr.shape[0] - image_size) // 2
     crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
+    return Image.fromarray(
+        arr[crop_y : crop_y + image_size, crop_x : crop_x + image_size]
+    )
 
 
-
-def random_mask(x : torch.Tensor, mask_ratios, mask_patch_size=1):
+def random_mask(x: torch.Tensor, mask_ratios, mask_patch_size=1):
     for mask_ratio in mask_ratios:
-        assert mask_ratio >=0 and mask_ratio<=1
+        assert mask_ratio >= 0 and mask_ratio <= 1
     n, c, w, h = x.shape
     size = int(np.prod(x.shape[2:]) / (mask_patch_size**2))
-    mask = torch.zeros((n,c,size)).to(x.device)
+    mask = torch.zeros((n, c, size)).to(x.device)
     for b in range(n):
         masked_indexes = np.arange(size)
         np.random.shuffle(masked_indexes)
-        masked_indexes = masked_indexes[:int(size * (1 - mask_ratios[b]))]
-        mask[b,:, masked_indexes] = 1
-    mask = mask.reshape(n, c, int(w/mask_patch_size), int(w/mask_patch_size))
-    mask = mask.repeat_interleave(mask_patch_size, dim=2).repeat_interleave(mask_patch_size, dim=3)
+        masked_indexes = masked_indexes[: int(size * (1 - mask_ratios[b]))]
+        mask[b, :, masked_indexes] = 1
+    mask = mask.reshape(n, c, int(w / mask_patch_size), int(w / mask_patch_size))
+    mask = mask.repeat_interleave(mask_patch_size, dim=2).repeat_interleave(
+        mask_patch_size, dim=3
+    )
     return mask
 
 
@@ -170,17 +189,19 @@ def random_mask(x : torch.Tensor, mask_ratios, mask_patch_size=1):
 #                                  Training Loop                                #
 #################################################################################
 
+
 def _main(args):
-    
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup DDP:
-    local_rank = int(os.environ['LOCAL_RANK'])
+    local_rank = int(os.environ["LOCAL_RANK"])
     dist.init_process_group("nccl")
-    assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
+    assert args.global_batch_size % dist.get_world_size() == 0, (
+        f"Batch size must be divisible by world size."
+    )
     rank = dist.get_rank()
     device = rank % torch.cuda.device_count()
-    torch_device = torch.device(f'cuda:{rank}')
+    torch_device = torch.device(f"cuda:{rank}")
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
@@ -188,15 +209,19 @@ def _main(args):
 
     # Setup an experiment folder:
     if rank == 0:
-        os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
-        
-        with open(f'{args.results_dir}/args.txt', 'w') as f:
+        os.makedirs(
+            args.results_dir, exist_ok=True
+        )  # Make results folder (holds all experiment subfolders)
+
+        with open(f"{args.results_dir}/args.txt", "w") as f:
             json.dump(args.__dict__, f, indent=2)
         experiment_index = len(glob(f"{args.results_dir}/*"))
         experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{args.model_size.replace('/', '-')}"  # Create an experiment folder
         if args.resume_dir:
             experiment_dir = args.resume_dir
-        checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+        checkpoint_dir = (
+            f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+        )
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
@@ -204,38 +229,120 @@ def _main(args):
         logger = create_logger(None)
 
     # Create model:
-    assert args.center_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
+    assert args.center_size % 8 == 0, (
+        "Image size must be divisible by 8 (for the VAE encoder)."
+    )
     latent_size = args.actual_image_size // 8
     model = UNET_models[args.model_size](latent_size=latent_size)
-        
 
-    ema = deepcopy(model).to(torch_device)  # Create an EMA of the model for use after training
+    ema = deepcopy(model).to(
+        torch_device
+    )  # Create an EMA of the model for use after training
     requires_grad(ema, False)
 
     model = DDP(model.to(torch_device), device_ids=[rank])
-    diffusion = create_diffusion(timestep_respacing="ddim10", predict_deviation=True, predict_xstart=False, sigma_small=False)  # default: 1000 steps, linear noise schedule
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae_type}").to(torch_device)
+    diffusion = create_diffusion(
+        timestep_respacing="ddim10",
+        predict_deviation=True,
+        predict_xstart=False,
+        sigma_small=False,
+    )  # default: 1000 steps, linear noise schedule
+    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae_type}").to(
+        torch_device
+    )
     vae.eval()
     logger.info(f"Number of Parameters: {sum(p.numel() for p in model.parameters()):}")
-    
+
     # Setup data:
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
-    ])
-        
-    
-    if args.dataset=='mvtec':
-        dataset = MVTECDataset('train', object_class=args.object_class, rootdir=args.data_dir, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
-    elif args.dataset=='visa':
-        dataset = VISADataset('train', object_class=args.object_class, rootdir=args.data_dir, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
-    elif args.dataset=='pcb':
-        dataset = PCBDataset('train', object_class=args.object_class, rootdir=args.data_dir, transform=transform, image_size=args.image_size,  center_size=args.center_size, augment=args.augmentation, center_crop=args.center_crop)
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True
+            ),
+        ]
+    )
+
+    if args.dataset == "mvtec":
+        dataset = MVTECDataset(
+            "train",
+            object_class=args.object_class,
+            rootdir=args.data_dir,
+            transform=transform,
+            image_size=args.image_size,
+            center_size=args.center_size,
+            augment=args.augmentation,
+            center_crop=args.center_crop,
+        )
+    elif args.dataset == "visa":
+        dataset = VISADataset(
+            "train",
+            object_class=args.object_class,
+            rootdir=args.data_dir,
+            transform=transform,
+            image_size=args.image_size,
+            center_size=args.center_size,
+            augment=args.augmentation,
+            center_crop=args.center_crop,
+        )
+    elif args.dataset == "pcb":
+        dataset = PCBDataset(
+            "train",
+            object_class=args.object_class,
+            rootdir=args.data_dir,
+            transform=transform,
+            image_size=args.image_size,
+            center_size=args.center_size,
+            augment=args.augmentation,
+            center_crop=args.center_crop,
+        )
 
     batch_size = args.global_batch_size // dist.get_world_size()
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=False)
+    loader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=False
+    )
+    if args.num_datafile is None and args.rep_datafile is None:
+        if args.dataset == "mvtec":
+            val_dataset = MVTECDataset(
+                "val",
+                object_class=args.object_class,
+                rootdir=args.data_dir,
+                transform=transform,
+                image_size=args.image_size,
+                center_size=args.center_size,
+                augment=args.augmentation,
+                center_crop=args.center_crop,
+            )
+        elif args.dataset == "visa":
+            val_dataset = VISADataset(
+                "val",
+                object_class=args.object_class,
+                rootdir=args.data_dir,
+                transform=transform,
+                image_size=args.image_size,
+                center_size=args.center_size,
+                augment=args.augmentation,
+                center_crop=args.center_crop,
+            )
+        elif args.dataset == "pcb":
+            val_dataset = PCBDataset(
+                "val",
+                object_class=args.object_class,
+                rootdir=args.data_dir,
+                transform=transform,
+                image_size=args.image_size,
+                center_size=args.center_size,
+                augment=args.augmentation,
+                center_crop=args.center_crop,
+            )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=4,
+            drop_last=False,
+        )
     accumulation_steps = 1
-
 
     logger.info(f"Dataset contains {len(dataset):,} training images")
 
@@ -246,20 +353,22 @@ def _main(args):
     scheduler = get_cosine_schedule_with_warmup(
         opt,
         num_warmup_steps=args.warmup_epochs,
-        num_training_steps=args.epochs*1.5,
+        num_training_steps=args.epochs * 1.5,
     )
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=adjusted_epochs, eta_min=args.lr/100)
     # Setup data:
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
-    ])
-        
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True
+            ),
+        ]
+    )
+
     start_epoch = 0
     if args.resume_dir:
-        last_ckpt = os.path.join(
-            args.resume_dir, "checkpoints", "last.pt"
-        )
+        last_ckpt = os.path.join(args.resume_dir, "checkpoints", "last.pt")
         if os.path.isfile(last_ckpt):
             if rank == 0:
                 logger.info(f"Found checkpoint at {last_ckpt!r}, resuming…")
@@ -279,7 +388,9 @@ def _main(args):
             start_epoch = 0
 
     # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
+    update_ema(
+        ema, model.module, decay=0
+    )  # Ensure EMA is initialized with synced weights
 
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
@@ -295,6 +406,52 @@ def _main(args):
     logger.info(f"Training for {adjusted_epochs} epochs...")
     for epoch in range(start_epoch, adjusted_epochs):
         logger.info(f"Beginning epoch {epoch}...")
+        if args.num_datafile is not None and args.rep_datafile is not None:
+            if epoch % args.rep_datafile == 0:
+                if args.dataset == "mvtec":
+                    dataset = MVTECDataset(
+                        "train",
+                        object_class=args.object_class,
+                        rootdir=args.data_dir,
+                        transform=transform,
+                        image_size=args.image_size,
+                        center_size=args.center_size,
+                        augment=args.augmentation,
+                        center_crop=args.center_crop,
+                    )
+                elif args.dataset == "visa":
+                    dataset = VISADataset(
+                        "train",
+                        object_class=args.object_class,
+                        rootdir=args.data_dir,
+                        transform=transform,
+                        image_size=args.image_size,
+                        center_size=args.center_size,
+                        augment=args.augmentation,
+                        center_crop=args.center_crop,
+                    )
+                elif args.dataset == "pcb":
+                    dataset = PCBDataset(
+                        "train",
+                        object_class=args.object_class,
+                        rootdir=args.data_dir,
+                        transform=transform,
+                        image_size=args.image_size,
+                        center_size=args.center_size,
+                        augment=args.augmentation,
+                        center_crop=args.center_crop,
+                        num_datafile=args.num_datafile,
+                    )
+
+                batch_size = args.global_batch_size // dist.get_world_size()
+                loader = DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=True,
+                    num_workers=4,
+                    drop_last=False,
+                )
+
         for ii, (x, _, y, _, _) in enumerate(loader):
             x = x.to(torch_device)
             with torch.no_grad():
@@ -303,53 +460,78 @@ def _main(args):
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
 
             if args.actual_image_size == 128:
-                mask_patch_size = np.random.choice([1,2,4], 1, p=[0.443, 0.333, 0.224]).item()
+                mask_patch_size = np.random.choice(
+                    [1, 2, 4], 1, p=[0.443, 0.333, 0.224]
+                ).item()
             if args.actual_image_size == 224:
-                mask_patch_size = np.random.choice([1,2,4,7], 1, p=[0.4, 0.3, 0.2, 0.1]).item()
+                mask_patch_size = np.random.choice(
+                    [1, 2, 4, 7], 1, p=[0.4, 0.3, 0.2, 0.1]
+                ).item()
             if args.actual_image_size == 256:
-                mask_patch_size = np.random.choice([1,2,4,8], 1, p=[0.4, 0.3, 0.2, 0.1]).item()
+                mask_patch_size = np.random.choice(
+                    [1, 2, 4, 8], 1, p=[0.4, 0.3, 0.2, 0.1]
+                ).item()
             if args.actual_image_size == 320:
-                mask_patch_size = np.random.choice([1,2,4,8], 1, p=[0.4, 0.3, 0.2, 0.1]).item()
+                mask_patch_size = np.random.choice(
+                    [1, 2, 4, 8], 1, p=[0.4, 0.3, 0.2, 0.1]
+                ).item()
             if args.actual_image_size == 384:
-                mask_patch_size = np.random.choice([1,2,4,8,12], 1, p=[0.3, 0.25, 0.20, 0.15, 0.1]).item()
+                mask_patch_size = np.random.choice(
+                    [1, 2, 4, 8, 12], 1, p=[0.3, 0.25, 0.20, 0.15, 0.1]
+                ).item()
             if args.actual_image_size == 448:
-                mask_patch_size = np.random.choice([1,2,4,8,14], 1, p=[0.3, 0.25, 0.20, 0.15, 0.1]).item()
+                mask_patch_size = np.random.choice(
+                    [1, 2, 4, 8, 14], 1, p=[0.3, 0.25, 0.20, 0.15, 0.1]
+                ).item()
             elif args.actual_image_size == 512:
-                mask_patch_size = np.random.choice([1,2,4,8,16], 1, p=[0.3, 0.25, 0.20, 0.15, 0.1]).item()   
+                mask_patch_size = np.random.choice(
+                    [1, 2, 4, 8, 16], 1, p=[0.3, 0.25, 0.20, 0.15, 0.1]
+                ).item()
             if args.mask_random_ratio:
-                mask_ratios = np.random.uniform(low=0.0, high=0.7, size = x.shape[0])
+                mask_ratios = np.random.uniform(low=0.0, high=0.7, size=x.shape[0])
             else:
                 mask_ratio = args.mask_ratio
-                mask_ratios = [mask_ratio]*x.shape[0],
-                
-            mask = random_mask(x, mask_ratios=mask_ratios, mask_patch_size=mask_patch_size)
-    
+                mask_ratios = ([mask_ratio] * x.shape[0],)
+
+            mask = random_mask(
+                x, mask_ratios=mask_ratios, mask_patch_size=mask_patch_size
+            )
+
             model_kwargs = {
-            'context' : torch.tensor(y).to(torch_device).int().unsqueeze(1),
-            'mask': mask
+                "context": torch.tensor(y).to(torch_device).int().unsqueeze(1),
+                "mask": mask,
             }
-            
-            noise_mask = random_mask(x, mask_ratios=np.random.uniform(low=0.0, high=args.patch_shuffle_ratio, size = x.shape[0]), mask_patch_size=mask_patch_size)
-            noise = noise_mask * torch.randn_like(x, device=device) + (1-noise_mask) *  shuffle_patches(x, mask_patch_size)
-            
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs, noise = noise)
+
+            noise_mask = random_mask(
+                x,
+                mask_ratios=np.random.uniform(
+                    low=0.0, high=args.patch_shuffle_ratio, size=x.shape[0]
+                ),
+                mask_patch_size=mask_patch_size,
+            )
+            noise = noise_mask * torch.randn_like(x, device=device) + (
+                1 - noise_mask
+            ) * shuffle_patches(x, mask_patch_size)
+
+            loss_dict = diffusion.training_losses(
+                model, x, t, model_kwargs, noise=noise
+            )
             loss = loss_dict["loss"].mean()
             loss.backward()
-            
+
             if (ii + 1) % accumulation_steps == 0:
                 opt.step()
-                opt.zero_grad() 
-                
+                opt.zero_grad()
+
             update_ema(ema, model.module)
 
             # Log loss values:
             running_loss += loss.item()
             running_mse += loss_dict["mse"].mean().item()
-            
+
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
-                
                 # Measure training speed:
                 torch.cuda.synchronize()
                 end_time = time()
@@ -361,7 +543,9 @@ def _main(args):
                 dist.all_reduce(avg_mse, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 avg_mse = avg_mse.item() / dist.get_world_size()
-                logger.info(f"(category={args.object_class} step={train_steps:07d}) MSE Loss: {avg_mse:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                logger.info(
+                    f"(category={args.object_class} step={train_steps:07d}) MSE Loss: {avg_mse:.4f}, Train Steps/Sec: {steps_per_sec:.2f}"
+                )
                 if rank == 0:
                     if avg_loss < best_loss:
                         best_loss = avg_loss
@@ -370,10 +554,12 @@ def _main(args):
                             "opt": opt.state_dict(),
                             "scheduler": scheduler.state_dict(),
                             "epoch": epoch,
-                            "args": args.__dict__
+                            "args": args.__dict__,
                         }
                         torch.save(checkpoint, f"{checkpoint_dir}/best.pt")
-                        logger.info(f"Saved **best** checkpoint (loss={best_loss:.4f}) to {checkpoint_dir}/best.pt")
+                        logger.info(
+                            f"Saved **best** checkpoint (loss={best_loss:.4f}) to {checkpoint_dir}/best.pt"
+                        )
                 dist.barrier()
 
                 # Reset monitoring variables:
@@ -383,6 +569,87 @@ def _main(args):
                 log_steps = 0
                 start_time = time()
 
+        if rank == 0 and "val_loader" in locals():
+            model.eval()
+            val_loss = 0
+            val_mse = 0
+            val_steps = 0
+            with torch.no_grad():
+                for val_x, _, val_y, _, _ in val_loader:
+                    val_x = val_x.to(torch_device)
+                    val_x = vae.encode(val_x).latent_dist.sample().mul_(0.18215)
+                    t = torch.randint(
+                        0, diffusion.num_timesteps, (val_x.shape[0],), device=device
+                    )
+                    # Use the same mask logic as in training
+                    if args.actual_image_size == 128:
+                        mask_patch_size = np.random.choice(
+                            [1, 2, 4], 1, p=[0.443, 0.333, 0.224]
+                        ).item()
+                    if args.actual_image_size == 224:
+                        mask_patch_size = np.random.choice(
+                            [1, 2, 4, 7], 1, p=[0.4, 0.3, 0.2, 0.1]
+                        ).item()
+                    if args.actual_image_size == 256:
+                        mask_patch_size = np.random.choice(
+                            [1, 2, 4, 8], 1, p=[0.4, 0.3, 0.2, 0.1]
+                        ).item()
+                    if args.actual_image_size == 320:
+                        mask_patch_size = np.random.choice(
+                            [1, 2, 4, 8], 1, p=[0.4, 0.3, 0.2, 0.1]
+                        ).item()
+                    if args.actual_image_size == 384:
+                        mask_patch_size = np.random.choice(
+                            [1, 2, 4, 8, 12], 1, p=[0.3, 0.25, 0.20, 0.15, 0.1]
+                        ).item()
+                    if args.actual_image_size == 448:
+                        mask_patch_size = np.random.choice(
+                            [1, 2, 4, 8, 14], 1, p=[0.3, 0.25, 0.20, 0.15, 0.1]
+                        ).item()
+                    elif args.actual_image_size == 512:
+                        mask_patch_size = np.random.choice(
+                            [1, 2, 4, 8, 16], 1, p=[0.3, 0.25, 0.20, 0.15, 0.1]
+                        ).item()
+                    if args.mask_random_ratio:
+                        mask_ratios = np.random.uniform(
+                            low=0.0, high=0.7, size=val_x.shape[0]
+                        )
+                    else:
+                        mask_ratio = args.mask_ratio
+                        mask_ratios = ([mask_ratio] * val_x.shape[0],)
+                    mask = random_mask(
+                        val_x, mask_ratios=mask_ratios, mask_patch_size=mask_patch_size
+                    )
+                    model_kwargs = {
+                        "context": torch.tensor(val_y)
+                        .to(torch_device)
+                        .int()
+                        .unsqueeze(1),
+                        "mask": mask,
+                    }
+                    noise_mask = random_mask(
+                        val_x,
+                        mask_ratios=np.random.uniform(
+                            low=0.0, high=args.patch_shuffle_ratio, size=val_x.shape[0]
+                        ),
+                        mask_patch_size=mask_patch_size,
+                    )
+                    noise = noise_mask * torch.randn_like(val_x, device=device) + (
+                        1 - noise_mask
+                    ) * shuffle_patches(val_x, mask_patch_size)
+                    loss_dict = diffusion.training_losses(
+                        model, val_x, t, model_kwargs, noise=noise
+                    )
+                    val_loss += loss_dict["loss"].mean().item()
+                    val_mse += loss_dict["mse"].mean().item()
+                    val_steps += 1
+            val_loss /= max(val_steps, 1)
+            val_mse /= max(val_steps, 1)
+            logger.info(
+                f"(category={args.object_class} epoch={epoch:03d}) VAL MSE Loss: {val_mse:.4f}, VAL Loss: {val_loss:.4f}"
+            )
+            model.train()
+
         scheduler.step()
         if rank == 0:
             # Save checkpoint:
@@ -391,37 +658,49 @@ def _main(args):
                 "opt": opt.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "epoch": epoch,
-                "args": args.__dict__
+                "args": args.__dict__,
                 ## "ema": ema.state_dict(),
                 ## "opt": opt.state_dict(),
-                #"args": args
+                # "args": args
             }
             torch.save(checkpoint, f"{checkpoint_dir}/last.pt")
-            if epoch % args.ckpt_every == 0 and epoch>0:
+            if epoch % args.ckpt_every == 0 and epoch > 0:
                 checkpoint_path = f"{checkpoint_dir}/{epoch}.pt"
                 torch.save(checkpoint, checkpoint_path)
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
 
         dist.barrier()
-            
 
     logger.info("Done!")
     cleanup()
-    
+
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, choices=['mvtec','visa','pcb'], default="mvtec")
-    parser.add_argument("--data-dir", type=str, default='./mvtec-dataset/')
-    parser.add_argument("--model-size", type=str, choices=['UNet_XS','UNet_S', 'UNet_M', 'UNet_L', 'UNet_XL'], default='UNet_XS')
-    parser.add_argument("--image-size", type=int, default= 288 )
+    parser.add_argument(
+        "--dataset", type=str, choices=["mvtec", "visa", "pcb"], default="mvtec"
+    )
+    parser.add_argument("--data-dir", type=str, default="./mvtec-dataset/")
+    parser.add_argument(
+        "--model-size",
+        type=str,
+        choices=["UNet_XS", "UNet_S", "UNet_M", "UNet_L", "UNet_XL"],
+        default="UNet_XS",
+    )
+    parser.add_argument("--image-size", type=int, default=288)
     parser.add_argument("--center-size", type=int, default=256)
-    parser.add_argument("--center-crop", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
+    parser.add_argument(
+        "--center-crop",
+        type=lambda v: True if v.lower() in ("yes", "true", "t", "y", "1") else False,
+        default=True,
+    )
     parser.add_argument("--epochs", type=int, default=800)
     parser.add_argument("--warmup-epochs", type=int, default=10)
     parser.add_argument("--global-batch-size", type=int, default=128)
     parser.add_argument("--global-seed", type=int, default=10)
-    parser.add_argument("--vae-type", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
+    parser.add_argument(
+        "--vae-type", type=str, choices=["ema", "mse"], default="ema"
+    )  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--ckpt-every", type=int, default=10)
@@ -429,23 +708,37 @@ def main():
     parser.add_argument("--local-rank", type=int, default=0)
     parser.add_argument("--mask-ratio", type=float, default=0.7)
     parser.add_argument("--patch-shuffle-ratio", type=float, default=0.3)
-    parser.add_argument("--object-class", type=str, default='all')
-    parser.add_argument("--mask-random-ratio", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
-    parser.add_argument("--from-scratch", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
-    parser.add_argument("--augmentation", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
+    parser.add_argument("--object-class", type=str, default="all")
+    parser.add_argument(
+        "--mask-random-ratio",
+        type=lambda v: True if v.lower() in ("yes", "true", "t", "y", "1") else False,
+        default=True,
+    )
+    parser.add_argument(
+        "--from-scratch",
+        type=lambda v: True if v.lower() in ("yes", "true", "t", "y", "1") else False,
+        default=True,
+    )
+    parser.add_argument(
+        "--augmentation",
+        type=lambda v: True if v.lower() in ("yes", "true", "t", "y", "1") else False,
+        default=True,
+    )
     parser.add_argument(
         "--resume-dir",
         type=str,
         default=None,
-        help="Dir to a checkpoint/last.pt file to resume training from"
+        help="Dir to a checkpoint/last.pt file to resume training from",
     )
-    
+    parser.add_argument("--num-datafile", type=int, default=None)
+    parser.add_argument("--rep-datafile", type=int, default=None)
+
     args = parser.parse_args()
-    if args.dataset == 'mvtec':
+    if args.dataset == "mvtec":
         args.num_classes = 15
-    elif args.dataset == 'visa':
+    elif args.dataset == "visa":
         args.num_classes = 12
-    elif args.dataset == 'pcb':
+    elif args.dataset == "pcb":
         args.num_classes = 1
     args.results_dir = f"./DeCo-Diff_{args.dataset}_{args.object_class}_{args.model_size}_{args.center_size}"
     if args.center_crop:
@@ -453,8 +746,9 @@ def main():
         args.actual_image_size = args.center_size
     else:
         args.actual_image_size = args.image_size
-        
+
     _main(args)
+
 
 if __name__ == "__main__":
     main()
