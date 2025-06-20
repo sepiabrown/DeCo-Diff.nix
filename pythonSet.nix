@@ -4,6 +4,7 @@
   workspace,
   pyproject-nix,
   pyproject-build-systems,
+  forWin ? false,
   ...
 }:
 
@@ -49,54 +50,60 @@ let
     torchaudio = prev.torchaudio.overrideAttrs (old: {
       nativeBuildInputs =
         (old.nativeBuildInputs or [ ])
-        ++ cudaLibs
+        ++ lib.optionals (! forWin) (cudaLibs
         ++ [
           pkgs.ffmpeg_6.dev
           pkgs.sox
-        ];
+        ]);
       preFixup = ''
         rm $out/${final.python.sitePackages}/torio/lib/{lib,_}torio_ffmpeg{4,5}.*
+      '' + lib.optionalString (! forWin) ''
         addAutoPatchelfSearchPath "${final.torch}"
       '';
     });
     torchvision = prev.torchvision.overrideAttrs (old: {
-      nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ cudaLibs;
-      preFixup = ''
+      nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ lib.optionals (! forWin) cudaLibs;
+      preFixup = lib.optionalString (! forWin) ''
         addAutoPatchelfSearchPath "${final.torch}"
       '';
     });
     nvidia-cudnn-cu11 = prev.nvidia-cudnn-cu11.overrideAttrs (old: {
-      nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ cudaLibs;
+      nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ lib.optionals (! forWin) cudaLibs;
     });
     nvidia-cusolver-cu12 = prev.nvidia-cusolver-cu12.overrideAttrs (old: {
-      nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ cudaLibs;
+      nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ lib.optionals (! forWin) cudaLibs;
     });
     nvidia-cusparse-cu12 = prev.nvidia-cusparse-cu12.overrideAttrs (old: {
-      nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ cudaLibs;
+      nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ lib.optionals (! forWin) cudaLibs;
     });
     torch = prev.torch.overrideAttrs (old: {
-      nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ cudaLibs;
+      nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ lib.optionals (! forWin) cudaLibs;
     });
   };
 
   buildSystemOverrides =
     final: prev:
     let
-      deps = {
+      deps = ({
         fire = {
           setuptools = [ ];
         };
         antlr4-python3-runtime = {
           setuptools = [ ];
         };
-      };
+      });
     in
     pkgs.lib.mapAttrs (
       name: spec:
       prev.${name}.overrideAttrs (old: {
+        buildInputs = (old.buildInputs or [ ]) ++ final.resolveBuildSystem spec;
         nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ final.resolveBuildSystem spec;
       })
     ) deps;
+
+  pyprojectCrossOverrides = _final: prev: {
+    pythonPkgsBuildHost = prev.pythonPkgsBuildHost.overrideScope overlay;
+  };
 
   # Construct package set
   pythonSet =
@@ -107,6 +114,7 @@ let
       (
         lib.composeManyExtensions [
           pyproject-build-systems.overlays.default
+          pyprojectCrossOverrides
           overlay
           pyprojectOverrides
           buildSystemOverrides

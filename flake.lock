@@ -129,15 +129,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1746540146,
-        "narHash": "sha256-QxdHGNpbicIrw5t6U3x+ZxeY/7IEJ6lYbvsjXmcxFIM=",
-        "owner": "pyproject-nix",
+        "lastModified": 1750431846,
+        "narHash": "sha256-c4ff0Mf1smOnHBMB9Qszii9hXswdwWnEL2T78tygB5w=",
+        "owner": "sepiabrown",
         "repo": "pyproject.nix",
-        "rev": "e09c10c24ebb955125fda449939bfba664c467fd",
+        "rev": "3cb429db7be7bb766eca1c52cd051bcb398fbf64",
         "type": "github"
       },
       "original": {
-        "owner": "pyproject-nix",
+        "owner": "sepiabrown",
+        "ref": "windows-support-for-pep508",
         "repo": "pyproject.nix",
         "type": "github"
       }

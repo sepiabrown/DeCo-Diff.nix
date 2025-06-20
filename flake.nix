@@ -7,7 +7,7 @@
     nixpkgs.follows = "haedosa/nixpkgs";
 
     pyproject-nix = {
-      url = "github:pyproject-nix/pyproject.nix";
+      url = "github:sepiabrown/pyproject.nix/windows-support-for-pep508";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
@@ -40,8 +40,10 @@
         system = "x86_64-linux";
         config.allowUnfree = true;
       };
+      pkgs-win = pkgs.pkgsCross.mingwW64;
 
       python = pkgs.python311Full;
+      python-win = pkgs-win.python311;
 
       workspace = uv2nix.lib.workspace.loadWorkspace { workspaceRoot = ./project; };
 
@@ -55,9 +57,19 @@
           ;
       };
 
+      pythonSet-win = import ./pythonSet.nix {
+        inherit
+          workspace
+          pyproject-nix
+          pyproject-build-systems
+          ;
+        pkgs = pkgs-win;
+        python = python-win;
+        forWin = true;
+      };
     in
     {
-      inherit pkgs;
+      inherit pkgs pkgs-win workspace pythonSet pythonSet-win pyproject-nix;
 
       packages.x86_64-linux = import ./packages {
         inherit
@@ -67,6 +79,14 @@
           pythonSet
           ;
       };
+      packages.mingwW64= import ./packages {
+        inherit
+          self
+          workspace
+          ;
+        pkgs = pkgs-win;
+        pythonSet = pythonSet-win;
+      };
 
       devShells.x86_64-linux = import ./develop.nix {
         inherit
@@ -75,6 +95,15 @@
           workspace
           pythonSet
           ;
+      };
+
+      devShells.mingwW64 = import ./develop.nix {
+        inherit
+          workspace
+          ;
+        pkgs = pkgs-win;
+        python = python-win;
+        pythonSet = pythonSet-win;
       };
 
       apps.x86_64-linux = import ./apps {

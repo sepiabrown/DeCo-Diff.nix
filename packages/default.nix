@@ -9,6 +9,10 @@
 rec {
 
   deco-diff-env = pythonSet.mkVirtualEnv "deco-diff-env" workspace.deps.default;
+  
+  deco-diff = pythonSet.deco-diff;
+
+  python = pythonSet.python;
 
   jupyter = pkgs.writeShellApplication {
     name = "jupyter";
@@ -59,4 +63,14 @@ rec {
           # --global-batch-size 253 \
     '';
   };
+
+  #wheels = pkgs.symlinkJoin {
+  #  name = "wheels";
+  #  paths = [
+  #    # Include the main project wheel output:
+  #    (pythonSet.${workspace.projectName}.override { pyprojectHook = pythonSet.pyprojectDistHook; }).dist
+  #  ];# ++ (lib.attrValues (workspace.deps.default) 
+  #        # ^ add all dependency wheels
+  #     #   // (dep: pythonSet.${dep}.dist));
+  #};
 }
