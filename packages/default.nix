@@ -5,10 +5,12 @@
   pythonSet,
   ...
 }:
-
-rec {
-
+let
   deco-diff-env = pythonSet.mkVirtualEnv "deco-diff-env" workspace.deps.default;
+  dep_srcs = __filter (src: __typeOf src != "path") (map (d: d.src) deco-diff-env.buildInputs);
+in
+rec {
+  inherit deco-diff-env;
   
   deco-diff = pythonSet.deco-diff;
 
@@ -64,13 +66,8 @@ rec {
     '';
   };
 
-  #wheels = pkgs.symlinkJoin {
-  #  name = "wheels";
-  #  paths = [
-  #    # Include the main project wheel output:
-  #    (pythonSet.${workspace.projectName}.override { pyprojectHook = pythonSet.pyprojectDistHook; }).dist
-  #  ];# ++ (lib.attrValues (workspace.deps.default) 
-  #        # ^ add all dependency wheels
-  #     #   // (dep: pythonSet.${dep}.dist));
-  #};
+  wheels = pkgs.linkFarm "wheels" (map (src: {
+    name = src.name;
+    path = src;
+  }) dep_srcs);
 }

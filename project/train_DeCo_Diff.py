@@ -732,22 +732,85 @@ def main():
     )
     parser.add_argument("--num-datafile", type=int, default=None)
     parser.add_argument("--rep-datafile", type=int, default=None)
+    parser.add_argument(
+        "--input-json",
+        type=str,
+        help="Path to JSON file containing multiple training configurations"
+    )
 
     args = parser.parse_args()
-    if args.dataset == "mvtec":
-        args.num_classes = 15
-    elif args.dataset == "visa":
-        args.num_classes = 12
-    elif args.dataset == "pcb":
-        args.num_classes = 1
-    args.results_dir = f"./DeCo-Diff_{args.dataset}_{args.object_class}_{args.model_size}_{args.center_size}"
-    if args.center_crop:
-        args.results_dir += "_CenterCrop"
-        args.actual_image_size = args.center_size
+    
+    # Handle input JSON if provided
+    if args.input_json:
+        import json
+        from datetime import datetime
+        with open(args.input_json, 'r') as f:
+            train_configs = json.load(f)
+            
+        # Run training for each configuration
+        for config_name, config_args in train_configs.items():
+            print(f"\nRunning training for {config_name}")
+            print(config_args)
+            # Update args with configuration
+            for key, value in config_args.items():
+                # Convert key from kebab-case to snake_case
+                key = key.replace('-', '_')
+                if hasattr(args, key):
+                    # Convert string values to appropriate types
+                    if key in ['image_size', 'center_size', 'epochs', 'warmup_epochs', 
+                              'global_batch_size', 'global_seed', 'num_workers', 
+                              'log_every', 'ckpt_every', 'local_rank', 'num_datafile', 'rep_datafile']:
+                        value = int(value)
+                    elif key in ['lr', 'mask_ratio', 'patch_shuffle_ratio']:
+                        value = float(value)
+                    elif key in ['center_crop', 'mask_random_ratio', 'from_scratch', 'augmentation']:
+                        value = value.lower() in ('yes', 'true', 't', 'y', '1')
+                    elif key in ['data_dir', 'resume_dir']:
+                        if value:  # Only expand if not None/empty
+                            value = os.path.expanduser(value)
+                    setattr(args, key, value)
+            
+            # Set up derived arguments
+            if args.dataset == "mvtec":
+                args.num_classes = 15
+            elif args.dataset == "visa":
+                args.num_classes = 12
+            elif args.dataset == "pcb":
+                args.num_classes = 1
+            
+            # Create unique results directory for this configuration
+            current_time = datetime.now().strftime("%y%m%d_%H%M%S")
+            args.results_dir = f"./DeCo-Diff_{args.dataset}_{args.object_class}_{args.model_size}_{args.center_size}_{config_name}_{current_time}"
+            if args.center_crop:
+                args.results_dir += "_CenterCrop"
+                args.actual_image_size = args.center_size
+            else:
+                args.actual_image_size = args.image_size
+            
+            # Save the current config_args (key-value pairs) into the results_dir as a JSON file
+            os.makedirs(args.results_dir, exist_ok=True)
+            config_save_path = os.path.join(args.results_dir, "config.json")
+            with open(config_save_path, "w") as config_file:
+                json.dump(config_args, config_file, indent=2)
+                
+            # Run training for this configuration
+            _main(args)
     else:
-        args.actual_image_size = args.image_size
+        # Original single configuration training
+        if args.dataset == "mvtec":
+            args.num_classes = 15
+        elif args.dataset == "visa":
+            args.num_classes = 12
+        elif args.dataset == "pcb":
+            args.num_classes = 1
+        args.results_dir = f"./DeCo-Diff_{args.dataset}_{args.object_class}_{args.model_size}_{args.center_size}"
+        if args.center_crop:
+            args.results_dir += "_CenterCrop"
+            args.actual_image_size = args.center_size
+        else:
+            args.actual_image_size = args.image_size
 
-    _main(args)
+        _main(args)
 
 
 if __name__ == "__main__":

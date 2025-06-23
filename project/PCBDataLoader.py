@@ -63,6 +63,8 @@ class PCBDataset(Dataset):
         self.noise = noise
         df = pd.read_csv(os.path.join(".", "splits", "pcb-split.csv"))
         if num_datafile is not None:
+            # Ensure we don't sample more than available data
+            num_datafile = min(num_datafile, len(df))
             df = df.sample(n=num_datafile)
         if object_class == "all":
             df = df.query(f'split=="{mode}"')
