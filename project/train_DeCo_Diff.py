@@ -25,6 +25,7 @@ from scipy.ndimage import gaussian_filter
 from transformers import get_cosine_schedule_with_warmup
 
 import torch.nn as nn
+import sys
 
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -195,7 +196,8 @@ def _main(args):
 
     # Setup DDP:
     local_rank = int(os.environ["LOCAL_RANK"])
-    dist.init_process_group("nccl")
+    backend = "nccl" if sys.platform != "win32" else "gloo"
+    dist.init_process_group(backend)
     assert args.global_batch_size % dist.get_world_size() == 0, (
         f"Batch size must be divisible by world size."
     )
@@ -209,16 +211,15 @@ def _main(args):
 
     # Setup an experiment folder:
     if rank == 0:
-        os.makedirs(
-            args.results_dir, exist_ok=True
-        )  # Make results folder (holds all experiment subfolders)
-
-        with open(f"{args.results_dir}/args.txt", "w") as f:
-            json.dump(args.__dict__, f, indent=2)
         experiment_index = len(glob(f"{args.results_dir}/*"))
         experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{args.model_size.replace('/', '-')}"  # Create an experiment folder
         if args.resume_dir:
             experiment_dir = args.resume_dir
+        os.makedirs(
+            experiment_dir, exist_ok=True
+        )
+        with open(f"{experiment_dir}/args.txt", "w") as f:
+            json.dump(args.__dict__, f, indent=2)
         checkpoint_dir = (
             f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
         )
@@ -247,9 +248,15 @@ def _main(args):
         predict_xstart=False,
         sigma_small=False,
     )  # default: 1000 steps, linear noise schedule
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae_type}").to(
-        torch_device
-    )
+    
+    if os.path.exists("./models/config.json"):
+        vae = AutoencoderKL.from_pretrained("./models", local_files_only=True).to(
+            torch_device
+        )
+    else:
+        vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae_type}").to(
+            torch_device
+        )
     vae.eval()
     logger.info(f"Number of Parameters: {sum(p.numel() for p in model.parameters()):}")
 
@@ -295,6 +302,8 @@ def _main(args):
             center_size=args.center_size,
             augment=args.augmentation,
             center_crop=args.center_crop,
+            num_datafile=args.num_datafile,
+            split_csv_path=args.split_csv_path,
         )
 
     batch_size = args.global_batch_size // dist.get_world_size()
@@ -334,6 +343,7 @@ def _main(args):
                 center_size=args.center_size,
                 augment=args.augmentation,
                 center_crop=args.center_crop,
+                split_csv_path=args.split_csv_path,
             )
         val_loader = DataLoader(
             val_dataset,
@@ -441,6 +451,7 @@ def _main(args):
                         augment=args.augmentation,
                         center_crop=args.center_crop,
                         num_datafile=args.num_datafile,
+                        split_csv_path=args.split_csv_path,
                     )
 
                 batch_size = args.global_batch_size // dist.get_world_size()
@@ -732,6 +743,7 @@ def main():
     )
     parser.add_argument("--num-datafile", type=int, default=None)
     parser.add_argument("--rep-datafile", type=int, default=None)
+    parser.add_argument("--split-csv-path", type=str, default=None)
     parser.add_argument(
         "--input-json",
         type=str,
@@ -765,7 +777,7 @@ def main():
                         value = float(value)
                     elif key in ['center_crop', 'mask_random_ratio', 'from_scratch', 'augmentation']:
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
-                    elif key in ['data_dir', 'resume_dir']:
+                    elif key in ['data_dir', 'resume_dir', 'split_csv_path']:
                         if value:  # Only expand if not None/empty
                             value = os.path.expanduser(value)
                     setattr(args, key, value)
@@ -778,9 +790,7 @@ def main():
             elif args.dataset == "pcb":
                 args.num_classes = 1
             
-            # Create unique results directory for this configuration
-            current_time = datetime.now().strftime("%y%m%d_%H%M%S")
-            args.results_dir = f"./DeCo-Diff_{args.dataset}_{args.object_class}_{args.model_size}_{args.center_size}_{config_name}_{current_time}"
+            args.results_dir = f"./DeCo-Diff_{args.dataset}_{args.object_class}_{args.model_size}_{args.center_size}_{config_name}"
             if args.center_crop:
                 args.results_dir += "_CenterCrop"
                 args.actual_image_size = args.center_size

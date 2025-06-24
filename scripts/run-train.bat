@@ -1,17 +1,4 @@
-py -3.11 train_ddpm.py ^
-  --output_dir .\results ^
-  --model_name pcb_126 ^
-  --training_ids .\data\data_splits\data-pcb_126-train.csv ^
-  --validation_ids .\data\data_splits\data-pcb_126-valid.csv ^
-  --num_train_timesteps=500 ^
-  --num_workers=0 ^
-  --num_val_workers=0 ^
-  --latent_pad "(1,1,1,1)" ^
-  --is_grayscale 0 ^
-  --n_epochs 1000 ^
-  --eval_freq=100 ^
-  --simplex_noise=0 ^
-  --beta_schedule scaled_linear_beta ^
-  --beta_start 0.0015 ^
-  --beta_end 0.0195 ^
-  --batch_size 8
+:loop
+set NO_ALBUMENTATIONS_UPDATE=1
+py -3.11 -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=1 project/train_DeCo_Diff.py --input-json input_json/train_input.json
+goto loop

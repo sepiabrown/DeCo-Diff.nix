@@ -6,14 +6,9 @@ from torch.utils.data import Dataset
 from PIL import Image
 
 # import torchio as tio
-import warnings
 import albumentations as A
 from synthetic_scratch import add_scratch_controlled
 import cv2
-import random
-
-warnings.filterwarnings("ignore")
-
 
 class PCBDataset(Dataset):
     """ABIDE dataset."""
@@ -36,6 +31,7 @@ class PCBDataset(Dataset):
         blur: int = None,
         noise: int = None,
         num_datafile: int = None,
+        split_csv_path: str = None,
     ):
         """
         Args:
@@ -61,7 +57,10 @@ class PCBDataset(Dataset):
         self.shift_y = shift_y
         self.blur = blur
         self.noise = noise
-        df = pd.read_csv(os.path.join(".", "splits", "pcb-split.csv"))
+        if split_csv_path is None:
+            df = pd.read_csv(os.path.join(".", "splits", "pcb-split.csv"))
+        else:
+            df = pd.read_csv(split_csv_path)
         if num_datafile is not None:
             # Ensure we don't sample more than available data
             num_datafile = min(num_datafile, len(df))

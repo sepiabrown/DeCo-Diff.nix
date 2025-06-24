@@ -1,5 +1,11 @@
 # %%
 from __future__ import annotations
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message="A new version of Albumentations is available.*",
+    category=UserWarning
+)
 from datetime import datetime
 import torch
 from skimage.transform import resize
@@ -671,6 +677,7 @@ def evaluation(args):
             reverse_steps=args.reverse_steps,
             batch_num=args.batch_num,
             device=device,
+            split_csv_path=args.split_csv_path,
         )
         if args.dataset == "pcb":
             common_args["dataset_class"] = PCBDataset
@@ -1054,6 +1061,7 @@ def collect_records_for_params(
     batch_num,
     device=None,
     dataset_class,
+    split_csv_path: str = None,
 ):
     common_args = dict(
         mode=split,
@@ -1064,6 +1072,7 @@ def collect_records_for_params(
         image_size=image_size,
         center_size=center_size,
         center_crop=center_crop,
+        split_csv_path=split_csv_path,
     )
     all_records = []
     for val in param_values:
@@ -1494,6 +1503,7 @@ def main():
         choices=[None, "brightness", "shift_x", "shift_y", "noise", "blur", "scratch"],
         default=None,
     )
+    parser.add_argument("--split-csv-path", type=str, default=None)
     parser.add_argument(
         "--input-json",
         type=str,
@@ -1522,7 +1532,7 @@ def main():
                         value = int(value)
                     elif key == 'center_crop':
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
-                    elif key in ['pretrained', 'data_dir']:
+                    elif key in ['pretrained', 'data_dir', 'split_csv_path']:
                         value = os.path.expanduser(value)
                     setattr(args, key, value)
             

@@ -12,6 +12,7 @@
     "pretrained": "DeCo-Diff_pcb_selected_UNet_XS_128_CenterCrop/001-UNet_XS/checkpoints/last.pt_bak",
     "perturbation": "scratch",
     "augmentation": "True",
-    "split": "train"
+    "split": "train",
+    "split-csv-path": "datasets/PCB/Huang/PCB_DATASET/PCB_SELECTED_GRAY/pcb-split.csv"
   }
 }

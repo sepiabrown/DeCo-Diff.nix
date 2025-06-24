@@ -23,6 +23,7 @@
     "augmentation": "True",
     "resume-dir": "DeCo-Diff_pcb_selected_UNet_XS_128_CenterCrop/001-UNet_XS",
     "num-datafile": "10",
-    "rep-datafile": "10"
+    "rep-datafile": "10",
+    "split-csv-path": "datasets/PCB/Huang/PCB_DATASET/PCB_SELECTED_GRAY/pcb-split.csv"
   }
 } 
