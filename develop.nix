@@ -77,6 +77,7 @@ in
       shellHook = ''
         unset PYTHONPATH
         export REPO_ROOT=$(git rev-parse --show-toplevel)/project
+        export NCCL_P2P_DISABLE=1
       '';
     };
 }

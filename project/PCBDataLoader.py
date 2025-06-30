@@ -1,3 +1,4 @@
+from datetime import datetime
 import os
 import torch
 import pandas as pd
@@ -63,8 +64,7 @@ class PCBDataset(Dataset):
             df = pd.read_csv(split_csv_path)
         if num_datafile is not None:
             # Ensure we don't sample more than available data
-            num_datafile = min(num_datafile, len(df))
-            df = df.sample(n=num_datafile)
+            df = df.sample(n=num_datafile, replace=True)
         if object_class == "all":
             df = df.query(f'split=="{mode}"')
         else:
@@ -185,6 +185,26 @@ class PCBDataset(Dataset):
         else:
             img = self.transform_volume(img)
             img = (img - 0.5) / 0.5
+
+        #import matplotlib.pyplot as plt
+        ## Convert tensor back to numpy for saving
+        #if isinstance(img, torch.Tensor):
+        #    img_np = img.detach().cpu().numpy()
+        #    if img_np.ndim == 3:
+        #        img_np = img_np.transpose(1, 2, 0)  # CHW to HWC
+        #    # Denormalize
+        #    img_np = (img_np + 1) / 2  # [-1,1] to [0,1]
+        #    img_np = np.clip(img_np, 0, 1)
+        #else:
+        #    img_np = img
+        ## Save image
+        #timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        #filename = f"tmp/pcb_image_{index}_{timestamp}.png"
+        #plt.imsave(filename, img_np)
+        #print(f"Saved image to: {filename}")
+        #breakpoint()
+        #print(f"Image shape: {img_np.shape}, dtype: {img_np.dtype}")
+        #print(f"Image range: [{img_np.min():.3f}, {img_np.max():.3f}]")
         return (
             img,
             seg.astype(np.float32),
