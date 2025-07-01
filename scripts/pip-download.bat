@@ -1,0 +1,1 @@
+py -3.11 -m pip download --dest offline_pkgs --extra-index-url https://download.pytorch.org/whl/cu118 -r ..\requirements.txt

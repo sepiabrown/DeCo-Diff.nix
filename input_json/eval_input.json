@@ -1,18 +1,18 @@
 {
   "test": {
     "dataset": "pcb",
-    "data-dir": "datasets/PCB/Huang/PCB_DATASET/PCB_SELECTED_GRAY",
-    "model-size": "UNet_XS",
+    "annotation-dir": "annotations",
+    "model-size": "UNet_L",
     "object-class": "all",
     "anomaly-class": "all",
     "image-size": "128",
     "center-size": "128",
     "center-crop": "True",
-    "batch-num": "1",
-    "pretrained": "DeCo-Diff_pcb_selected_UNet_XS_128_CenterCrop/001-UNet_XS/checkpoints/last.pt_bak",
+    "batch-num": "80",
+    "pretrained": "DeCo-Diff_pcb_all_UNet_L_128_CenterCrop/001-UNet_L/checkpoints/33000.pt",
     "perturbation": "scratch",
     "augmentation": "True",
     "split": "train",
-    "split-csv-path": "datasets/PCB/Huang/PCB_DATASET/PCB_SELECTED_GRAY/pcb-split.csv"
+    "split-csv-path": "datasets/PCB/Huang/PCB_DATASET/PCB_SELECTED_GRAY/n10_t6_l100-120_d20_c0.2_s1.0/images/pcb-split.csv"
   }
 }

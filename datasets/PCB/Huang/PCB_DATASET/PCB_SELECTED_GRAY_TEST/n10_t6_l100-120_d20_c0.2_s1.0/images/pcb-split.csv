@@ -1,0 +1,2 @@
+object,split,label,image,mask,category
+pcb,test,normal,06_defect.png,,good

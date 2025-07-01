@@ -79,6 +79,110 @@ Record = OrderedDict[str, Kinded]
 # New Dataset Class for Irregular Images
 # ---------------------------------------------------------------------------
 
+class AnnotatedImageDataset(Dataset):
+    """Dataset for handling images with JSON annotations for defective regions."""
+    
+    def __init__(
+        self,
+        annotation_dir: str,
+        patch_size: int = 128,
+        transform=None,
+        object_class: str = "pcb",
+    ):
+        """
+        Args:
+            annotation_dir: Directory containing JSON annotation files
+            patch_size: Size of patches to extract (default: 128)
+            transform: Optional transform to apply to patches
+            object_class: Object class for classification
+        """
+        self.annotation_dir = annotation_dir
+        self.patch_size = patch_size
+        self.transform = transform
+        self.object_class = object_class
+        
+        # Find all annotation files
+        annotation_files = glob(os.path.join(annotation_dir, "*_annotations.json"))
+        
+        self.images = []
+        self.patches = []
+        self.patch_coords = []  # (x, y) coordinates of each patch in original image
+        self.image_paths = []
+        self.anomaly_classes = []
+        self.is_defective = []  # Boolean indicating if patch is defective
+        
+        for annotation_file in annotation_files:
+            with open(annotation_file, 'r') as f:
+                annotation = json.load(f)
+            
+            image_path = annotation["image_path"]
+            if not os.path.exists(image_path):
+                print(f"Warning: Image {image_path} not found, skipping...")
+                continue
+            
+            # Load original image
+            img = np.array(PILImage.open(image_path).convert('RGB'))
+            original_height, original_width = img.shape[:2]
+            
+            # Get defective patch coordinates
+            defective_patches = set()
+            for patch_coord in annotation["defective_patches"]:
+                grid_row, grid_col = patch_coord
+                defective_patches.add((grid_row, grid_col))
+            
+            # Generate all possible patches
+            grid_rows = original_height // patch_size
+            grid_cols = original_width // patch_size
+            
+            for grid_row in range(grid_rows):
+                for grid_col in range(grid_cols):
+                    # Calculate pixel coordinates
+                    x = grid_col * patch_size
+                    y = grid_row * patch_size
+                    
+                    # Extract patch
+                    patch = img[y:y + patch_size, x:x + patch_size]
+                    
+                    # Determine if this patch is defective
+                    is_defective = (grid_row, grid_col) in defective_patches
+                    
+                    self.images.append(img)  # Store original image
+                    self.patches.append(patch)
+                    self.patch_coords.append((x, y))
+                    self.image_paths.append(image_path)
+                    self.anomaly_classes.append("defect" if is_defective else "normal")
+                    self.is_defective.append(is_defective)
+        
+        print(f"Created {len(self.patches)} patches from {len(set(self.image_paths))} images")
+        print(f"Defective patches: {sum(self.is_defective)}, Normal patches: {len(self.is_defective) - sum(self.is_defective)}")
+    
+    def __len__(self):
+        return len(self.patches)
+    
+    def __getitem__(self, index):
+        patch = self.patches[index].astype(np.float32) / 255.0
+        original_img = self.images[index]
+        x, y = self.patch_coords[index]
+        image_path = self.image_paths[index]
+        anomaly_class = self.anomaly_classes[index]
+        is_defective = self.is_defective[index]
+        
+        # Create segmentation mask (all zeros for normal patches, all ones for defective)
+        seg = np.ones((self.patch_size, self.patch_size), dtype=np.float32) if is_defective else np.zeros((self.patch_size, self.patch_size), dtype=np.float32)
+        
+        # Apply transform if provided
+        if self.transform:
+            patch = self.transform(patch)
+        else:
+            patch = torch.from_numpy(patch.transpose(2, 0, 1))
+            patch = (patch - 0.5) / 0.5
+        
+        # Convert coordinates to tensors for proper batching
+        coords_tensor = torch.tensor([x, y], dtype=torch.int32)
+        
+        return patch, seg, 0, image_path, anomaly_class, coords_tensor, original_img
+
+
 class IrregularImageDataset(Dataset):
     """Dataset for handling irregular-sized images by splitting them into patches."""
     
@@ -312,25 +416,59 @@ def _write_row(ws, row_idx: int, rec: dict, size: int):
         ws.add_image(img, f"{get_column_letter(col_idx)}{row_idx}")
 
 
-def mark_defective_regions_on_image(original_img, patch_results, patch_size=128, stride=64):
+def mark_defective_regions_on_image(original_img, patch_results, ground_truth_patches=None, patch_size=128, stride=64):
     """
-    Mark defective regions on the original image based on patch analysis results.
+    Mark defective regions on the original image based on patch analysis results and ground truth.
     
     Args:
         original_img: Original image as numpy array
         patch_results: List of (x, y, is_defective) tuples for each patch
+        ground_truth_patches: List of [grid_row, grid_col] coordinates for ground truth defective patches
         patch_size: Size of patches
         stride: Stride used for patch extraction
     
     Returns:
-        Marked image with red rectangles around defective regions
+        Marked image with:
+        - Red rectangles around predicted defective regions
+        - Green rectangles around ground truth defective regions
+        - Yellow rectangles where prediction and ground truth overlap
     """
     marked_img = original_img.copy()
     
+    # Create sets for efficient lookup
+    predicted_defective = set()
+    ground_truth_defective = set()
+    
+    # Collect predicted defective patches
     for x, y, is_defective in patch_results:
         if is_defective:
-            # Draw red rectangle around defective patch
-            cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (0, 0, 255), 2)
+            grid_row = y // patch_size
+            grid_col = x // patch_size
+            predicted_defective.add((grid_row, grid_col))
+    
+    # Collect ground truth defective patches
+    if ground_truth_patches:
+        for grid_row, grid_col in ground_truth_patches:
+            ground_truth_defective.add((grid_row, grid_col))
+    
+    # Draw predicted defective regions (red)
+    for grid_row, grid_col in predicted_defective:
+        x = grid_col * patch_size
+        y = grid_row * patch_size
+        cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (0, 0, 255), 2)
+    
+    # Draw ground truth defective regions (green)
+    for grid_row, grid_col in ground_truth_defective:
+        x = grid_col * patch_size
+        y = grid_row * patch_size
+        cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (0, 255, 0), 2)
+    
+    # Draw overlapping regions (yellow) - where prediction and ground truth match
+    overlapping = predicted_defective.intersection(ground_truth_defective)
+    for grid_row, grid_col in overlapping:
+        x = grid_col * patch_size
+        y = grid_row * patch_size
+        cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (0, 255, 255), 3)
     
     return marked_img
 
@@ -740,13 +878,112 @@ def evaluation(args):
         diffusion_steps=1000,
     )
 
+    # Check if we're processing annotated images
+    if hasattr(args, 'annotation_dir') and args.annotation_dir:
+        print("Processing images with JSON annotations...")
+        evaluation_annotated_images(args, diffusion, model, vae)
     # Check if we're processing irregular images
-    if hasattr(args, 'irregular_images') and args.irregular_images:
+    elif hasattr(args, 'irregular_images') and args.irregular_images:
         print("Processing irregular-sized images with patch-based approach...")
         evaluation_irregular_images(args, diffusion, model, vae)
     else:
         print("Processing regular-sized images...")
         evaluation_regular_images(args, diffusion, model, vae)
+
+
+def evaluation_annotated_images(args, diffusion, model, vae):
+    """Evaluate images with JSON annotations for defective regions."""
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True
+            ),
+        ]
+    )
+    
+    # Create dataset for annotated images
+    dataset = AnnotatedImageDataset(
+        annotation_dir=args.annotation_dir,
+        patch_size=128,
+        transform=transform,
+        object_class=args.object_class,
+    )
+    
+    loader = DataLoader(
+        dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False
+    )
+    
+    # For annotated images, use patch size as center_size to ensure consistent dimensions
+    patch_center_size = 128
+    
+    # Process patches
+    _recs, image_patch_results = process_split_irregular(
+        loader,
+        args.split,
+        diffusion,
+        model,
+        vae,
+        args.reverse_steps,
+        patch_center_size,  # Use patch size instead of args.center_size
+        args.batch_num,
+        device,
+    )
+    
+    # Mark defective regions on original images
+    print("Marking defective regions on original images...")
+    marked_images_dir = os.path.join(args.results_dir, "marked_images")
+    
+    for image_path, patch_results in image_patch_results.items():
+        # Load original image
+        original_img = np.array(PILImage.open(image_path).convert('RGB'))
+        
+        # Load ground truth annotations for this image
+        ground_truth_patches = None
+        image_name = os.path.basename(image_path)
+        annotation_filename = f"{os.path.splitext(image_name)[0]}_annotations.json"
+        annotation_path = os.path.join(args.annotation_dir, annotation_filename)
+        
+        if os.path.exists(annotation_path):
+            with open(annotation_path, 'r') as f:
+                annotation = json.load(f)
+                ground_truth_patches = annotation.get("defective_patches", [])
+        
+        # Mark defective regions (both predicted and ground truth)
+        marked_img = mark_defective_regions_on_image(
+            original_img, patch_results, ground_truth_patches, patch_size=128, stride=128
+        )
+        
+        # Save marked image
+        output_path = save_marked_image(marked_img, image_path, marked_images_dir)
+        print(f"Saved marked image: {output_path}")
+    
+    # Save evaluation results in the same format as annotation files
+    evaluation_results_dir = os.path.join(args.results_dir, "evaluation_results")
+    os.makedirs(evaluation_results_dir, exist_ok=True)
+    
+    for image_path, patch_results in image_patch_results.items():
+        # Convert pixel coordinates back to grid coordinates
+        predicted_defective_patches = []
+        for x, y, is_defective in patch_results:
+            if is_defective:
+                grid_row = y // 128
+                grid_col = x // 128
+                predicted_defective_patches.append([grid_row, grid_col])
+        image_name = os.path.basename(image_path)
+        result_filename = f"{os.path.splitext(image_name)[0]}_evaluation.json"
+        result_path = os.path.join(evaluation_results_dir, result_filename)
+        evaluation_result = {
+            "image_path": image_path,
+            "defective_patches": predicted_defective_patches,
+            "grid_size": 128
+        }
+        with open(result_path, 'w') as f:
+            json.dump(evaluation_result, f, indent=2)
+        print(f"Saved evaluation result: {result_path}")
+    print("==" * 30)
+    # Compute confusion matrix and accuracy
+    compute_confusion_matrix_and_accuracy(args.annotation_dir, evaluation_results_dir)
 
 
 def evaluation_irregular_images(args, diffusion, model, vae):
@@ -1175,6 +1412,116 @@ def compute_roc_stats(y_true, y_score):
     return fpr, tpr, thresholds, best_threshold, best_idx, auc_score
 
 
+def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir):
+    import glob
+    from collections import Counter
+    import numpy as np
+    import os
+    import json
+
+    # Find all evaluation result files
+    eval_files = glob.glob(os.path.join(evaluation_results_dir, '*_evaluation.json'))
+    all_TP = all_FP = all_FN = all_TN = 0
+    for eval_file in eval_files:
+        with open(eval_file, 'r') as f:
+            eval_data = json.load(f)
+        image_path = eval_data['image_path']
+        predicted = set(tuple(x) for x in eval_data['defective_patches'])
+        grid_size = eval_data['grid_size']
+        image_name = os.path.basename(image_path)
+        annotation_file = os.path.join(annotation_dir, f"{os.path.splitext(image_name)[0]}_annotations.json")
+        if not os.path.exists(annotation_file):
+            print(f"Warning: No annotation for {image_name}")
+            continue
+        with open(annotation_file, 'r') as f:
+            anno_data = json.load(f)
+        gt = set(tuple(x) for x in anno_data['defective_patches'])
+        # Get all possible grid cells
+        # (Assume image is divisible by grid_size)
+        img = PILImage.open(image_path)
+        h, w = img.height, img.width
+        n_rows = h // grid_size
+        n_cols = w // grid_size
+        all_cells = set((r, c) for r in range(n_rows) for c in range(n_cols))
+        for cell in all_cells:
+            pred = cell in predicted
+            truth = cell in gt
+            if pred and truth:
+                all_TP += 1
+            elif pred and not truth:
+                all_FP += 1
+            elif not pred and truth:
+                all_FN += 1
+            else:
+                all_TN += 1
+    total = all_TP + all_FP + all_FN + all_TN
+    accuracy = (all_TP + all_TN) / total if total > 0 else 0
+    
+    # Calculate additional metrics
+    precision = all_TP / (all_TP + all_FP) if (all_TP + all_FP) > 0 else 0
+    recall = all_TP / (all_TP + all_FN) if (all_TP + all_FN) > 0 else 0
+    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    
+    print("Confusion Matrix (patch-level):")
+    print(f"TP: {all_TP}, FP: {all_FP}, FN: {all_FN}, TN: {all_TN}")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1-Score: {f1_score:.4f}")
+    
+    # Create confusion matrix visualization
+    cm = np.array([[all_TN, all_FP], [all_FN, all_TP]])
+    
+    plt.figure(figsize=(8, 6))
+    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title('Confusion Matrix (Patch-level)', fontsize=16, fontweight='bold')
+    plt.colorbar()
+    
+    # Add text annotations
+    thresh = cm.max() / 2.
+    for i in range(2):
+        for j in range(2):
+            plt.text(j, i, format(cm[i, j], 'd'),
+                    ha="center", va="center",
+                    color="white" if cm[i, j] > thresh else "black",
+                    fontsize=14, fontweight='bold')
+    
+    # Set labels
+    tick_marks = np.arange(2)
+    plt.xticks(tick_marks, ['Normal', 'Defective'], fontsize=12)
+    plt.yticks(tick_marks, ['Normal', 'Defective'], fontsize=12)
+    plt.ylabel('True Label', fontsize=12)
+    plt.xlabel('Predicted Label', fontsize=12)
+    
+    # Add metrics text
+    metrics_text = f'Accuracy: {accuracy:.4f}\nPrecision: {precision:.4f}\nRecall: {recall:.4f}\nF1-Score: {f1_score:.4f}'
+    plt.figtext(0.02, 0.02, metrics_text, fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
+    
+    plt.tight_layout()
+    
+    # Save the confusion matrix plot
+    cm_plot_path = os.path.join(evaluation_results_dir, "confusion_matrix.png")
+    plt.savefig(cm_plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Confusion matrix plot saved to: {cm_plot_path}")
+    
+    # Save detailed results to file
+    result = {
+        "TP": all_TP,
+        "FP": all_FP,
+        "FN": all_FN,
+        "TN": all_TN,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1_score": f1_score,
+        "total_patches": total
+    }
+    with open(os.path.join(evaluation_results_dir, "confusion_matrix.json"), "w") as f:
+        json.dump(result, f, indent=2)
+
+
 def main():
     REPO_ROOT = os.environ.get("REPO_ROOT", None)
     if REPO_ROOT is not None:
@@ -1256,6 +1603,11 @@ def main():
         action="store_true",
         help="Process irregular-sized images by splitting into 128x128 patches"
     )
+    parser.add_argument(
+        "--annotation-dir",
+        type=str,
+        help="Directory containing JSON annotation files for defective regions"
+    )
 
     args = parser.parse_args()
     
@@ -1279,7 +1631,7 @@ def main():
                         value = int(value)
                     elif key == 'center_crop':
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
-                    elif key in ['pretrained', 'data_dir', 'split_csv_path']:
+                    elif key in ['pretrained', 'data_dir', 'split_csv_path', 'annotation_dir']:
                         value = os.path.expanduser(value)
                     elif key == 'irregular_images':
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')

@@ -166,3 +166,5 @@ cython_debug/
 # files specific to my projects
 /data
 **/DeCo-Diff*/
+annotations/
+models/
