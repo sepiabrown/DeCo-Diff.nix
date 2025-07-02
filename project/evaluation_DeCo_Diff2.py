@@ -1,5 +1,8 @@
 # %%
 from __future__ import annotations
+import os
+os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'
+
 import warnings
 warnings.filterwarnings(
     "ignore",
@@ -32,7 +35,6 @@ import pandas as pd
 from skimage import measure
 from sklearn.metrics import auc
 
-import os
 import sys
 from typing import List
 import matplotlib.pyplot as plt
@@ -60,8 +62,9 @@ import json
 import cv2
 
 torch.set_grad_enabled(False)
-device = "cuda" if torch.cuda.is_available() else "cpu"
-if device == "cpu":
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+if device == torch.device("cpu"):
     print("GPU not found. Using CPU instead.")
 
 # ---------------------------------------------------------------------------
@@ -314,10 +317,7 @@ class IrregularImageDataset(Dataset):
 # Helper functions
 # ---------------------------------------------------------------------------
 
-def add_metric_fields(rec: Record, *, device=None) -> None:
-    device = device or (
-        torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    )
+def add_metric_fields(rec: Record, *, device=torch.device("cpu")) -> None:
 
     def to4d(x):
         if isinstance(x, np.ndarray):
@@ -500,11 +500,10 @@ def process_split_irregular(
     reverse_steps: int,
     center_size: int,
     batch_num: int,
-    device: torch.device | None = None,
+    device: torch.device = torch.device("cpu"),
+    anomaly_binary_threshold: int = 0,
 ) -> List[Record]:
     """Run a forward‑&‑reverse pass on irregular images and collect metrics."""
-
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     results: List[Record] = []
     image_patch_results = defaultdict(list)  # Track results per original image
@@ -632,8 +631,8 @@ def process_split_irregular(
             #x_original_img = Image.fromarray(((x_original_np + 1) / 2 * 255).astype(np.uint8))
             #x_original_save_path = os.path.join(tmp_dir, f'original_batch_{b}_{x_original_min:.3f}_{x_original_max:.3f}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
             #x_original_img.save(x_original_save_path)
-            
-            is_defective = torch.sum(anomaly_binary > 0).item() > 0  # Any white pixels
+            anomaly_pixels = torch.sum(anomaly_binary > 0).item()
+            is_defective = anomaly_pixels > anomaly_binary_threshold  # Any white pixels
             
             # Store patch result for original image marking
             # patch_coords[b] is now a tensor [x, y]
@@ -928,6 +927,7 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         patch_center_size,  # Use patch size instead of args.center_size
         args.batch_num,
         device,
+        args.anomaly_binary_threshold,
     )
     
     # Mark defective regions on original images
@@ -1026,6 +1026,7 @@ def evaluation_irregular_images(args, diffusion, model, vae):
         patch_center_size,  # Use patch size instead of args.center_size
         args.batch_num,
         device,
+        args.anomaly_binary_threshold,
     )
     
     # Mark defective regions on original images
@@ -1608,6 +1609,12 @@ def main():
         type=str,
         help="Directory containing JSON annotation files for defective regions"
     )
+    parser.add_argument(
+        "--anomaly-binary-threshold",
+        type=float,
+        default=0,
+        help="Threshold for determining if a patch is defective based on number of anomaly pixels (default: 0)"
+    )
 
     args = parser.parse_args()
     
@@ -1627,7 +1634,7 @@ def main():
                 key = key.replace('-', '_')
                 if hasattr(args, key):
                     # Convert string values to appropriate types
-                    if key in ['image_size', 'center_size', 'batch_num', 'reverse_steps']:
+                    if key in ['image_size', 'center_size', 'batch_num', 'reverse_steps', 'anomaly_binary_threshold']:
                         value = int(value)
                     elif key == 'center_crop':
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
