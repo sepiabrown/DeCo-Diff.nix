@@ -32,6 +32,23 @@ class GridAnnotationWriter:
         self.out_dir = out_dir
         self.annotations = {}  # Store annotations per image
         out_dir.mkdir(parents=True, exist_ok=True)
+        self.load_existing_annotation_files()
+
+    def load_existing_annotation_files(self):
+        """Load existing annotation files from the output directory."""
+        if not self.out_dir.exists():
+            return
+            
+        for json_file in self.out_dir.glob("*_annotations.json"):
+            try:
+                with open(json_file, 'r') as f:
+                    annotation = json.load(f)
+                    image_path = annotation.get("image_path")
+                    if image_path:
+                        self.annotations[image_path] = annotation
+                        print(f"Loaded existing annotations from: {json_file.name}")
+            except Exception as e:
+                print(f"Warning: Could not load {json_file}: {e}")
 
     def add_defect(self, grid_row: int, grid_col: int, image_path: Path):
         """Add a defective patch at the specified grid position."""
@@ -49,6 +66,21 @@ class GridAnnotationWriter:
             # Convert to regular Python integers to ensure JSON serialization
             self.annotations[image_key]["defective_patches"].append([int(grid_row), int(grid_col)])
             print(f"     marked defective: grid[{grid_row}, {grid_col}]")
+
+    def remove_defect(self, grid_row: int, grid_col: int, image_path: Path):
+        """Remove a defective patch at the specified grid position."""
+        image_key = str(image_path)
+        if image_key in self.annotations:
+            # Convert to regular Python integers for comparison
+            patch_to_remove = [int(grid_row), int(grid_col)]
+            if patch_to_remove in self.annotations[image_key]["defective_patches"]:
+                self.annotations[image_key]["defective_patches"].remove(patch_to_remove)
+                print(f"     removed defective: grid[{grid_row}, {grid_col}]")
+                
+                # If no more defective patches for this image, remove the entire entry
+                if not self.annotations[image_key]["defective_patches"]:
+                    del self.annotations[image_key]
+                    print(f"     removed all annotations for {image_path.name}")
 
     def save_annotations(self):
         """Save all annotations to JSON file."""
@@ -98,7 +130,22 @@ class CropApp:
         self.img = img
         self.img_h, self.img_w = img.shape[:2]
         self.defective_patches = set()  # Reset defective patches for new image
+        
+        # Load existing annotations for this image
+        self.load_existing_annotations(path)
+        
         print(f"\nLoaded {path.name}: {self.img_w}x{self.img_h}px")
+        if self.defective_patches:
+            print(f"Loaded {len(self.defective_patches)} existing defective patches")
+
+    def load_existing_annotations(self, image_path: Path):
+        """Load existing annotations for the given image."""
+        image_key = str(image_path)
+        if image_key in self.writer.annotations:
+            annotation = self.writer.annotations[image_key]
+            for patch in annotation["defective_patches"]:
+                grid_row, grid_col = patch
+                self.defective_patches.add((grid_row, grid_col))
 
     def pan(self, dx: int, dy: int):
         self.off_x = np.clip(self.off_x + dx, 0, max(0, self.img_w - self.view_w))
@@ -201,6 +248,7 @@ class CropApp:
         patch_key = (grid_row, grid_col)
         if patch_key in self.defective_patches:
             self.defective_patches.remove(patch_key)
+            self.writer.remove_defect(grid_row, grid_col, self.path)
             print(f"\nUnmarked grid[{grid_row}, {grid_col}] as normal")
         else:
             self.defective_patches.add(patch_key)
