@@ -3,6 +3,7 @@ import os
 import sys
 import json
 from pathlib import Path
+import re
 
 import cv2
 import numpy as np
@@ -27,6 +28,21 @@ def ask_file():
     root.destroy()
     return Path(path) if path else None
 
+def path_to_safe_filename(file_path: str) -> str:
+    """
+    Convert an absolute file path to a safe filename by replacing path separators with underscores.
+    Handles Windows drive letters and both types of path separators.
+    Also replaces .png extension at the end with __png.
+    """
+    normalized_path = os.path.normpath(file_path)
+    # Replace Windows drive letter at the start (e.g., C:\ or C:/) with C__
+    normalized_path = re.sub(r'^([a-zA-Z]):[\\/]', r'\1__', normalized_path)
+    # Replace all remaining path separators with double underscores
+    safe_name = re.sub(r'[\\/]', '__', normalized_path)
+    # Replace .png at the end with __png
+    safe_name = re.sub(r'\.png$', '__png', safe_name, flags=re.IGNORECASE)
+    return safe_name
+
 class GridAnnotationWriter:
     def __init__(self, out_dir: Path):
         self.out_dir = out_dir
@@ -39,7 +55,7 @@ class GridAnnotationWriter:
         if not self.out_dir.exists():
             return
             
-        for json_file in self.out_dir.glob("*_annotations.json"):
+        for json_file in self.out_dir.glob("*__annotations.json"):
             try:
                 with open(json_file, 'r') as f:
                     annotation = json.load(f)
@@ -91,7 +107,7 @@ class GridAnnotationWriter:
         # Save each image's annotations separately
         for image_key, annotation in self.annotations.items():
             image_path = Path(annotation["image_path"])
-            json_filename = f"{image_path.stem}_annotations.json"
+            json_filename = f"{path_to_safe_filename(str(image_path))}__annotations.json"
             json_path = self.out_dir / json_filename
             
             with open(json_path, 'w') as f:
@@ -106,6 +122,7 @@ class CropApp:
         self.out_dir = out_dir
         self.patch_size = patch_size
         self.writer = GridAnnotationWriter(out_dir)
+        self.defective_patches = set()  # Track defective patches for current image
         self.load_image(image_path)
 
         self.scr_w, self.scr_h = screen_size()
@@ -115,7 +132,6 @@ class CropApp:
         self.off_x = 0
         self.off_y = 0
         self.cur_view = None
-        self.defective_patches = set()  # Track defective patches for current image
 
         self.win = "Grid Annotator"
         cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)

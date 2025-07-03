@@ -60,6 +60,9 @@ from sklearn.metrics import roc_curve
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import json
 import cv2
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+import re
 
 torch.set_grad_enabled(False)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -105,7 +108,7 @@ class AnnotatedImageDataset(Dataset):
         self.object_class = object_class
         
         # Find all annotation files
-        annotation_files = glob(os.path.join(annotation_dir, "*_annotations.json"))
+        annotation_files = glob(os.path.join(annotation_dir, "*__annotations.json"))
         
         self.images = []
         self.patches = []
@@ -183,7 +186,9 @@ class AnnotatedImageDataset(Dataset):
         # Convert coordinates to tensors for proper batching
         coords_tensor = torch.tensor([x, y], dtype=torch.int32)
         
-        return patch, seg, 0, image_path, anomaly_class, coords_tensor, original_img
+        # Don't return original_img in the batch to avoid tensor size mismatch
+        # We'll handle original image loading separately in the processing function
+        return patch, seg, 0, image_path, anomaly_class, coords_tensor
 
 
 class IrregularImageDataset(Dataset):
@@ -455,20 +460,20 @@ def mark_defective_regions_on_image(original_img, patch_results, ground_truth_pa
     for grid_row, grid_col in predicted_defective:
         x = grid_col * patch_size
         y = grid_row * patch_size
-        cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (0, 0, 255), 2)
+        cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (255, 0, 0), 2)
     
-    # Draw ground truth defective regions (green)
+    # Draw ground truth defective regions (yellow)
     for grid_row, grid_col in ground_truth_defective:
         x = grid_col * patch_size
         y = grid_row * patch_size
-        cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (0, 255, 0), 2)
+        cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (255, 255, 0), 2)
     
-    # Draw overlapping regions (yellow) - where prediction and ground truth match
+    # Draw overlapping regions (green) - where prediction and ground truth match
     overlapping = predicted_defective.intersection(ground_truth_defective)
     for grid_row, grid_col in overlapping:
         x = grid_col * patch_size
         y = grid_row * patch_size
-        cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (0, 255, 255), 3)
+        cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (0, 255, 0), 3)
     
     return marked_img
 
@@ -484,6 +489,56 @@ def save_marked_image(marked_img, original_path, output_dir):
     
     # Save image
     PILImage.fromarray(marked_img).save(output_path)
+    return output_path
+
+
+def create_anomaly_overlay(original_img, anomaly_map, alpha=0.6):
+    """
+    Create an overlay of the anomaly map on top of the original image.
+    
+    Args:
+        original_img: Original image as numpy array (H, W, 3)
+        anomaly_map: Anomaly map as numpy array (H, W) or (H, W, 1)
+        alpha: Transparency factor (0.0 = fully transparent, 1.0 = fully opaque)
+    
+    Returns:
+        Overlay image as numpy array
+    """
+    # Ensure anomaly_map is 2D
+    if anomaly_map.ndim == 3 and anomaly_map.shape[2] == 1:
+        anomaly_map = anomaly_map.squeeze()
+    
+    # Normalize anomaly map to 0-1 range
+    if anomaly_map.max() > 0:
+        anomaly_map = (anomaly_map - anomaly_map.min()) / (anomaly_map.max() - anomaly_map.min())
+    
+    # Create lime color overlay (lime = [0, 255, 0])
+    lime_color = np.array([0, 255, 0], dtype=np.uint8)
+    
+    # Create colored overlay
+    overlay = np.zeros_like(original_img)
+    overlay[..., 0] = lime_color[0] * anomaly_map
+    overlay[..., 1] = lime_color[1] * anomaly_map
+    overlay[..., 2] = lime_color[2] * anomaly_map
+    
+    # Blend with original image
+    result = original_img.astype(np.float32) * (1 - alpha * anomaly_map[..., np.newaxis]) + \
+             overlay.astype(np.float32) * alpha * anomaly_map[..., np.newaxis]
+    
+    return result.astype(np.uint8)
+
+
+def save_anomaly_overlay(overlay_img, original_path, output_dir):
+    """Save the anomaly overlay image to the output directory."""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create output filename
+    base_name = os.path.basename(original_path)
+    name, ext = os.path.splitext(base_name)
+    output_path = os.path.join(output_dir, f"{name}_anomaly_overlay{ext}")
+    
+    # Save image
+    PILImage.fromarray(overlay_img).save(output_path)
     return output_path
 
 
@@ -507,8 +562,9 @@ def process_split_irregular(
 
     results: List[Record] = []
     image_patch_results = defaultdict(list)  # Track results per original image
+    image_anomaly_maps = defaultdict(list)  # Track anomaly maps per original image
 
-    for idx, (x, seg, object_cls, image_paths, anomaly_classes, patch_coords, original_imgs) in enumerate(
+    for idx, (x, seg, object_cls, image_paths, anomaly_classes, patch_coords) in enumerate(
         tqdm(dataloader, desc=f"{split} split")
     ):
         if idx >= batch_num:
@@ -649,6 +705,10 @@ def process_split_irregular(
             
             image_patch_results[image_paths[b]].append((x_coord, y_coord, is_defective))
             
+            # Store anomaly map for overlay creation
+            anomaly_map_np = _to_numpy(anomaly_map_arithmetic[b])
+            image_anomaly_maps[image_paths[b]].append((x_coord, y_coord, anomaly_map_np))
+            
             rec = make_record(
                 split=("meta", split),
                 image_path=("meta", image_paths[b]),
@@ -691,7 +751,7 @@ def process_split_irregular(
             add_metric_fields(rec, device=device)
             results.append(rec)
 
-    return results, image_patch_results
+    return results, image_patch_results, image_anomaly_maps
 
 
 def process_split(
@@ -910,14 +970,14 @@ def evaluation_annotated_images(args, diffusion, model, vae):
     )
     
     loader = DataLoader(
-        dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False
+        dataset, batch_size=30, shuffle=False, num_workers=4, drop_last=False
     )
     
     # For annotated images, use patch size as center_size to ensure consistent dimensions
     patch_center_size = 128
     
     # Process patches
-    _recs, image_patch_results = process_split_irregular(
+    _recs, image_patch_results, image_anomaly_maps = process_split_irregular(
         loader,
         args.split,
         diffusion,
@@ -933,6 +993,7 @@ def evaluation_annotated_images(args, diffusion, model, vae):
     # Mark defective regions on original images
     print("Marking defective regions on original images...")
     marked_images_dir = os.path.join(args.results_dir, "marked_images")
+    os.makedirs(marked_images_dir, exist_ok=True)
     
     for image_path, patch_results in image_patch_results.items():
         # Load original image
@@ -940,8 +1001,7 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         
         # Load ground truth annotations for this image
         ground_truth_patches = None
-        image_name = os.path.basename(image_path)
-        annotation_filename = f"{os.path.splitext(image_name)[0]}_annotations.json"
+        annotation_filename = f"{path_to_safe_filename(image_path)}__annotations.json"
         annotation_path = os.path.join(args.annotation_dir, annotation_filename)
         
         if os.path.exists(annotation_path):
@@ -954,9 +1014,30 @@ def evaluation_annotated_images(args, diffusion, model, vae):
             original_img, patch_results, ground_truth_patches, patch_size=128, stride=128
         )
         
+        safe_name = path_to_safe_filename(image_path)
         # Save marked image
-        output_path = save_marked_image(marked_img, image_path, marked_images_dir)
-        print(f"Saved marked image: {output_path}")
+        marked_path = os.path.join(marked_images_dir, f"{safe_name}__marked.png")
+        PILImage.fromarray(marked_img).save(marked_path)
+        print(f"Saved marked image: {marked_path}")
+
+        # --- Create and save anomaly overlay image ---
+        # Reconstruct the full anomaly map for this image
+        anomaly_map_list = image_anomaly_maps[image_path]
+        # Assume all patches are 128x128 and non-overlapping
+        h, w, _ = original_img.shape
+        full_anomaly_map = np.zeros((h, w), dtype=np.float32)
+        for x, y, patch_map in anomaly_map_list:
+            full_anomaly_map[y:y+128, x:x+128] = patch_map.squeeze()
+        overlay_img = create_anomaly_overlay(original_img, full_anomaly_map, alpha=0.8)
+        overlay_path = os.path.join(marked_images_dir, f"{safe_name}__anomaly_overlay.png")
+        PILImage.fromarray(overlay_img).save(overlay_path)
+        print(f"Saved anomaly overlay image: {overlay_path}")
+
+        # Save overlay+patches image
+        marked_overlay_img = draw_patch_rectangles_on_image(overlay_img, patch_results, ground_truth_patches, patch_size=128, stride=128)
+        marked_overlay_path = os.path.join(marked_images_dir, f"{safe_name}__marked_overlay.png")
+        PILImage.fromarray(marked_overlay_img).save(marked_overlay_path)
+        print(f"Saved marked overlay image: {marked_overlay_path}")
     
     # Save evaluation results in the same format as annotation files
     evaluation_results_dir = os.path.join(args.results_dir, "evaluation_results")
@@ -970,8 +1051,7 @@ def evaluation_annotated_images(args, diffusion, model, vae):
                 grid_row = y // 128
                 grid_col = x // 128
                 predicted_defective_patches.append([grid_row, grid_col])
-        image_name = os.path.basename(image_path)
-        result_filename = f"{os.path.splitext(image_name)[0]}_evaluation.json"
+        result_filename = f"{path_to_safe_filename(image_path)}__evaluation.json"
         result_path = os.path.join(evaluation_results_dir, result_filename)
         evaluation_result = {
             "image_path": image_path,
@@ -1016,7 +1096,7 @@ def evaluation_irregular_images(args, diffusion, model, vae):
     patch_center_size = 128
     
     # Process patches
-    _recs, image_patch_results = process_split_irregular(
+    _recs, image_patch_results, image_anomaly_maps = process_split_irregular(
         loader,
         args.split,
         diffusion,
@@ -1042,9 +1122,11 @@ def evaluation_irregular_images(args, diffusion, model, vae):
             original_img, patch_results, patch_size=128, stride=128
         )
         
+        safe_name = path_to_safe_filename(image_path)
         # Save marked image
-        output_path = save_marked_image(marked_img, image_path, marked_images_dir)
-        print(f"Saved marked image: {output_path}")
+        marked_path = os.path.join(marked_images_dir, f"{safe_name}_marked.png")
+        PILImage.fromarray(marked_img).save(marked_path)
+        print(f"Saved marked image: {marked_path}")
     
     # Save patch analysis results
     patch_analysis_path = os.path.join(args.results_dir, "patch_analysis.json")
@@ -1421,7 +1503,7 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
     import json
 
     # Find all evaluation result files
-    eval_files = glob.glob(os.path.join(evaluation_results_dir, '*_evaluation.json'))
+    eval_files = glob.glob(os.path.join(evaluation_results_dir, '*__evaluation.json'))
     all_TP = all_FP = all_FN = all_TN = 0
     for eval_file in eval_files:
         with open(eval_file, 'r') as f:
@@ -1429,10 +1511,9 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
         image_path = eval_data['image_path']
         predicted = set(tuple(x) for x in eval_data['defective_patches'])
         grid_size = eval_data['grid_size']
-        image_name = os.path.basename(image_path)
-        annotation_file = os.path.join(annotation_dir, f"{os.path.splitext(image_name)[0]}_annotations.json")
+        annotation_file = os.path.join(annotation_dir, f"{path_to_safe_filename(image_path)}__annotations.json")
         if not os.path.exists(annotation_file):
-            print(f"Warning: No annotation for {image_name}")
+            print(f"Warning: No annotation for {image_path}")
             continue
         with open(annotation_file, 'r') as f:
             anno_data = json.load(f)
@@ -1521,6 +1602,62 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
     }
     with open(os.path.join(evaluation_results_dir, "confusion_matrix.json"), "w") as f:
         json.dump(result, f, indent=2)
+
+
+def path_to_safe_filename(file_path: str) -> str:
+    """
+    Convert an absolute file path to a safe filename by replacing path separators with underscores.
+    Handles Windows drive letters and both types of path separators.
+    Also replaces .png extension at the end with __png.
+    """
+    normalized_path = os.path.normpath(file_path)
+    normalized_path = re.sub(r'^([a-zA-Z]):[\\/]', r'\1__', normalized_path)
+    safe_name = re.sub(r'[\\/]', '__', normalized_path)
+    # Replace .png at the end with __png
+    safe_name = re.sub(r'\.png$', '__png', safe_name, flags=re.IGNORECASE)
+    return safe_name
+
+
+def draw_patch_rectangles_on_image(base_img, patch_results, ground_truth_patches=None, patch_size=128, stride=64):
+    """
+    Draw patch rectangles (TP/FP/FN) on top of an existing image (e.g., anomaly overlay).
+    Args:
+        base_img: The image to draw on (np.uint8, HxWx3)
+        patch_results: List of (x, y, is_defective) tuples for each patch
+        ground_truth_patches: List of [grid_row, grid_col] coordinates for ground truth defective patches
+        patch_size: Size of patches
+        stride: Stride used for patch extraction
+    Returns:
+        Image with rectangles drawn.
+    """
+    img = base_img.copy()
+    predicted_defective = set()
+    ground_truth_defective = set()
+    for x, y, is_defective in patch_results:
+        if is_defective:
+            grid_row = y // patch_size
+            grid_col = x // patch_size
+            predicted_defective.add((grid_row, grid_col))
+    if ground_truth_patches:
+        for grid_row, grid_col in ground_truth_patches:
+            ground_truth_defective.add((grid_row, grid_col))
+    # Draw predicted defective regions (red)
+    for grid_row, grid_col in predicted_defective:
+        x = grid_col * patch_size
+        y = grid_row * patch_size
+        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (255, 0, 0), 2)
+    # Draw ground truth defective regions (yellow)
+    for grid_row, grid_col in ground_truth_defective:
+        x = grid_col * patch_size
+        y = grid_row * patch_size
+        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (255, 255, 0), 2)
+    # Draw overlapping regions (green)
+    overlapping = predicted_defective.intersection(ground_truth_defective)
+    for grid_row, grid_col in overlapping:
+        x = grid_col * patch_size
+        y = grid_row * patch_size
+        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (0, 255, 0), 3)
+    return img
 
 
 def main():
