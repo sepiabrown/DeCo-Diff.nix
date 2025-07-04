@@ -1,0 +1,192 @@
+[
+  {
+    "start": [
+      358,
+      245
+    ],
+    "end": [
+      471,
+      273
+    ],
+    "thickness": 2,
+    "avg_background": 64.0,
+    "deviation": -10,
+    "sigma": 3.0,
+    "curvature": 0.2,
+    "mid": [
+      428,
+      279
+    ]
+  },
+  {
+    "start": [
+      624,
+      1440
+    ],
+    "end": [
+      515,
+      1425
+    ],
+    "thickness": 2,
+    "avg_background": 63.0,
+    "deviation": -10,
+    "sigma": 3.0,
+    "curvature": 0.2,
+    "mid": [
+      553,
+      1424
+    ]
+  },
+  {
+    "start": [
+      264,
+      1853
+    ],
+    "end": [
+      203,
+      1920
+    ],
+    "thickness": 2,
+    "avg_background": 64.0,
+    "deviation": -10,
+    "sigma": 3.0,
+    "curvature": 0.2,
+    "mid": [
+      232,
+      1875
+    ]
+  },
+  {
+    "start": [
+      1383,
+      1131
+    ],
+    "end": [
+      1396,
+      1240
+    ],
+    "thickness": 2,
+    "avg_background": 64.0,
+    "deviation": -10,
+    "sigma": 3.0,
+    "curvature": 0.2,
+    "mid": [
+      1398,
+      1186
+    ]
+  },
+  {
+    "start": [
+      2156,
+      264
+    ],
+    "end": [
+      2100,
+      353
+    ],
+    "thickness": 2,
+    "avg_background": 64.0,
+    "deviation": -10,
+    "sigma": 3.0,
+    "curvature": 0.2,
+    "mid": [
+      2128,
+      312
+    ]
+  },
+  {
+    "start": [
+      410,
+      1040
+    ],
+    "end": [
+      326,
+      972
+    ],
+    "thickness": 2,
+    "avg_background": 62.0,
+    "deviation": -10,
+    "sigma": 3.0,
+    "curvature": 0.2,
+    "mid": [
+      349,
+      1006
+    ]
+  },
+  {
+    "start": [
+      563,
+      1085
+    ],
+    "end": [
+      500,
+      1184
+    ],
+    "thickness": 2,
+    "avg_background": 61.0,
+    "deviation": -10,
+    "sigma": 3.0,
+    "curvature": 0.2,
+    "mid": [
+      522,
+      1114
+    ]
+  },
+  {
+    "start": [
+      1798,
+      870
+    ],
+    "end": [
+      1760,
+      981
+    ],
+    "thickness": 2,
+    "avg_background": 45.0,
+    "deviation": -10,
+    "sigma": 3.0,
+    "curvature": 0.2,
+    "mid": [
+      1776,
+      923
+    ]
+  },
+  {
+    "start": [
+      2848,
+      827
+    ],
+    "end": [
+      2770,
+      913
+    ],
+    "thickness": 2,
+    "avg_background": 64.0,
+    "deviation": -10,
+    "sigma": 3.0,
+    "curvature": 0.2,
+    "mid": [
+      2818,
+      870
+    ]
+  },
+  {
+    "start": [
+      1923,
+      397
+    ],
+    "end": [
+      1945,
+      500
+    ],
+    "thickness": 2,
+    "avg_background": 64.0,
+    "deviation": -10,
+    "sigma": 3.0,
+    "curvature": 0.2,
+    "mid": [
+      1941,
+      434
+    ]
+  }
+]
