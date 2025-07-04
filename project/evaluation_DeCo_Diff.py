@@ -48,7 +48,7 @@ from typing import Sequence
 from io import BytesIO
 from pathlib import Path
 
-from typing import Any, Tuple
+from typing import Any, Tuple, cast
 
 from torchmetrics.functional.image import (
     learned_perceptual_image_patch_similarity as _lpips,
@@ -617,8 +617,14 @@ def evaluate_anomaly_maps(anomaly_maps, segmentation):
 
 
 def evaluation(args):
-    vae_model = f"stabilityai/sd-vae-ft-{args.vae_type}"  # @param ["stabilityai/sd-vae-ft-mse", "stabilityai/sd-vae-ft-ema"]
-    vae = AutoencoderKL.from_pretrained(vae_model).to(device)
+    if os.path.exists("./models/config.json"):
+        vae = cast(AutoencoderKL, AutoencoderKL.from_pretrained("./models", local_files_only=True)).to(
+            device
+        )
+    else:
+        vae = cast(AutoencoderKL, AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae_type}")).to(
+            device
+        )
     vae.eval()
     try:
         if args.pretrained != "":

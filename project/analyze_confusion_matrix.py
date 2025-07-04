@@ -7,19 +7,7 @@ import matplotlib.pyplot as plt
 from PIL import Image as PILImage
 import re
 from collections import defaultdict
-
-def path_to_safe_filename(file_path: str) -> str:
-    """
-    Convert an absolute file path to a safe filename by replacing path separators with underscores.
-    Handles Windows drive letters and both types of path separators.
-    Also replaces .png extension at the end with __png.
-    """
-    normalized_path = os.path.normpath(file_path)
-    normalized_path = re.sub(r'^([a-zA-Z]):[\\/]', r'\1__', normalized_path)
-    safe_name = re.sub(r'[\\/]', '__', normalized_path)
-    # Replace .png at the end with __png
-    safe_name = re.sub(r'\.png$', '__png', safe_name, flags=re.IGNORECASE)
-    return safe_name
+from utils import path_to_safe_filename
 
 def compute_confusion_matrix_with_details(annotation_dir, evaluation_results_dir, output_dir=None):
     """

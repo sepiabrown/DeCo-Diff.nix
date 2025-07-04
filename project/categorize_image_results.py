@@ -3,7 +3,7 @@ import json
 import glob
 import argparse
 from collections import defaultdict
-from analyze_confusion_matrix import path_to_safe_filename
+from utils import path_to_safe_filename
 
 def categorize_images(annotation_dir, evaluation_results_dir, output_file=None):
     eval_files = glob.glob(os.path.join(evaluation_results_dir, '*__evaluation.json'))
@@ -46,9 +46,9 @@ def categorize_images(annotation_dir, evaluation_results_dir, output_file=None):
         # Category assignment
         if not has_defect:
             if not detected_any:
-                cat = 1  # No defect, nothing detected
+                cat = 7  # No defect, nothing detected
             else:
-                cat = 2  # No defect, but model detected some
+                cat = 8  # No defect, but model detected some
         else:
             if detected_all:
                 if not over_detected:
@@ -62,9 +62,9 @@ def categorize_images(annotation_dir, evaluation_results_dir, output_file=None):
                     cat = 6  # Some defects detected, but over-detection
             elif detected_none:
                 if not over_detected:
-                    cat = 7  # No defects detected, no over-detection
+                    cat = 1  # No defects detected, no over-detection
                 else:
-                    cat = 8  # No defects detected, but over-detection
+                    cat = 2  # No defects detected, but over-detection
             else:
                 # Should not happen, but fallback
                 cat = 0
@@ -73,14 +73,14 @@ def categorize_images(annotation_dir, evaluation_results_dir, output_file=None):
 
     # Category descriptions
     category_descriptions = {
-        1: "Image that has no defective patch and the model also didn't detect any defective patch.",
-        2: "Image that has no defective patch but the model mistakenly detected few of the patches as defective.",
+        1: "Image that has defective patches and the model detected none of them while not over detecting.",
+        2: "Image that has defective patches and the model detected none of them but also over detected patches that are normal as defective.",
         3: "Image that has defective patches and the model detected every of them while not over detecting.",
         4: "Image that has defective patches and the model detected every of them but also over detected patches that are normal as defective.",
         5: "Image that has defective patches and the model detected some of them while not over detecting.",
         6: "Image that has defective patches and the model detected some of them but also over detected patches that are normal as defective.",
-        7: "Image that has defective patches and the model detected none of them while not over detecting.",
-        8: "Image that has defective patches and the model detected none of them but also over detected patches that are normal as defective."
+        7: "Image that has no defective patch and the model also didn't detect any defective patch.",
+        8: "Image that has no defective patch but the model mistakenly detected few of the patches as defective."
     }
 
     # Output summary

@@ -50,7 +50,7 @@ from typing import Sequence
 from io import BytesIO
 from pathlib import Path
 
-from typing import Any, Tuple
+from typing import Any, Tuple, cast
 
 from torchmetrics.functional.image import (
     learned_perceptual_image_patch_similarity as _lpips,
@@ -63,6 +63,7 @@ import cv2
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
 import re
+from utils import path_to_safe_filename
 
 torch.set_grad_enabled(False)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -253,7 +254,7 @@ class IrregularImageDataset(Dataset):
             image_path = os.path.join(data_dir, row['image'])
             if not os.path.exists(image_path):
                 continue
-                
+
             # Load original image
             img = np.array(PILImage.open(image_path).convert('RGB'))
             original_height, original_width = img.shape[:2]
@@ -456,17 +457,17 @@ def mark_defective_regions_on_image(original_img, patch_results, ground_truth_pa
         for grid_row, grid_col in ground_truth_patches:
             ground_truth_defective.add((grid_row, grid_col))
     
-    # Draw predicted defective regions (red)
+    # Draw predicted defective regions (yellow)
     for grid_row, grid_col in predicted_defective:
         x = grid_col * patch_size
         y = grid_row * patch_size
-        cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (255, 0, 0), 2)
+        cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (255, 255, 0), 2)
     
-    # Draw ground truth defective regions (yellow)
+    # Draw ground truth defective regions (red)
     for grid_row, grid_col in ground_truth_defective:
         x = grid_col * patch_size
         y = grid_row * patch_size
-        cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (255, 255, 0), 2)
+        cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (255, 0, 0), 2)
     
     # Draw overlapping regions (green) - where prediction and ground truth match
     overlapping = predicted_defective.intersection(ground_truth_defective)
@@ -492,17 +493,16 @@ def save_marked_image(marked_img, original_path, output_dir):
     return output_path
 
 
-def create_anomaly_overlay(original_img, anomaly_map, alpha=0.6):
+def create_anomaly_map_image(anomaly_map, lime_color=(192, 255, 0)):
     """
-    Create an overlay of the anomaly map on top of the original image.
+    Create a colored anomaly map image.
     
     Args:
-        original_img: Original image as numpy array (H, W, 3)
-        anomaly_map: Anomaly map as numpy array (H, W) or (H, W, 1)
-        alpha: Transparency factor (0.0 = fully transparent, 1.0 = fully opaque)
+        anomaly_map: 2D numpy array of anomaly scores (H, W) or (H, W, 1)
+        lime_color: RGB color for the anomaly map (default: lime green)
     
     Returns:
-        Overlay image as numpy array
+        RGB image with anomaly map in specified color (np.uint8, HxWx3)
     """
     # Ensure anomaly_map is 2D
     if anomaly_map.ndim == 3 and anomaly_map.shape[2] == 1:
@@ -510,20 +510,50 @@ def create_anomaly_overlay(original_img, anomaly_map, alpha=0.6):
     
     # Normalize anomaly map to 0-1 range
     if anomaly_map.max() > 0:
-        anomaly_map = (anomaly_map - anomaly_map.min()) / (anomaly_map.max() - anomaly_map.min())
+        normalized_map = (anomaly_map - anomaly_map.min()) / (anomaly_map.max() - anomaly_map.min())
+    else:
+        normalized_map = anomaly_map
     
-    # Create lime color overlay (lime = [0, 255, 0])
-    lime_color = np.array([0, 255, 0], dtype=np.uint8)
+    # Create RGB image with specified color
+    h, w = anomaly_map.shape
+    rgb_map = np.zeros((h, w, 3), dtype=np.uint8)
     
-    # Create colored overlay
-    overlay = np.zeros_like(original_img)
-    overlay[..., 0] = lime_color[0] * anomaly_map
-    overlay[..., 1] = lime_color[1] * anomaly_map
-    overlay[..., 2] = lime_color[2] * anomaly_map
+    # Apply color based on anomaly intensity
+    for c in range(3):
+        rgb_map[:, :, c] = (normalized_map * lime_color[c]).astype(np.uint8)
+    
+    return rgb_map
+
+
+def create_anomaly_overlay(original_img, anomaly_map, alpha=0.6, lime_color=(192, 255, 0)):
+    """
+    Create an overlay of the anomaly map on top of the original image.
+    
+    Args:
+        original_img: Original image as numpy array (H, W, 3)
+        anomaly_map: Anomaly map as numpy array (H, W) or (H, W, 1)
+        alpha: Transparency factor (0.0 = fully transparent, 1.0 = fully opaque)
+        lime_color: RGB color for the anomaly overlay (default: lime green)
+    
+    Returns:
+        Overlay image as numpy array
+    """
+    # Create colored overlay using the unified function
+    overlay = create_anomaly_map_image(anomaly_map, lime_color)
+    
+    # Ensure anomaly_map is 2D for blending
+    if anomaly_map.ndim == 3 and anomaly_map.shape[2] == 1:
+        anomaly_map = anomaly_map.squeeze()
+    
+    # Normalize anomaly map to 0-1 range for blending
+    if anomaly_map.max() > 0:
+        normalized_map = (anomaly_map - anomaly_map.min()) / (anomaly_map.max() - anomaly_map.min())
+    else:
+        normalized_map = anomaly_map
     
     # Blend with original image
-    result = original_img.astype(np.float32) * (1 - alpha * anomaly_map[..., np.newaxis]) + \
-             overlay.astype(np.float32) * alpha * anomaly_map[..., np.newaxis]
+    result = original_img.astype(np.float32) * (1 - alpha * normalized_map[..., np.newaxis]) + \
+             overlay.astype(np.float32) * alpha * normalized_map[..., np.newaxis]
     
     return result.astype(np.uint8)
 
@@ -902,8 +932,14 @@ def process_split(
 
 
 def evaluation(args):
-    vae_model = f"stabilityai/sd-vae-ft-{args.vae_type}"  # @param ["stabilityai/sd-vae-ft-mse", "stabilityai/sd-vae-ft-ema"]
-    vae = AutoencoderKL.from_pretrained(vae_model).to(device)
+    if os.path.exists("./models/config.json"):
+        vae = cast(AutoencoderKL, AutoencoderKL.from_pretrained("./models", local_files_only=True)).to(
+            device
+        )
+    else:
+        vae = cast(AutoencoderKL, AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae_type}")).to(
+            device
+        )
     vae.eval()
     try:
         if args.pretrained != "":
@@ -970,7 +1006,7 @@ def evaluation_annotated_images(args, diffusion, model, vae):
     )
     
     loader = DataLoader(
-        dataset, batch_size=30, shuffle=False, num_workers=4, drop_last=False
+        dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False
     )
     
     # For annotated images, use patch size as center_size to ensure consistent dimensions
@@ -1028,6 +1064,14 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         full_anomaly_map = np.zeros((h, w), dtype=np.float32)
         for x, y, patch_map in anomaly_map_list:
             full_anomaly_map[y:y+128, x:x+128] = patch_map.squeeze()
+        
+        # Create and save standalone anomaly map
+        anomaly_map_img = create_anomaly_map_image(full_anomaly_map)
+        anomaly_map_path = os.path.join(marked_images_dir, f"{safe_name}__anomaly_map.png")
+        PILImage.fromarray(anomaly_map_img).save(anomaly_map_path)
+        print(f"Saved anomaly map image: {anomaly_map_path}")
+        
+        # Create overlay image
         overlay_img = create_anomaly_overlay(original_img, full_anomaly_map, alpha=0.8)
         overlay_path = os.path.join(marked_images_dir, f"{safe_name}__anomaly_overlay.png")
         PILImage.fromarray(overlay_img).save(overlay_path)
@@ -1604,18 +1648,7 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
         json.dump(result, f, indent=2)
 
 
-def path_to_safe_filename(file_path: str) -> str:
-    """
-    Convert an absolute file path to a safe filename by replacing path separators with underscores.
-    Handles Windows drive letters and both types of path separators.
-    Also replaces .png extension at the end with __png.
-    """
-    normalized_path = os.path.normpath(file_path)
-    normalized_path = re.sub(r'^([a-zA-Z]):[\\/]', r'\1__', normalized_path)
-    safe_name = re.sub(r'[\\/]', '__', normalized_path)
-    # Replace .png at the end with __png
-    safe_name = re.sub(r'\.png$', '__png', safe_name, flags=re.IGNORECASE)
-    return safe_name
+
 
 
 def draw_patch_rectangles_on_image(base_img, patch_results, ground_truth_patches=None, patch_size=128, stride=64):
@@ -1641,16 +1674,16 @@ def draw_patch_rectangles_on_image(base_img, patch_results, ground_truth_patches
     if ground_truth_patches:
         for grid_row, grid_col in ground_truth_patches:
             ground_truth_defective.add((grid_row, grid_col))
-    # Draw predicted defective regions (red)
+    # Draw predicted defective regions (yellow)
     for grid_row, grid_col in predicted_defective:
         x = grid_col * patch_size
         y = grid_row * patch_size
-        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (255, 0, 0), 2)
-    # Draw ground truth defective regions (yellow)
+        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (255, 255, 0), 2)
+    # Draw ground truth defective regions (red)
     for grid_row, grid_col in ground_truth_defective:
         x = grid_col * patch_size
         y = grid_row * patch_size
-        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (255, 255, 0), 2)
+        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (255, 0, 0), 2)
     # Draw overlapping regions (green)
     overlapping = predicted_defective.intersection(ground_truth_defective)
     for grid_row, grid_col in overlapping:
@@ -1658,6 +1691,9 @@ def draw_patch_rectangles_on_image(base_img, patch_results, ground_truth_patches
         y = grid_row * patch_size
         cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (0, 255, 0), 3)
     return img
+
+
+
 
 
 def main():
