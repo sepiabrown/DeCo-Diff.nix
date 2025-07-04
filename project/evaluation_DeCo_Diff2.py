@@ -75,7 +75,6 @@ if device == torch.device("cpu"):
 # Constants
 # ---------------------------------------------------------------------------
 
-_DIFF_SCALE = 2.0
 _THRESHOLD = 5.0 / 255.0
 _LATENT_SCALE = 0.18215
 
@@ -350,14 +349,21 @@ def make_record(**kwargs) -> Record:
     return OrderedDict(kwargs)
 
 
-def _compute_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Return the mean channel‑wise difference *scaled* by ``_DIFF_SCALE``."""
-    return (a - b).mean(dim=1, keepdim=True) / _DIFF_SCALE
+def _compute_diff_mean(a: torch.Tensor, b: torch.Tensor, diff_scale: float = 1.0) -> torch.Tensor:
+    """Return the mean channel‑wise difference *scaled* by ``diff_scale``."""
+    return (a - b).mean(dim=1, keepdim=True) / diff_scale
 
+def _compute_abs_diff_mean(a: torch.Tensor, b: torch.Tensor, diff_scale: float = 1.0) -> torch.Tensor:
+    """Return the mean channel‑wise absolute difference *scaled* by ``diff_scale``."""
+    return torch.abs(a - b).mean(dim=1, keepdim=True) / diff_scale
+
+def _compute_abs_diff_max(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Return the maximum channel‑wise absolute difference."""
+    return torch.abs(a - b).max(dim=1, keepdim=True).values
 
 def _binary_mask(diff: torch.Tensor, threshold: float = _THRESHOLD) -> torch.Tensor:
-    """Return a binary mask in ``{-1, 1}`` based on *absolute* diff magnitude."""
-    return (diff.abs() > threshold).float() * 2.0 - 1.0
+    """Return a binary mask in ``{0, 1}`` based on *absolute* diff magnitude."""
+    return (diff.abs() > threshold).float()
 
 
 def _to_numpy(
@@ -493,7 +499,7 @@ def save_marked_image(marked_img, original_path, output_dir):
     return output_path
 
 
-def create_anomaly_map_image(anomaly_map, lime_color=(192, 255, 0)):
+def create_anomaly_map_image(anomaly_map, lime_color=(192, 255, 0), is_binary=True):
     """
     Create a colored anomaly map image.
     
@@ -508,11 +514,7 @@ def create_anomaly_map_image(anomaly_map, lime_color=(192, 255, 0)):
     if anomaly_map.ndim == 3 and anomaly_map.shape[2] == 1:
         anomaly_map = anomaly_map.squeeze()
     
-    # Normalize anomaly map to 0-1 range
-    if anomaly_map.max() > 0:
-        normalized_map = (anomaly_map - anomaly_map.min()) / (anomaly_map.max() - anomaly_map.min())
-    else:
-        normalized_map = anomaly_map
+
     
     # Create RGB image with specified color
     h, w = anomaly_map.shape
@@ -520,12 +522,20 @@ def create_anomaly_map_image(anomaly_map, lime_color=(192, 255, 0)):
     
     # Apply color based on anomaly intensity
     for c in range(3):
-        rgb_map[:, :, c] = (normalized_map * lime_color[c]).astype(np.uint8)
+        if not is_binary:
+            # Normalize anomaly map to 0-1 range
+            if anomaly_map.max() > 0:
+                normalized_map = (anomaly_map - anomaly_map.min()) / (anomaly_map.max() - anomaly_map.min())
+            else:
+                normalized_map = anomaly_map
+            rgb_map[:, :, c] = (normalized_map * lime_color[c]).astype(np.uint8)
+        else:
+            rgb_map[:, :, c] = (anomaly_map * lime_color[c]).astype(np.uint8)
     
     return rgb_map
 
 
-def create_anomaly_overlay(original_img, anomaly_map, alpha=0.6, lime_color=(192, 255, 0)):
+def create_anomaly_overlay(original_img, anomaly_map, alpha=0.6, lime_color=(192, 255, 0), is_binary=True):
     """
     Create an overlay of the anomaly map on top of the original image.
     
@@ -539,22 +549,23 @@ def create_anomaly_overlay(original_img, anomaly_map, alpha=0.6, lime_color=(192
         Overlay image as numpy array
     """
     # Create colored overlay using the unified function
-    overlay = create_anomaly_map_image(anomaly_map, lime_color)
+    overlay = create_anomaly_map_image(anomaly_map, lime_color, is_binary)
     
     # Ensure anomaly_map is 2D for blending
     if anomaly_map.ndim == 3 and anomaly_map.shape[2] == 1:
         anomaly_map = anomaly_map.squeeze()
     
-    # Normalize anomaly map to 0-1 range for blending
-    if anomaly_map.max() > 0:
-        normalized_map = (anomaly_map - anomaly_map.min()) / (anomaly_map.max() - anomaly_map.min())
-    else:
-        normalized_map = anomaly_map
-    
-    # Blend with original image
-    result = original_img.astype(np.float32) * (1 - alpha * normalized_map[..., np.newaxis]) + \
+    if not is_binary:
+        # Normalize anomaly map to 0-1 range
+        if anomaly_map.max() > 0:
+            normalized_map = (anomaly_map - anomaly_map.min()) / (anomaly_map.max() - anomaly_map.min())
+        else:
+            normalized_map = anomaly_map
+        result = original_img.astype(np.float32) * (1 - alpha * normalized_map[..., np.newaxis]) + \
              overlay.astype(np.float32) * alpha * normalized_map[..., np.newaxis]
-    
+    else:
+        result = original_img.astype(np.float32) * (1 - alpha * anomaly_map[..., np.newaxis]) + \
+             overlay.astype(np.float32) * alpha * anomaly_map[..., np.newaxis]
     return result.astype(np.uint8)
 
 
@@ -588,6 +599,10 @@ def process_split_irregular(
     device: torch.device = torch.device("cpu"),
     anomaly_binary_threshold: int = 0,
 ) -> List[Record]:
+    # Initialize epoch-wise statistics
+    epoch_encodedrecon_values = []
+    epoch_latent_values = []
+    epoch_anomaly_map_values = []
     """Run a forward‑&‑reverse pass on irregular images and collect metrics."""
 
     results: List[Record] = []
@@ -644,24 +659,29 @@ def process_split_irregular(
             # -----------------------------------------------------------------
             # Difference / binary maps
             # -----------------------------------------------------------------
-            orig_dodrecon_diff = _compute_diff(x, image_samples)
-            orig_encodedrecon_diff = _compute_diff(x, x0)
-            encodedrecon_dodrecon_diff = _compute_diff(x0, image_samples)
-
+            orig_dodrecon_diff = _compute_diff_mean(x, image_samples)
             orig_dodrecon_binary = _binary_mask(orig_dodrecon_diff)
-            orig_encodedrecon_binary = _binary_mask(orig_encodedrecon_diff)
-            encodedrecon_dodrecon_binary = _binary_mask(encodedrecon_dodrecon_diff)
 
-            encoded_latent_diff = (
-                (latent_samples_final - encoded).max(dim=1, keepdim=True).values
-            )
-            encoded_latent_binary = _binary_mask(encoded_latent_diff)
+            orig_encodedrecon_diff = _compute_diff_mean(x, x0)
+            orig_encodedrecon_binary = _binary_mask(orig_encodedrecon_diff)
+            
+            encodedrecon_dodrecon_diff = _compute_abs_diff_max(x0, image_samples)
+            # Collect epoch-wise statistics
+            encodedrecon_flat = encodedrecon_dodrecon_diff.flatten().cpu().numpy()
+            epoch_encodedrecon_values.extend(encodedrecon_flat)
+            encodedrecon_dodrecon_binary = torch.clamp(encodedrecon_dodrecon_diff, 0.0, 0.4) * 2.5
+
+            encoded_latent_diff = _compute_abs_diff_mean(latent_samples_final,encoded)
+            # Collect epoch-wise statistics
+            latent_flat = encoded_latent_diff.flatten().cpu().numpy()
+            epoch_latent_values.extend(latent_flat)
+            encoded_latent_binary = torch.clamp(encoded_latent_diff, 0.0, 0.4) * 2.5
 
             # Resize encoded_latent_diff to match the spatial dimensions of encodedrecon_dodrecon_diff
             # For irregular images, we want to use the patch size (128) as the target size
             patch_size = x.shape[-1]  # Should be 128 for patches
-            encoded_latent_abs_diff_resized = F.interpolate(
-                encoded_latent_diff.abs(),
+            encoded_latent_binary_resized = F.interpolate(
+                encoded_latent_binary,
                 size=(patch_size, patch_size),
                 mode="bilinear",
                 align_corners=False,
@@ -671,11 +691,11 @@ def process_split_irregular(
             # Composite anomaly maps
             # -----------------------------------------------------------------
             anomaly_map_arithmetic = 0.5 * (
-                encodedrecon_dodrecon_diff + encoded_latent_abs_diff_resized
+                encodedrecon_dodrecon_binary + encoded_latent_binary_resized
             )
             anomaly_map_arithmetic_binary = _binary_mask(anomaly_map_arithmetic)
             anomaly_map_geometric = (
-                encodedrecon_dodrecon_diff * encoded_latent_abs_diff_resized
+                encodedrecon_dodrecon_diff * encoded_latent_binary_resized
             )
             anomaly_map_geometric_binary = _binary_mask(anomaly_map_geometric)
 
@@ -717,7 +737,7 @@ def process_split_irregular(
             #x_original_img = Image.fromarray(((x_original_np + 1) / 2 * 255).astype(np.uint8))
             #x_original_save_path = os.path.join(tmp_dir, f'original_batch_{b}_{x_original_min:.3f}_{x_original_max:.3f}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
             #x_original_img.save(x_original_save_path)
-            anomaly_pixels = torch.sum(anomaly_binary > 0).item()
+            anomaly_pixels = torch.sum(anomaly_binary).item()
             is_defective = anomaly_pixels > anomaly_binary_threshold  # Any white pixels
             
             # Store patch result for original image marking
@@ -736,8 +756,9 @@ def process_split_irregular(
             image_patch_results[image_paths[b]].append((x_coord, y_coord, is_defective))
             
             # Store anomaly map for overlay creation
-            anomaly_map_np = _to_numpy(anomaly_map_arithmetic[b])
-            image_anomaly_maps[image_paths[b]].append((x_coord, y_coord, anomaly_map_np))
+            anomaly_map_arithmetic_np = _to_numpy(anomaly_map_arithmetic[b])
+            anomaly_map_arithmetic_binary_np = _to_numpy(anomaly_map_arithmetic_binary[b])
+            image_anomaly_maps[image_paths[b]].append((x_coord, y_coord, anomaly_map_arithmetic_np, anomaly_map_arithmetic_binary_np))
             
             rec = make_record(
                 split=("meta", split),
@@ -780,6 +801,31 @@ def process_split_irregular(
 
             add_metric_fields(rec, device=device)
             results.append(rec)
+
+    # Print epoch-wise statistics
+    print(f'\n=== EPOCH-WISE STATISTICS ===')
+    
+    # encodedrecon_dodrecon_diff statistics
+    if epoch_encodedrecon_values:
+        encodedrecon_array = np.array(epoch_encodedrecon_values)
+        print(f'encodedrecon_dodrecon_diff epoch stats:')
+        print(f'  min: {encodedrecon_array.min():.6f}, max: {encodedrecon_array.max():.6f}')
+        print(f'  mean: {encodedrecon_array.mean():.6f}, std: {encodedrecon_array.std():.6f}')
+        hist, bin_edges = np.histogram(encodedrecon_array, bins=np.arange(0, 3.25, 0.25), range=(0, 3))
+        print(f'encodedrecon_dodrecon_diff epoch distribution:')
+        for i, (count, edge) in enumerate(zip(hist, bin_edges[:-1])):
+            print(f'  [{edge:.2f}-{edge+0.25:.2f}): {count:6d} ({count/len(encodedrecon_array)*100:5.1f}%)')
+    
+    # encoded_latent_diff statistics
+    if epoch_latent_values:
+        latent_array = np.array(epoch_latent_values)
+        print(f'encoded_latent_diff epoch stats:')
+        print(f'  min: {latent_array.min():.6f}, max: {latent_array.max():.6f}')
+        print(f'  mean: {latent_array.mean():.6f}, std: {latent_array.std():.6f}')
+        hist, bin_edges = np.histogram(latent_array, bins=np.arange(0, 3.25, 0.25), range=(0, 3))
+        print(f'encoded_latent_diff epoch distribution:')
+        for i, (count, edge) in enumerate(zip(hist, bin_edges[:-1])):
+            print(f'  [{edge:.2f}-{edge+0.25:.2f}): {count:6d} ({count/len(latent_array)*100:5.1f}%)')
 
     return results, image_patch_results, image_anomaly_maps
 
@@ -851,9 +897,9 @@ def process_split(
             # -----------------------------------------------------------------
             # Difference / binary maps
             # -----------------------------------------------------------------
-            orig_dodrecon_diff = _compute_diff(x, image_samples)
-            orig_encodedrecon_diff = _compute_diff(x, x0)
-            encodedrecon_dodrecon_diff = _compute_diff(x0, image_samples)
+            orig_dodrecon_diff = _compute_diff_mean(x, image_samples)
+            orig_encodedrecon_diff = _compute_diff_mean(x, x0)
+            encodedrecon_dodrecon_diff = _compute_diff_mean(x0, image_samples)
 
             orig_dodrecon_binary = _binary_mask(orig_dodrecon_diff)
             orig_encodedrecon_binary = _binary_mask(orig_encodedrecon_diff)
@@ -1006,7 +1052,7 @@ def evaluation_annotated_images(args, diffusion, model, vae):
     )
     
     loader = DataLoader(
-        dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False
+        dataset, batch_size=1, shuffle=False, num_workers=4, drop_last=False
     )
     
     # For annotated images, use patch size as center_size to ensure consistent dimensions
@@ -1062,26 +1108,44 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         # Assume all patches are 128x128 and non-overlapping
         h, w, _ = original_img.shape
         full_anomaly_map = np.zeros((h, w), dtype=np.float32)
-        for x, y, patch_map in anomaly_map_list:
+        full_anomaly_map_binary = np.zeros((h, w), dtype=np.float32)
+        for x, y, patch_map, patch_map_binary in anomaly_map_list:
             full_anomaly_map[y:y+128, x:x+128] = patch_map.squeeze()
+            full_anomaly_map_binary[y:y+128, x:x+128] = patch_map_binary.squeeze()
         
         # Create and save standalone anomaly map
-        anomaly_map_img = create_anomaly_map_image(full_anomaly_map)
+        anomaly_map_img = create_anomaly_map_image(full_anomaly_map, is_binary=False)
         anomaly_map_path = os.path.join(marked_images_dir, f"{safe_name}__anomaly_map.png")
         PILImage.fromarray(anomaly_map_img).save(anomaly_map_path)
         print(f"Saved anomaly map image: {anomaly_map_path}")
         
+        anomaly_map_binary_img = create_anomaly_map_image(full_anomaly_map_binary, is_binary=True)
+        anomaly_map_binary_path = os.path.join(marked_images_dir, f"{safe_name}__anomaly_map_binary.png")
+        PILImage.fromarray(anomaly_map_binary_img).save(anomaly_map_binary_path)
+        print(f"Saved anomaly map binary image: {anomaly_map_binary_path}")
+
         # Create overlay image
-        overlay_img = create_anomaly_overlay(original_img, full_anomaly_map, alpha=0.8)
+        overlay_img = create_anomaly_overlay(original_img, full_anomaly_map, alpha=0.8, is_binary=False)
         overlay_path = os.path.join(marked_images_dir, f"{safe_name}__anomaly_overlay.png")
         PILImage.fromarray(overlay_img).save(overlay_path)
         print(f"Saved anomaly overlay image: {overlay_path}")
+
+# Create overlay image
+        overlay_binary_img = create_anomaly_overlay(original_img, full_anomaly_map_binary, alpha=0.8, is_binary=True)
+        overlay_binary_path = os.path.join(marked_images_dir, f"{safe_name}__anomaly_overlay_binary.png")
+        PILImage.fromarray(overlay_binary_img).save(overlay_binary_path)
+        print(f"Saved anomaly overlay binary image: {overlay_binary_path}")
 
         # Save overlay+patches image
         marked_overlay_img = draw_patch_rectangles_on_image(overlay_img, patch_results, ground_truth_patches, patch_size=128, stride=128)
         marked_overlay_path = os.path.join(marked_images_dir, f"{safe_name}__marked_overlay.png")
         PILImage.fromarray(marked_overlay_img).save(marked_overlay_path)
         print(f"Saved marked overlay image: {marked_overlay_path}")
+
+        marked_overlay_binary_img = draw_patch_rectangles_on_image(overlay_binary_img, patch_results, ground_truth_patches, patch_size=128, stride=128)
+        marked_overlay_binary_path = os.path.join(marked_images_dir, f"{safe_name}__marked_overlay_binary.png")
+        PILImage.fromarray(marked_overlay_binary_img).save(marked_overlay_binary_path)
+        print(f"Saved marked overlay binary image: {marked_overlay_binary_path}")
     
     # Save evaluation results in the same format as annotation files
     evaluation_results_dir = os.path.join(args.results_dir, "evaluation_results")
@@ -1133,7 +1197,7 @@ def evaluation_irregular_images(args, diffusion, model, vae):
     )
     
     loader = DataLoader(
-        dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False
+        dataset, batch_size=1, shuffle=False, num_workers=4, drop_last=False
     )
     
     # For irregular images, use patch size as center_size to ensure consistent dimensions
