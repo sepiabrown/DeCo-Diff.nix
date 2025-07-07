@@ -82,6 +82,160 @@ Kinded = Tuple[str, Any]  # (kind, value)
 Record = OrderedDict[str, Kinded]
 
 # ---------------------------------------------------------------------------
+# Base Classes for Reducing Boilerplate
+# ---------------------------------------------------------------------------
+
+class BaseEvaluator:
+    """Base class for evaluation operations to reduce boilerplate code."""
+    
+    def __init__(self, args, diffusion, model, vae, device=None):
+        self.args = args
+        self.diffusion = diffusion
+        self.model = model
+        self.vae = vae
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.transform = self._get_transform()
+        self.results_dir = args.results_dir
+        
+    def _get_transform(self):
+        """Get standard transform for all datasets."""
+        return transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+        ])
+    
+    def _get_dataloader(self, dataset, batch_size=None, shuffle=False):
+        """Get standard dataloader configuration."""
+        batch_size = batch_size or getattr(self.args, 'batch_size', 64)
+        return DataLoader(
+            dataset, 
+            batch_size=batch_size, 
+            shuffle=shuffle, 
+            num_workers=4, 
+            drop_last=False
+        )
+    
+    def _create_output_dirs(self):
+        """Create standard output directories."""
+        dirs = {
+            'marked_images': os.path.join(self.results_dir, "marked_images"),
+            'evaluation_results': os.path.join(self.results_dir, "evaluation_results"),
+            'accuracy_plots': os.path.join(self.results_dir, "accuracy_vs_param")
+        }
+        for dir_path in dirs.values():
+            os.makedirs(dir_path, exist_ok=True)
+        return dirs
+    
+    def _save_image(self, img, path, description=""):
+        """Save image with standard error handling."""
+        try:
+            PILImage.fromarray(img).save(path)
+            if description:
+                print(f"Saved {description}: {path}")
+        except Exception as e:
+            print(f"Error saving {description} to {path}: {e}")
+    
+    def _save_json(self, data, path, description=""):
+        """Save JSON with standard error handling."""
+        try:
+            with open(path, 'w') as f:
+                json.dump(data, f, indent=2)
+            if description:
+                print(f"Saved {description}: {path}")
+        except Exception as e:
+            print(f"Error saving {description} to {path}: {e}")
+
+class ImageProcessor:
+    """Utility class for common image processing operations."""
+    
+    @staticmethod
+    def create_anomaly_map_image(anomaly_map, lime_color=(192, 255, 0), is_binary=True, patch_size=128, add_grid=True, grid_color=(255, 255, 255), grid_thickness=1):
+        """Create anomaly map visualization with optional grid overlay."""
+        if is_binary:
+            # Binary map: 0 or 1
+            anomaly_map_img = (anomaly_map * 255).astype(np.uint8)
+        else:
+            # Continuous map: normalize to 0-255
+            if anomaly_map.max() > 0:
+                anomaly_map_img = ((anomaly_map - anomaly_map.min()) / 
+                                 (anomaly_map.max() - anomaly_map.min()) * 255).astype(np.uint8)
+            else:
+                anomaly_map_img = np.zeros_like(anomaly_map, dtype=np.uint8)
+        
+        # Apply colormap for better visualization
+        anomaly_map_colored = cv2.applyColorMap(anomaly_map_img, cv2.COLORMAP_HOT)
+        
+        # Add grid overlay if requested
+        if add_grid:
+            h, w = anomaly_map.shape
+            
+            # Draw vertical grid lines
+            for x in range(patch_size, w, patch_size):
+                cv2.line(anomaly_map_colored, (x, 0), (x, h), grid_color, grid_thickness)
+            
+            # Draw horizontal grid lines
+            for y in range(patch_size, h, patch_size):
+                cv2.line(anomaly_map_colored, (0, y), (w, y), grid_color, grid_thickness)
+            
+            # Draw border around the entire image
+            cv2.rectangle(anomaly_map_colored, (0, 0), (w-1, h-1), grid_color, grid_thickness)
+        
+        return anomaly_map_colored
+    
+    @staticmethod
+    def create_anomaly_overlay(original_img, anomaly_map, alpha=0.6, lime_color=(192, 255, 0), is_binary=True):
+        """Create overlay of anomaly map on original image."""
+        if is_binary:
+            # Binary overlay
+            overlay = original_img.copy()
+            mask = anomaly_map > 0
+            overlay[mask] = lime_color
+        else:
+            # Continuous overlay
+            anomaly_colored = ImageProcessor.create_anomaly_map_image(anomaly_map, is_binary=False, add_grid=False)
+            overlay = cv2.addWeighted(original_img, 1-alpha, anomaly_colored, alpha, 0)
+        
+        return overlay.astype(np.uint8)
+    
+    @staticmethod
+    def path_to_safe_filename(path):
+        """Convert file path to safe filename."""
+        return path.replace('/', '_').replace('\\', '_').replace(':', '_')
+
+class EvaluationMetrics:
+    """Utility class for computing and storing evaluation metrics."""
+    
+    def __init__(self):
+        self.epoch_stats = {
+            'encodedrecon_values': [],
+            'latent_values': [],
+            'anomaly_map_values': []
+        }
+    
+    def add_batch_stats(self, encodedrecon_diff, latent_diff, anomaly_map=None):
+        """Add batch statistics to epoch collection."""
+        self.epoch_stats['encodedrecon_values'].extend(encodedrecon_diff.flatten().cpu().numpy())
+        self.epoch_stats['latent_values'].extend(latent_diff.flatten().cpu().numpy())
+        if anomaly_map is not None:
+            self.epoch_stats['anomaly_map_values'].extend(anomaly_map.flatten().cpu().numpy())
+    
+    def print_epoch_stats(self):
+        """Print epoch-wise statistics."""
+        print(f'\n=== EPOCH-WISE STATISTICS ===')
+        
+        for name, values in self.epoch_stats.items():
+            if values:
+                array = np.array(values)
+                print(f'{name} epoch stats:')
+                print(f'  min: {array.min():.6f}, max: {array.max():.6f}')
+                print(f'  mean: {array.mean():.6f}, std: {array.std():.6f}')
+                
+                hist, bin_edges = np.histogram(array, bins=np.arange(0, 3.25, 0.25), range=(0, 3))
+                print(f'{name} epoch distribution:')
+                for i, (count, edge) in enumerate(zip(hist, bin_edges[:-1])):
+                    print(f'  [{edge:.2f}-{edge+0.25:.2f}): {count:6d} ({count/len(array)*100:5.1f}%)')
+
+# ---------------------------------------------------------------------------
 # New Dataset Class for Irregular Images
 # ---------------------------------------------------------------------------
 
@@ -421,31 +575,67 @@ def _write_row(ws, row_idx: int, rec: dict, size: int):
             embeds.append((col_idx, _tensor_to_xlimage(val, size)))
             scalars.append("")
         else:
-            scalars.append(val)
+            # Convert tuples and other non-serializable types to strings
+            if isinstance(val, (tuple, list)):
+                scalars.append(str(val))
+            elif isinstance(val, (np.ndarray, torch.Tensor)):
+                scalars.append(str(val.tolist() if hasattr(val, 'tolist') else val))
+            else:
+                scalars.append(val)
     ws.append(scalars)
     ws.row_dimensions[row_idx].height = size * 0.75
     for col_idx, img in embeds:
         ws.add_image(img, f"{get_column_letter(col_idx)}{row_idx}")
 
 
-def mark_defective_regions_on_image(original_img, patch_results, ground_truth_patches=None, patch_size=128, stride=64):
+def make_excel(
+    records: List[Record],
+    image_size: int,
+    save_dir: str | Path = "report",
+    save_filename: str | None = datetime.now().strftime("%y%m%d_%H%M%S"),
+) -> Path:
+    """Create Excel report with all evaluation records and images."""
+    save_dir = Path(save_dir).expanduser()
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Header comes from the first record's keys (order preserved)
+    header = list(records[0].keys())
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Report"
+    ws.append(header)
+
+    for r, rec in enumerate(records, start=2):
+        _write_row(ws, r, rec, image_size)
+    for c in range(1, len(header) + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 18
+
+    out_path = save_dir / f"report_{save_filename}.xlsx"
+    wb.save(out_path)
+    print(f"Report saved to {out_path}")
+    return out_path
+
+
+def draw_patch_rectangles_on_image(base_img, patch_results, ground_truth_patches=None, patch_size=128, stride=64, grid_thickness=1):
     """
-    Mark defective regions on the original image based on patch analysis results and ground truth.
+    Draw patch rectangles (TP/FP/FN) on top of an image.
     
     Args:
-        original_img: Original image as numpy array
+        base_img: The image to draw on (np.uint8, HxWx3)
         patch_results: List of (x, y, is_defective) tuples for each patch
         ground_truth_patches: List of [grid_row, grid_col] coordinates for ground truth defective patches
         patch_size: Size of patches
         stride: Stride used for patch extraction
+        grid_thickness: Thickness of the rectangle lines (default: 1)
     
     Returns:
-        Marked image with:
-        - Red rectangles around predicted defective regions
-        - Green rectangles around ground truth defective regions
-        - Yellow rectangles where prediction and ground truth overlap
+        Image with rectangles drawn:
+        - Yellow rectangles around predicted defective regions
+        - Red rectangles around ground truth defective regions  
+        - Green rectangles where prediction and ground truth overlap
     """
-    marked_img = original_img.copy()
+    img = base_img.copy()
     
     # Create sets for efficient lookup
     predicted_defective = set()
@@ -467,120 +657,25 @@ def mark_defective_regions_on_image(original_img, patch_results, ground_truth_pa
     for grid_row, grid_col in predicted_defective:
         x = grid_col * patch_size
         y = grid_row * patch_size
-        cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (255, 255, 0), 2)
+        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (255, 255, 0), grid_thickness)
     
     # Draw ground truth defective regions (red)
     for grid_row, grid_col in ground_truth_defective:
         x = grid_col * patch_size
         y = grid_row * patch_size
-        cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (255, 0, 0), 2)
+        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (255, 0, 0), grid_thickness)
     
     # Draw overlapping regions (green) - where prediction and ground truth match
     overlapping = predicted_defective.intersection(ground_truth_defective)
     for grid_row, grid_col in overlapping:
         x = grid_col * patch_size
         y = grid_row * patch_size
-        cv2.rectangle(marked_img, (x, y), (x + patch_size, y + patch_size), (0, 255, 0), 3)
+        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (0, 255, 0), grid_thickness)
     
-    return marked_img
+    return img
 
 
-def save_marked_image(marked_img, original_path, output_dir):
-    """Save the marked image to the output directory."""
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Create output filename
-    base_name = os.path.basename(original_path)
-    name, ext = os.path.splitext(base_name)
-    output_path = os.path.join(output_dir, f"{name}_marked{ext}")
-    
-    # Save image
-    PILImage.fromarray(marked_img).save(output_path)
-    return output_path
 
-
-def create_anomaly_map_image(anomaly_map, lime_color=(192, 255, 0), is_binary=True):
-    """
-    Create a colored anomaly map image.
-    
-    Args:
-        anomaly_map: 2D numpy array of anomaly scores (H, W) or (H, W, 1)
-        lime_color: RGB color for the anomaly map (default: lime green)
-    
-    Returns:
-        RGB image with anomaly map in specified color (np.uint8, HxWx3)
-    """
-    # Ensure anomaly_map is 2D
-    if anomaly_map.ndim == 3 and anomaly_map.shape[2] == 1:
-        anomaly_map = anomaly_map.squeeze()
-    
-
-    
-    # Create RGB image with specified color
-    h, w = anomaly_map.shape
-    rgb_map = np.zeros((h, w, 3), dtype=np.uint8)
-    
-    # Apply color based on anomaly intensity
-    for c in range(3):
-        if not is_binary:
-            # Normalize anomaly map to 0-1 range
-            if anomaly_map.max() > 0:
-                normalized_map = (anomaly_map - anomaly_map.min()) / (anomaly_map.max() - anomaly_map.min())
-            else:
-                normalized_map = anomaly_map
-            rgb_map[:, :, c] = (normalized_map * lime_color[c]).astype(np.uint8)
-        else:
-            rgb_map[:, :, c] = (anomaly_map * lime_color[c]).astype(np.uint8)
-    
-    return rgb_map
-
-
-def create_anomaly_overlay(original_img, anomaly_map, alpha=0.6, lime_color=(192, 255, 0), is_binary=True):
-    """
-    Create an overlay of the anomaly map on top of the original image.
-    
-    Args:
-        original_img: Original image as numpy array (H, W, 3)
-        anomaly_map: Anomaly map as numpy array (H, W) or (H, W, 1)
-        alpha: Transparency factor (0.0 = fully transparent, 1.0 = fully opaque)
-        lime_color: RGB color for the anomaly overlay (default: lime green)
-    
-    Returns:
-        Overlay image as numpy array
-    """
-    # Create colored overlay using the unified function
-    overlay = create_anomaly_map_image(anomaly_map, lime_color, is_binary)
-    
-    # Ensure anomaly_map is 2D for blending
-    if anomaly_map.ndim == 3 and anomaly_map.shape[2] == 1:
-        anomaly_map = anomaly_map.squeeze()
-    
-    if not is_binary:
-        # Normalize anomaly map to 0-1 range
-        if anomaly_map.max() > 0:
-            normalized_map = (anomaly_map - anomaly_map.min()) / (anomaly_map.max() - anomaly_map.min())
-        else:
-            normalized_map = anomaly_map
-        result = original_img.astype(np.float32) * (1 - alpha * normalized_map[..., np.newaxis]) + \
-             overlay.astype(np.float32) * alpha * normalized_map[..., np.newaxis]
-    else:
-        result = original_img.astype(np.float32) * (1 - alpha * anomaly_map[..., np.newaxis]) + \
-             overlay.astype(np.float32) * alpha * anomaly_map[..., np.newaxis]
-    return result.astype(np.uint8)
-
-
-def save_anomaly_overlay(overlay_img, original_path, output_dir):
-    """Save the anomaly overlay image to the output directory."""
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Create output filename
-    base_name = os.path.basename(original_path)
-    name, ext = os.path.splitext(base_name)
-    output_path = os.path.join(output_dir, f"{name}_anomaly_overlay{ext}")
-    
-    # Save image
-    PILImage.fromarray(overlay_img).save(output_path)
-    return output_path
 
 
 # ---------------------------------------------------------------------------
@@ -598,11 +693,10 @@ def process_split_irregular(
     batch_num: int,
     device: torch.device = torch.device("cpu"),
     anomaly_binary_threshold: int = 0,
+    anomaly_pixel_num_threshold: int = 0,
 ) -> List[Record]:
-    # Initialize epoch-wise statistics
-    epoch_encodedrecon_values = []
-    epoch_latent_values = []
-    epoch_anomaly_map_values = []
+    # Initialize evaluation metrics
+    metrics = EvaluationMetrics()
     """Run a forward‑&‑reverse pass on irregular images and collect metrics."""
 
     results: List[Record] = []
@@ -660,28 +754,24 @@ def process_split_irregular(
             # Difference / binary maps
             # -----------------------------------------------------------------
             orig_dodrecon_diff = _compute_diff_mean(x, image_samples)
-            orig_dodrecon_binary = _binary_mask(orig_dodrecon_diff)
+            orig_dodrecon_binary = _binary_mask(orig_dodrecon_diff, anomaly_binary_threshold)
 
             orig_encodedrecon_diff = _compute_diff_mean(x, x0)
-            orig_encodedrecon_binary = _binary_mask(orig_encodedrecon_diff)
+            orig_encodedrecon_binary = _binary_mask(orig_encodedrecon_diff, anomaly_binary_threshold)
             
             encodedrecon_dodrecon_diff = _compute_abs_diff_max(x0, image_samples)
-            # Collect epoch-wise statistics
-            encodedrecon_flat = encodedrecon_dodrecon_diff.flatten().cpu().numpy()
-            epoch_encodedrecon_values.extend(encodedrecon_flat)
-            encodedrecon_dodrecon_binary = torch.clamp(encodedrecon_dodrecon_diff, 0.0, 0.4) * 2.5
+            encodedrecon_dodrecon_diff = torch.clamp(encodedrecon_dodrecon_diff, 0.0, 0.4) * 2.5
 
             encoded_latent_diff = _compute_abs_diff_mean(latent_samples_final,encoded)
             # Collect epoch-wise statistics
-            latent_flat = encoded_latent_diff.flatten().cpu().numpy()
-            epoch_latent_values.extend(latent_flat)
-            encoded_latent_binary = torch.clamp(encoded_latent_diff, 0.0, 0.4) * 2.5
+            metrics.add_batch_stats(encodedrecon_dodrecon_diff, encoded_latent_diff)
+            encoded_latent_diff = torch.clamp(encoded_latent_diff, 0.0, 0.4) * 2.5
 
             # Resize encoded_latent_diff to match the spatial dimensions of encodedrecon_dodrecon_diff
             # For irregular images, we want to use the patch size (128) as the target size
             patch_size = x.shape[-1]  # Should be 128 for patches
-            encoded_latent_binary_resized = F.interpolate(
-                encoded_latent_binary,
+            encoded_latent_diff_resized = F.interpolate(
+                encoded_latent_diff,
                 size=(patch_size, patch_size),
                 mode="bilinear",
                 align_corners=False,
@@ -691,13 +781,13 @@ def process_split_irregular(
             # Composite anomaly maps
             # -----------------------------------------------------------------
             anomaly_map_arithmetic = 0.5 * (
-                encodedrecon_dodrecon_binary + encoded_latent_binary_resized
+                encodedrecon_dodrecon_diff + encoded_latent_diff_resized
             )
-            anomaly_map_arithmetic_binary = _binary_mask(anomaly_map_arithmetic)
+            anomaly_map_arithmetic_binary = _binary_mask(anomaly_map_arithmetic, anomaly_binary_threshold)
             anomaly_map_geometric = (
-                encodedrecon_dodrecon_diff * encoded_latent_binary_resized
+                encodedrecon_dodrecon_diff * encoded_latent_diff_resized
             )
-            anomaly_map_geometric_binary = _binary_mask(anomaly_map_geometric)
+            anomaly_map_geometric_binary = _binary_mask(anomaly_map_geometric, anomaly_binary_threshold)
 
         # ---------------------------------------------------------------------
         # Per‑sample aggregation
@@ -707,7 +797,7 @@ def process_split_irregular(
         for b in range(batch_size):
             # Determine if this patch is defective
             anomaly_binary = anomaly_map_arithmetic_binary[b]
-            #encoded_latent = encoded_latent_binary[b]
+            #encoded_latent = encoded_latent_diff[b]
             #x_original = x[b]
             #
             #img_path = image_paths[b]
@@ -738,7 +828,7 @@ def process_split_irregular(
             #x_original_save_path = os.path.join(tmp_dir, f'original_batch_{b}_{x_original_min:.3f}_{x_original_max:.3f}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
             #x_original_img.save(x_original_save_path)
             anomaly_pixels = torch.sum(anomaly_binary).item()
-            is_defective = anomaly_pixels > anomaly_binary_threshold  # Any white pixels
+            is_defective = anomaly_pixels > anomaly_pixel_num_threshold  # Any white pixels
             
             # Store patch result for original image marking
             # patch_coords[b] is now a tensor [x, y]
@@ -755,10 +845,12 @@ def process_split_irregular(
             
             image_patch_results[image_paths[b]].append((x_coord, y_coord, is_defective))
             
-            # Store anomaly map for overlay creation
+            # Store anomaly maps for overlay creation
             anomaly_map_arithmetic_np = _to_numpy(anomaly_map_arithmetic[b])
             anomaly_map_arithmetic_binary_np = _to_numpy(anomaly_map_arithmetic_binary[b])
-            image_anomaly_maps[image_paths[b]].append((x_coord, y_coord, anomaly_map_arithmetic_np, anomaly_map_arithmetic_binary_np))
+            anomaly_map_geometric_np = _to_numpy(anomaly_map_geometric[b])
+            anomaly_map_geometric_binary_np = _to_numpy(anomaly_map_geometric_binary[b])
+            image_anomaly_maps[image_paths[b]].append((x_coord, y_coord, anomaly_map_arithmetic_np, anomaly_map_arithmetic_binary_np, anomaly_map_geometric_np, anomaly_map_geometric_binary_np))
             
             rec = make_record(
                 split=("meta", split),
@@ -780,12 +872,7 @@ def process_split_irregular(
                     "image",
                     _to_numpy(encodedrecon_dodrecon_diff[b]),
                 ),
-                encodedrecon_dodrecon_binary=(
-                    "image",
-                    _to_numpy(encodedrecon_dodrecon_binary[b]),
-                ),
                 encoded_latent_diff=("image", _to_numpy(encoded_latent_diff[b])),
-                encoded_latent_binary=("image", _to_numpy(encoded_latent_binary[b])),
                 anomaly_map_arithmetic=("image", _to_numpy(anomaly_map_arithmetic[b])),
                 anomaly_map_geometric=("image", _to_numpy(anomaly_map_geometric[b])),
                 anomaly_map_arithmetic_binary=(
@@ -803,29 +890,7 @@ def process_split_irregular(
             results.append(rec)
 
     # Print epoch-wise statistics
-    print(f'\n=== EPOCH-WISE STATISTICS ===')
-    
-    # encodedrecon_dodrecon_diff statistics
-    if epoch_encodedrecon_values:
-        encodedrecon_array = np.array(epoch_encodedrecon_values)
-        print(f'encodedrecon_dodrecon_diff epoch stats:')
-        print(f'  min: {encodedrecon_array.min():.6f}, max: {encodedrecon_array.max():.6f}')
-        print(f'  mean: {encodedrecon_array.mean():.6f}, std: {encodedrecon_array.std():.6f}')
-        hist, bin_edges = np.histogram(encodedrecon_array, bins=np.arange(0, 3.25, 0.25), range=(0, 3))
-        print(f'encodedrecon_dodrecon_diff epoch distribution:')
-        for i, (count, edge) in enumerate(zip(hist, bin_edges[:-1])):
-            print(f'  [{edge:.2f}-{edge+0.25:.2f}): {count:6d} ({count/len(encodedrecon_array)*100:5.1f}%)')
-    
-    # encoded_latent_diff statistics
-    if epoch_latent_values:
-        latent_array = np.array(epoch_latent_values)
-        print(f'encoded_latent_diff epoch stats:')
-        print(f'  min: {latent_array.min():.6f}, max: {latent_array.max():.6f}')
-        print(f'  mean: {latent_array.mean():.6f}, std: {latent_array.std():.6f}')
-        hist, bin_edges = np.histogram(latent_array, bins=np.arange(0, 3.25, 0.25), range=(0, 3))
-        print(f'encoded_latent_diff epoch distribution:')
-        for i, (count, edge) in enumerate(zip(hist, bin_edges[:-1])):
-            print(f'  [{edge:.2f}-{edge+0.25:.2f}): {count:6d} ({count/len(latent_array)*100:5.1f}%)')
+    metrics.print_epoch_stats()
 
     return results, image_patch_results, image_anomaly_maps
 
@@ -903,12 +968,12 @@ def process_split(
 
             orig_dodrecon_binary = _binary_mask(orig_dodrecon_diff)
             orig_encodedrecon_binary = _binary_mask(orig_encodedrecon_diff)
-            encodedrecon_dodrecon_binary = _binary_mask(encodedrecon_dodrecon_diff)
+            encodedrecon_dodrecon_diff = _binary_mask(encodedrecon_dodrecon_diff)
 
             encoded_latent_diff = (
                 (latent_samples_final - encoded).max(dim=1, keepdim=True).values
             )
-            encoded_latent_binary = _binary_mask(encoded_latent_diff)
+            encoded_latent_diff = _binary_mask(encoded_latent_diff)
 
             encoded_latent_abs_diff_resized = F.interpolate(
                 encoded_latent_diff.abs(),
@@ -952,12 +1017,7 @@ def process_split(
                     "image",
                     _to_numpy(encodedrecon_dodrecon_diff[b]),
                 ),
-                encodedrecon_dodrecon_binary=(
-                    "image",
-                    _to_numpy(encodedrecon_dodrecon_binary[b]),
-                ),
                 encoded_latent_diff=("image", _to_numpy(encoded_latent_diff[b])),
-                encoded_latent_binary=("image", _to_numpy(encoded_latent_binary[b])),
                 anomaly_map_arithmetic=("image", _to_numpy(anomaly_map_arithmetic[b])),
                 anomaly_map_geometric=("image", _to_numpy(anomaly_map_geometric[b])),
                 anomaly_map_arithmetic_binary=(
@@ -1034,32 +1094,24 @@ def evaluation(args):
 
 def evaluation_annotated_images(args, diffusion, model, vae):
     """Evaluate images with JSON annotations for defective regions."""
-    transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True
-            ),
-        ]
-    )
+    # Create base evaluator
+    evaluator = BaseEvaluator(args, diffusion, model, vae)
     
     # Create dataset for annotated images
     dataset = AnnotatedImageDataset(
         annotation_dir=args.annotation_dir,
         patch_size=128,
-        transform=transform,
+        transform=evaluator.transform,
         object_class=args.object_class,
     )
     
-    loader = DataLoader(
-        dataset, batch_size=1, shuffle=False, num_workers=4, drop_last=False
-    )
+    loader = evaluator._get_dataloader(dataset, batch_size=1)
     
     # For annotated images, use patch size as center_size to ensure consistent dimensions
     patch_center_size = 128
     
     # Process patches
-    _recs, image_patch_results, image_anomaly_maps = process_split_irregular(
+    records, image_patch_results, image_anomaly_maps = process_split_irregular(
         loader,
         args.split,
         diffusion,
@@ -1070,12 +1122,12 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         args.batch_num,
         device,
         args.anomaly_binary_threshold,
+        args.anomaly_pixel_num_threshold,
     )
     
     # Mark defective regions on original images
     print("Marking defective regions on original images...")
-    marked_images_dir = os.path.join(args.results_dir, "marked_images")
-    os.makedirs(marked_images_dir, exist_ok=True)
+    output_dirs = evaluator._create_output_dirs()
     
     for image_path, patch_results in image_patch_results.items():
         # Load original image
@@ -1092,65 +1144,86 @@ def evaluation_annotated_images(args, diffusion, model, vae):
                 ground_truth_patches = annotation.get("defective_patches", [])
         
         # Mark defective regions (both predicted and ground truth)
-        marked_img = mark_defective_regions_on_image(
-            original_img, patch_results, ground_truth_patches, patch_size=128, stride=128
+        marked_img = draw_patch_rectangles_on_image(
+            original_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1
         )
         
-        safe_name = path_to_safe_filename(image_path)
+        safe_name = ImageProcessor.path_to_safe_filename(image_path)
         # Save marked image
-        marked_path = os.path.join(marked_images_dir, f"{safe_name}__marked.png")
-        PILImage.fromarray(marked_img).save(marked_path)
-        print(f"Saved marked image: {marked_path}")
+        marked_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__marked.png")
+        evaluator._save_image(marked_img, marked_path, "marked image")
 
         # --- Create and save anomaly overlay image ---
-        # Reconstruct the full anomaly map for this image
+        # Reconstruct the full anomaly maps for this image
         anomaly_map_list = image_anomaly_maps[image_path]
         # Assume all patches are 128x128 and non-overlapping
         h, w, _ = original_img.shape
-        full_anomaly_map = np.zeros((h, w), dtype=np.float32)
-        full_anomaly_map_binary = np.zeros((h, w), dtype=np.float32)
-        for x, y, patch_map, patch_map_binary in anomaly_map_list:
-            full_anomaly_map[y:y+128, x:x+128] = patch_map.squeeze()
-            full_anomaly_map_binary[y:y+128, x:x+128] = patch_map_binary.squeeze()
+        full_anomaly_map_arithmetic = np.zeros((h, w), dtype=np.float32)
+        full_anomaly_map_arithmetic_binary = np.zeros((h, w), dtype=np.float32)
+        full_anomaly_map_geometric = np.zeros((h, w), dtype=np.float32)
+        full_anomaly_map_geometric_binary = np.zeros((h, w), dtype=np.float32)
         
-        # Create and save standalone anomaly map
-        anomaly_map_img = create_anomaly_map_image(full_anomaly_map, is_binary=False)
-        anomaly_map_path = os.path.join(marked_images_dir, f"{safe_name}__anomaly_map.png")
-        PILImage.fromarray(anomaly_map_img).save(anomaly_map_path)
-        print(f"Saved anomaly map image: {anomaly_map_path}")
+        for x, y, patch_map_arithmetic, patch_map_arithmetic_binary, patch_map_geometric, patch_map_geometric_binary in anomaly_map_list:
+            full_anomaly_map_arithmetic[y:y+128, x:x+128] = patch_map_arithmetic.squeeze()
+            full_anomaly_map_arithmetic_binary[y:y+128, x:x+128] = patch_map_arithmetic_binary.squeeze()
+            full_anomaly_map_geometric[y:y+128, x:x+128] = patch_map_geometric.squeeze()
+            full_anomaly_map_geometric_binary[y:y+128, x:x+128] = patch_map_geometric_binary.squeeze()
         
-        anomaly_map_binary_img = create_anomaly_map_image(full_anomaly_map_binary, is_binary=True)
-        anomaly_map_binary_path = os.path.join(marked_images_dir, f"{safe_name}__anomaly_map_binary.png")
-        PILImage.fromarray(anomaly_map_binary_img).save(anomaly_map_binary_path)
-        print(f"Saved anomaly map binary image: {anomaly_map_binary_path}")
+        # Create and save standalone arithmetic anomaly maps
+        anomaly_map_arithmetic_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_arithmetic, is_binary=False, patch_size=128, add_grid=True)
+        anomaly_map_arithmetic_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__anomaly_map_arithmetic.png")
+        evaluator._save_image(anomaly_map_arithmetic_img, anomaly_map_arithmetic_path, "arithmetic anomaly map image")
+        
+        anomaly_map_arithmetic_binary_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_arithmetic_binary, is_binary=True, patch_size=128, add_grid=True)
+        anomaly_map_arithmetic_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__anomaly_map_arithmetic_binary.png")
+        evaluator._save_image(anomaly_map_arithmetic_binary_img, anomaly_map_arithmetic_binary_path, "arithmetic anomaly map binary image")
 
-        # Create overlay image
-        overlay_img = create_anomaly_overlay(original_img, full_anomaly_map, alpha=0.8, is_binary=False)
-        overlay_path = os.path.join(marked_images_dir, f"{safe_name}__anomaly_overlay.png")
-        PILImage.fromarray(overlay_img).save(overlay_path)
-        print(f"Saved anomaly overlay image: {overlay_path}")
+        # Create and save standalone geometric anomaly maps
+        anomaly_map_geometric_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_geometric, is_binary=False, patch_size=128, add_grid=True)
+        anomaly_map_geometric_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__anomaly_map_geometric.png")
+        evaluator._save_image(anomaly_map_geometric_img, anomaly_map_geometric_path, "geometric anomaly map image")
+        
+        anomaly_map_geometric_binary_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_geometric_binary, is_binary=True, patch_size=128, add_grid=True)
+        anomaly_map_geometric_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__anomaly_map_geometric_binary.png")
+        evaluator._save_image(anomaly_map_geometric_binary_img, anomaly_map_geometric_binary_path, "geometric anomaly map binary image")
 
-# Create overlay image
-        overlay_binary_img = create_anomaly_overlay(original_img, full_anomaly_map_binary, alpha=0.8, is_binary=True)
-        overlay_binary_path = os.path.join(marked_images_dir, f"{safe_name}__anomaly_overlay_binary.png")
-        PILImage.fromarray(overlay_binary_img).save(overlay_binary_path)
-        print(f"Saved anomaly overlay binary image: {overlay_binary_path}")
+        # Create arithmetic overlay images
+        overlay_arithmetic_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_arithmetic, alpha=0.8, is_binary=False)
+        overlay_arithmetic_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__anomaly_overlay_arithmetic.png")
+        evaluator._save_image(overlay_arithmetic_img, overlay_arithmetic_path, "arithmetic anomaly overlay image")
 
-        # Save overlay+patches image
-        marked_overlay_img = draw_patch_rectangles_on_image(overlay_img, patch_results, ground_truth_patches, patch_size=128, stride=128)
-        marked_overlay_path = os.path.join(marked_images_dir, f"{safe_name}__marked_overlay.png")
-        PILImage.fromarray(marked_overlay_img).save(marked_overlay_path)
-        print(f"Saved marked overlay image: {marked_overlay_path}")
+        overlay_arithmetic_binary_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_arithmetic_binary, alpha=0.8, is_binary=True)
+        overlay_arithmetic_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__anomaly_overlay_arithmetic_binary.png")
+        evaluator._save_image(overlay_arithmetic_binary_img, overlay_arithmetic_binary_path, "arithmetic anomaly overlay binary image")
 
-        marked_overlay_binary_img = draw_patch_rectangles_on_image(overlay_binary_img, patch_results, ground_truth_patches, patch_size=128, stride=128)
-        marked_overlay_binary_path = os.path.join(marked_images_dir, f"{safe_name}__marked_overlay_binary.png")
-        PILImage.fromarray(marked_overlay_binary_img).save(marked_overlay_binary_path)
-        print(f"Saved marked overlay binary image: {marked_overlay_binary_path}")
+        # Create geometric overlay images
+        overlay_geometric_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_geometric, alpha=0.8, is_binary=False)
+        overlay_geometric_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__anomaly_overlay_geometric.png")
+        evaluator._save_image(overlay_geometric_img, overlay_geometric_path, "geometric anomaly overlay image")
+
+        overlay_geometric_binary_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_geometric_binary, alpha=0.8, is_binary=True)
+        overlay_geometric_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__anomaly_overlay_geometric_binary.png")
+        evaluator._save_image(overlay_geometric_binary_img, overlay_geometric_binary_path, "geometric anomaly overlay binary image")
+
+        # Save overlay+patches images for arithmetic maps
+        marked_overlay_arithmetic_img = draw_patch_rectangles_on_image(overlay_arithmetic_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
+        marked_overlay_arithmetic_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__marked_overlay_arithmetic.png")
+        evaluator._save_image(marked_overlay_arithmetic_img, marked_overlay_arithmetic_path, "marked arithmetic overlay image")
+
+        marked_overlay_arithmetic_binary_img = draw_patch_rectangles_on_image(overlay_arithmetic_binary_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
+        marked_overlay_arithmetic_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__marked_overlay_arithmetic_binary.png")
+        evaluator._save_image(marked_overlay_arithmetic_binary_img, marked_overlay_arithmetic_binary_path, "marked arithmetic overlay binary image")
+
+        # Save overlay+patches images for geometric maps
+        marked_overlay_geometric_img = draw_patch_rectangles_on_image(overlay_geometric_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
+        marked_overlay_geometric_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__marked_overlay_geometric.png")
+        evaluator._save_image(marked_overlay_geometric_img, marked_overlay_geometric_path, "marked geometric overlay image")
+
+        marked_overlay_geometric_binary_img = draw_patch_rectangles_on_image(overlay_geometric_binary_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
+        marked_overlay_geometric_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__marked_overlay_geometric_binary.png")
+        evaluator._save_image(marked_overlay_geometric_binary_img, marked_overlay_geometric_binary_path, "marked geometric overlay binary image")
     
     # Save evaluation results in the same format as annotation files
-    evaluation_results_dir = os.path.join(args.results_dir, "evaluation_results")
-    os.makedirs(evaluation_results_dir, exist_ok=True)
-    
     for image_path, patch_results in image_patch_results.items():
         # Convert pixel coordinates back to grid coordinates
         predicted_defective_patches = []
@@ -1159,19 +1232,28 @@ def evaluation_annotated_images(args, diffusion, model, vae):
                 grid_row = y // 128
                 grid_col = x // 128
                 predicted_defective_patches.append([grid_row, grid_col])
-        result_filename = f"{path_to_safe_filename(image_path)}__evaluation.json"
-        result_path = os.path.join(evaluation_results_dir, result_filename)
+        result_filename = f"{ImageProcessor.path_to_safe_filename(image_path)}__evaluation.json"
+        result_path = os.path.join(output_dirs['evaluation_results'], result_filename)
         evaluation_result = {
             "image_path": image_path,
             "defective_patches": predicted_defective_patches,
             "grid_size": 128
         }
-        with open(result_path, 'w') as f:
-            json.dump(evaluation_result, f, indent=2)
-        print(f"Saved evaluation result: {result_path}")
+        evaluator._save_json(evaluation_result, result_path, "evaluation result")
+    
+    # Create Excel report
+    print("Creating Excel report...")
+    excel_path = make_excel(
+        records=records,
+        image_size=128,
+        save_dir=output_dirs['evaluation_results'],
+        save_filename=f"report_{datetime.now().strftime('%y%m%d_%H%M%S')}"
+    )
+    print(f"Excel report saved to: {excel_path}")
+    
     print("==" * 30)
     # Compute confusion matrix and accuracy
-    compute_confusion_matrix_and_accuracy(args.annotation_dir, evaluation_results_dir)
+    compute_confusion_matrix_and_accuracy(args.annotation_dir, output_dirs['evaluation_results'])
 
 
 def evaluation_irregular_images(args, diffusion, model, vae):
@@ -1215,6 +1297,7 @@ def evaluation_irregular_images(args, diffusion, model, vae):
         args.batch_num,
         device,
         args.anomaly_binary_threshold,
+        args.anomaly_pixel_num_threshold,
     )
     
     # Mark defective regions on original images
@@ -1226,8 +1309,8 @@ def evaluation_irregular_images(args, diffusion, model, vae):
         original_img = np.array(PILImage.open(image_path).convert('RGB'))
         
         # Mark defective regions
-        marked_img = mark_defective_regions_on_image(
-            original_img, patch_results, patch_size=128, stride=128
+        marked_img = draw_patch_rectangles_on_image(
+            original_img, patch_results, patch_size=128, stride=128, grid_thickness=1
         )
         
         safe_name = path_to_safe_filename(image_path)
@@ -1715,46 +1798,7 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
 
 
 
-def draw_patch_rectangles_on_image(base_img, patch_results, ground_truth_patches=None, patch_size=128, stride=64):
-    """
-    Draw patch rectangles (TP/FP/FN) on top of an existing image (e.g., anomaly overlay).
-    Args:
-        base_img: The image to draw on (np.uint8, HxWx3)
-        patch_results: List of (x, y, is_defective) tuples for each patch
-        ground_truth_patches: List of [grid_row, grid_col] coordinates for ground truth defective patches
-        patch_size: Size of patches
-        stride: Stride used for patch extraction
-    Returns:
-        Image with rectangles drawn.
-    """
-    img = base_img.copy()
-    predicted_defective = set()
-    ground_truth_defective = set()
-    for x, y, is_defective in patch_results:
-        if is_defective:
-            grid_row = y // patch_size
-            grid_col = x // patch_size
-            predicted_defective.add((grid_row, grid_col))
-    if ground_truth_patches:
-        for grid_row, grid_col in ground_truth_patches:
-            ground_truth_defective.add((grid_row, grid_col))
-    # Draw predicted defective regions (yellow)
-    for grid_row, grid_col in predicted_defective:
-        x = grid_col * patch_size
-        y = grid_row * patch_size
-        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (255, 255, 0), 2)
-    # Draw ground truth defective regions (red)
-    for grid_row, grid_col in ground_truth_defective:
-        x = grid_col * patch_size
-        y = grid_row * patch_size
-        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (255, 0, 0), 2)
-    # Draw overlapping regions (green)
-    overlapping = predicted_defective.intersection(ground_truth_defective)
-    for grid_row, grid_col in overlapping:
-        x = grid_col * patch_size
-        y = grid_row * patch_size
-        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (0, 255, 0), 3)
-    return img
+
 
 
 
@@ -1848,11 +1892,16 @@ def main():
     )
     parser.add_argument(
         "--anomaly-binary-threshold",
-        type=float,
+        type=int,
         default=0,
         help="Threshold for determining if a patch is defective based on number of anomaly pixels (default: 0)"
     )
-
+    parser.add_argument(
+        "--anomaly-pixel-num-threshold",
+        type=int,
+        default=0,
+        help="Threshold for determining if a patch is defective based on number of anomaly pixels (default: 0)"
+    )
     args = parser.parse_args()
     
     # Handle input JSON if provided
@@ -1871,7 +1920,7 @@ def main():
                 key = key.replace('-', '_')
                 if hasattr(args, key):
                     # Convert string values to appropriate types
-                    if key in ['image_size', 'center_size', 'batch_num', 'reverse_steps', 'anomaly_binary_threshold']:
+                    if key in ['image_size', 'center_size', 'batch_num', 'reverse_steps', 'anomaly_binary_threshold', 'anomaly_pixel_num_threshold']:
                         value = int(value)
                     elif key == 'center_crop':
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
