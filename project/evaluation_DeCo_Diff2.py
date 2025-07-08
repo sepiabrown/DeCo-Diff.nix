@@ -132,13 +132,34 @@ class BaseEvaluator:
         return dirs
     
     def _save_image(self, img, path, description=""):
-        """Save image with standard error handling."""
-        try:
-            PILImage.fromarray(img).save(path)
-            if description:
-                print(f"Saved {description}: {path}")
-        except Exception as e:
-            print(f"Error saving {description} to {path}: {e}")
+        """Save image to path."""
+        import os
+        from PIL import Image
+        import numpy as np
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        
+        # Convert numpy array to PIL Image if needed
+        if isinstance(img, np.ndarray):
+            # Handle different array formats
+            if img.dtype == np.uint8:
+                pil_img = Image.fromarray(img)
+            else:
+                # Convert float arrays to uint8
+                if img.max() <= 1.0:
+                    img = (img * 255).astype(np.uint8)
+                else:
+                    img = img.astype(np.uint8)
+                pil_img = Image.fromarray(img)
+        elif hasattr(img, 'save'):
+            # Already a PIL Image
+            pil_img = img
+        else:
+            raise ValueError(f"Unsupported image type: {type(img)}")
+        
+        pil_img.save(path)
+        print(f"Saved {description}: {path}")
     
     def _save_json(self, data, path, description=""):
         """Save JSON with standard error handling."""
@@ -154,22 +175,20 @@ class ImageProcessor:
     """Utility class for common image processing operations."""
     
     @staticmethod
-    def create_anomaly_map_image(anomaly_map, is_binary=True, patch_size=128, add_grid=True, grid_color=(255, 255, 255), grid_thickness=1):
-        """Create anomaly map visualization with optional grid overlay."""
+    def create_anomaly_map_image(anomaly_map, is_binary=True, patch_size=128, add_grid=True, grid_color=(255, 255, 255), grid_thickness=1, patch_results=None, ground_truth_patches=None):
+        """Create anomaly map visualization with optional grid overlay and patch prediction rectangles."""
         if is_binary:
-            # Binary map: 0 or 1
+            # Binary map: 0 or 1 - create custom red colormap
             anomaly_map_img = (anomaly_map * 255).astype(np.uint8)
+            # Create custom colormap: 0 -> transparent (black), 255 -> pure red
+            h, w = anomaly_map_img.shape
+            anomaly_map_colored_bgr = np.zeros((h, w, 3), dtype=np.uint8)
+            # Set red channel based on anomaly values (0 = transparent/black, 255 = pure red)
+            anomaly_map_colored_bgr[:, :, 2] = anomaly_map_img  # Red channel (BGR format)
         else:
-            # Continuous map: normalize to 0-255
-            if anomaly_map.max() > 0:
-                anomaly_map_img = ((anomaly_map - anomaly_map.min()) / 
-                                 (anomaly_map.max() - anomaly_map.min()) * 255).astype(np.uint8)
-            else:
-                anomaly_map_img = np.zeros_like(anomaly_map, dtype=np.uint8)
-        
-        # Apply colormap for better visualization (returns BGR)
-        anomaly_map_colored_bgr = cv2.applyColorMap(anomaly_map_img, cv2.COLORMAP_HOT)
-        
+            anomaly_map_img = (anomaly_map * 255).astype(np.uint8)
+            anomaly_map_colored_bgr = cv2.applyColorMap(anomaly_map_img, cv2.COLORMAP_HOT)
+
         # Add grid overlay if requested
         if add_grid:
             h, w = anomaly_map.shape
@@ -188,23 +207,32 @@ class ImageProcessor:
         # Convert BGR to RGB for proper display
         anomaly_map_colored = cv2.cvtColor(anomaly_map_colored_bgr, cv2.COLOR_BGR2RGB)
         
+        # Add patch prediction rectangles if provided
+        if patch_results is not None:
+            anomaly_map_colored = draw_patch_rectangles_on_image(
+                anomaly_map_colored, 
+                patch_results, 
+                ground_truth_patches, 
+                patch_size=patch_size, 
+                stride=patch_size, 
+                grid_thickness=grid_thickness
+            )
+        
         return anomaly_map_colored
     
     @staticmethod
     def create_anomaly_overlay(original_img, anomaly_map, alpha=0.6, is_binary=True):
         """Create overlay of anomaly map on original image."""
         if is_binary:
-            # Binary overlay using HOT colormap
+            # Binary overlay using pure red
             overlay = original_img.copy()
             mask = anomaly_map > 0
-            # Create a binary image for colormap application
-            binary_img = np.zeros_like(anomaly_map, dtype=np.uint8)
-            binary_img[mask] = 255
-            # Apply HOT colormap to the binary image (returns BGR)
-            anomaly_colored_bgr = cv2.applyColorMap(binary_img, cv2.COLORMAP_HOT)
-            # Convert BGR to RGB for proper overlay
-            anomaly_colored = cv2.cvtColor(anomaly_colored_bgr, cv2.COLOR_BGR2RGB)
-            # Apply the colored anomaly regions to the overlay
+            # Create pure red overlay for anomaly regions
+            h, w = anomaly_map.shape
+            anomaly_colored = np.zeros((h, w, 3), dtype=np.uint8)
+            # Set red channel for anomaly regions (pure red)
+            anomaly_colored[mask, 0] = 255  # Red channel (RGB format)
+            # Apply the red anomaly regions to the overlay
             overlay[mask] = anomaly_colored[mask]
         else:
             # Continuous overlay using HOT colormap
@@ -220,10 +248,7 @@ class ImageProcessor:
         
         return overlay.astype(np.uint8)
     
-    @staticmethod
-    def path_to_safe_filename(path):
-        """Convert file path to safe filename."""
-        return path.replace('/', '_').replace('\\', '_').replace(':', '_')
+
 
 class EvaluationMetrics:
     """Utility class for computing and storing evaluation metrics with memory-efficient approach."""
@@ -630,6 +655,194 @@ def _binary_mask(diff: torch.Tensor, threshold: int = 5) -> torch.Tensor:
     return (diff.abs() > (threshold / 255.0)).float()
 
 
+def _get_largest_connected_component_pixels(anomaly_binary: torch.Tensor) -> int:
+    """
+    Calculate the number of pixels in the largest connected component of white pixels.
+    
+    Args:
+        anomaly_binary: Binary tensor with shape (H, W) or (1, H, W) where 1 indicates white pixels
+        
+    Returns:
+        Number of pixels in the largest connected component
+    """
+    import cv2
+    import numpy as np
+    
+    # Convert to numpy and ensure 2D shape
+    if anomaly_binary.dim() == 3 and anomaly_binary.shape[0] == 1:
+        binary_np = anomaly_binary.squeeze(0).cpu().numpy()
+    else:
+        binary_np = anomaly_binary.cpu().numpy()
+    
+    # Ensure binary values (0 or 1)
+    binary_np = (binary_np > 0).astype(np.uint8)
+    
+    # Find connected components
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_np, connectivity=8)
+    
+    if num_labels <= 1:  # Only background (label 0) or no components
+        return 0
+    
+    # Find the largest component (excluding background which is label 0)
+    largest_component_size = 0
+    for i in range(1, num_labels):  # Skip background (i=0)
+        component_size = stats[i, cv2.CC_STAT_AREA]
+        if component_size > largest_component_size:
+            largest_component_size = component_size
+    
+    return largest_component_size
+
+
+def _create_contour_based_binary_mask(anomaly_map: torch.Tensor, adaptive_threshold: float = 0.1) -> torch.Tensor:
+    """
+    Create binary mask based on contours with adaptive selection based on distribution.
+    
+    Args:
+        anomaly_map: Anomaly map tensor with shape (batch_size, 1, H, W) with values in [0, 1]
+        adaptive_threshold: Threshold for adaptive contour selection (default: 0.1)
+                          - Lower values select more contours
+                          - Higher values select fewer contours
+        
+    Returns:
+        Binary tensor with same shape as input where selected contour pixels are 1, others are 0
+    """
+    import cv2
+    import numpy as np
+    
+    # Handle batch processing for shape (batch_size, 1, H, W)
+    if anomaly_map.dim() == 4:
+        batch_size = anomaly_map.shape[0]
+        binary_masks = []
+        
+        for b in range(batch_size):
+            # Extract single image from batch
+            single_map = anomaly_map[b, 0]  # Shape: (H, W)
+            single_binary = _create_contour_based_binary_mask_single(single_map, adaptive_threshold)
+            binary_masks.append(single_binary)
+        
+        # Stack back into batch
+        return torch.stack(binary_masks, dim=0).unsqueeze(1)  # Shape: (batch_size, 1, H, W)
+    else:
+        # Handle single image case
+        return _create_contour_based_binary_mask_single(anomaly_map, adaptive_threshold)
+
+
+def _create_contour_based_binary_mask_single(anomaly_map: torch.Tensor, adaptive_threshold: float = 0.1) -> torch.Tensor:
+    """
+    Create binary mask for a single image based on adaptive contour selection.
+    
+    Args:
+        anomaly_map: Anomaly map tensor with shape (H, W) with values in [0, 1]
+        adaptive_threshold: Threshold for adaptive contour selection (default: 0.1)
+        
+    Returns:
+        Binary tensor with shape (H, W) where selected contour pixels are 1, others are 0
+    """
+    import cv2
+    import numpy as np
+    
+    # Convert to numpy
+    map_np = anomaly_map.cpu().numpy()
+    
+    # Ensure the map is 2D
+    if map_np.ndim != 2:
+        print(f"Warning: Expected 2D array, got shape {map_np.shape}")
+        return torch.zeros_like(anomaly_map)
+    
+    # Handle negative values and ensure proper range
+    map_np = np.clip(map_np, 0, 1)  # Clip to [0, 1] range
+    
+    # Convert to uint8 for contour detection (0-255 range)
+    map_uint8 = (map_np * 255).astype(np.uint8)
+    
+    # Check if the image is all zeros (no contours possible)
+    if np.all(map_uint8 == 0):
+        return torch.zeros_like(anomaly_map)
+    
+    try:
+        # Find contours
+        contours, _ = cv2.findContours(map_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    except cv2.error as e:
+        print(f"OpenCV error in findContours: {e}")
+        print(f"Map shape: {map_uint8.shape}, dtype: {map_uint8.dtype}")
+        print(f"Map min: {map_uint8.min()}, max: {map_uint8.max()}")
+        return torch.zeros_like(anomaly_map)
+    
+    if not contours:
+        # No contours found, return all zeros
+        return torch.zeros_like(anomaly_map)
+    
+    # Calculate contour statistics (sum of pixel values within each contour)
+    contour_stats = []
+    for i, contour in enumerate(contours):
+        # Create a mask for this contour
+        contour_mask = np.zeros_like(map_uint8)
+        cv2.fillPoly(contour_mask, [contour], (255,))
+        
+        # Calculate sum of pixel values within this contour
+        contour_sum = np.sum(map_np * (contour_mask > 0))
+        contour_area = cv2.contourArea(contour)
+        
+        contour_stats.append({
+            'index': i,
+            'contour': contour,
+            'sum': contour_sum,
+            'area': contour_area
+        })
+    
+    # Sort by sum (descending)
+    contour_stats.sort(key=lambda x: x['sum'], reverse=True)
+    
+    if not contour_stats:
+        return torch.zeros_like(anomaly_map)
+    
+    # Extract sums for adaptive selection
+    sums = np.array([stat['sum'] for stat in contour_stats])
+    
+    # Adaptive selection based on distribution
+    if len(sums) == 1:
+        # Only one contour, select it
+        selected_contours = contour_stats
+    else:
+        # Calculate statistics for adaptive selection
+        total_sum = np.sum(sums)
+        max_sum = np.max(sums)
+        mean_sum = np.mean(sums)
+        std_sum = np.std(sums)
+        
+        # Multiple adaptive criteria
+        # 1. Contours with sum > threshold * max_sum
+        threshold_max = adaptive_threshold * max_sum
+        
+        # 2. Contours with sum > mean + threshold * std
+        threshold_stat = mean_sum + adaptive_threshold * std_sum
+        
+        # 3. Contours contributing > threshold of total sum
+        threshold_total = adaptive_threshold * total_sum
+        
+        # Select contours that meet any of the criteria
+        selected_contours = []
+        for stat in contour_stats:
+            if (stat['sum'] >= threshold_max or 
+                stat['sum'] >= threshold_stat or 
+                stat['sum'] >= threshold_total):
+                selected_contours.append(stat)
+        
+        # If no contours meet criteria, select at least the top one
+        if not selected_contours:
+            selected_contours = [contour_stats[0]]
+    
+    # Create binary mask with selected contours
+    binary_mask = np.zeros_like(map_uint8)
+    for contour_info in selected_contours:
+        cv2.fillPoly(binary_mask, [contour_info['contour']], (255,))
+    
+    # Convert back to tensor and normalize to [0, 1]
+    binary_tensor = torch.from_numpy(binary_mask).float() / 255.0
+    
+    return binary_tensor.to(anomaly_map.device)
+
+
 def _to_numpy(
     t: torch.Tensor,
 ) -> np.ndarray:  # keep Images API compatibility
@@ -777,13 +990,12 @@ def draw_patch_rectangles_on_image(base_img, patch_results, ground_truth_patches
         y = grid_row * patch_size
         cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (255, 0, 0), grid_thickness)
     
-    # Draw overlapping regions (HOT colormap orange/red) - where prediction and ground truth match
+    # Draw overlapping regions (green) - where prediction and ground truth match
     overlapping = predicted_defective.intersection(ground_truth_defective)
     for grid_row, grid_col in overlapping:
         x = grid_col * patch_size
         y = grid_row * patch_size
-        # Use a bright orange/red color from HOT colormap (similar to high intensity in HOT)
-        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (0, 165, 255), grid_thickness)
+        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (0, 255, 0), grid_thickness)
     
     return img
 
@@ -807,6 +1019,8 @@ def process_split_irregular(
     device: torch.device = torch.device("cpu"),
     anomaly_binary_threshold: int = 0,
     anomaly_pixel_num_threshold: int = 0,
+    adaptive_threshold: float = 0.1,
+    enable_epoch_stats: bool = True,
 ) -> tuple[List[Record], defaultdict[str, list[tuple[int, int, bool]]], defaultdict[str, list[tuple[int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]]]:
     """Run a forward‑&‑reverse pass on irregular images and collect metrics."""
     # Initialize evaluation metrics
@@ -898,11 +1112,15 @@ def process_split_irregular(
             anomaly_map_arithmetic = 0.5 * (
                 encodedrecon_dodrecon_diff + encoded_latent_diff_resized
             )
+            # Use contour-based binary mask instead of fixed threshold
             anomaly_map_arithmetic_binary = _binary_mask(anomaly_map_arithmetic, anomaly_binary_threshold)
+            #anomaly_map_arithmetic_binary = _create_contour_based_binary_mask(anomaly_map_arithmetic, adaptive_threshold=adaptive_threshold)
             anomaly_map_geometric = (
                 encodedrecon_dodrecon_diff * encoded_latent_diff_resized
             )
+            # Use contour-based binary mask instead of fixed threshold
             anomaly_map_geometric_binary = _binary_mask(anomaly_map_geometric, anomaly_binary_threshold)
+            #anomaly_map_geometric_binary = _create_contour_based_binary_mask(anomaly_map_geometric, adaptive_threshold=adaptive_threshold)
 
             # Collect epoch-wise statistics
             metrics.add_batch_stats(encodedrecon_dodrecon_diff_raw, encoded_latent_diff_raw, anomaly_map_arithmetic, anomaly_map_geometric)
@@ -944,8 +1162,10 @@ def process_split_irregular(
             #x_original_img = Image.fromarray(((x_original_np + 1) / 2 * 255).astype(np.uint8))
             #x_original_save_path = os.path.join(tmp_dir, f'original_batch_{b}_{x_original_min:.3f}_{x_original_max:.3f}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
             #x_original_img.save(x_original_save_path)
+            # Use largest connected component instead of total white pixels
             anomaly_pixels = torch.sum(anomaly_binary).item()
-            is_defective = anomaly_pixels > anomaly_pixel_num_threshold  # Any white pixels
+            #anomaly_pixels = _get_largest_connected_component_pixels(anomaly_binary)
+            is_defective = anomaly_pixels > anomaly_pixel_num_threshold  # Largest connected component size
             
             # Store patch result for original image marking
             # patch_coords[b] is now a tensor [x, y]
@@ -1014,8 +1234,11 @@ def process_split_irregular(
             import gc
             gc.collect()
 
-    # Print epoch-wise statistics
-    metrics.print_epoch_stats()
+    # Print epoch-wise statistics (if enabled)
+    if enable_epoch_stats:
+        metrics.print_epoch_stats()
+    else:
+        print("Skipping epoch statistics (disabled)")
 
     return results, image_patch_results, image_anomaly_maps
 
@@ -1230,7 +1453,7 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         object_class=args.object_class,
     )
     
-    loader = evaluator._get_dataloader(dataset, batch_size=1)
+    loader = evaluator._get_dataloader(dataset, batch_size=8)
     
     # For annotated images, use patch size as center_size to ensure consistent dimensions
     patch_center_size = 128
@@ -1248,6 +1471,8 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         device,
         args.anomaly_binary_threshold,
         args.anomaly_pixel_num_threshold,
+        0.1,  # adaptive_threshold
+        args.enable_epoch_stats,  # Pass only the boolean flag
     )
     
     # Mark defective regions on original images
@@ -1273,7 +1498,7 @@ def evaluation_annotated_images(args, diffusion, model, vae):
             original_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1
         )
         
-        safe_name = ImageProcessor.path_to_safe_filename(image_path)
+        safe_name = path_to_safe_filename(image_path)
         # Save marked image
         marked_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__marked.png")
         evaluator._save_image(marked_img, marked_path, "marked image")
@@ -1295,57 +1520,57 @@ def evaluation_annotated_images(args, diffusion, model, vae):
             full_anomaly_map_geometric_binary[y:y+128, x:x+128] = patch_map_geometric_binary.squeeze()
         
         # Create and save standalone arithmetic anomaly maps
-        anomaly_map_arithmetic_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_arithmetic, patch_size=128, add_grid=True)
-        anomaly_map_arithmetic_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__anomaly_map_arithmetic.png")
+        anomaly_map_arithmetic_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_arithmetic, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches, is_binary=False)
+        anomaly_map_arithmetic_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_arithmetic.png")
         evaluator._save_image(anomaly_map_arithmetic_img, anomaly_map_arithmetic_path, "arithmetic anomaly map image")
         
-        anomaly_map_arithmetic_binary_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_arithmetic_binary, patch_size=128, add_grid=True)
-        anomaly_map_arithmetic_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__anomaly_map_arithmetic_binary.png")
+        anomaly_map_arithmetic_binary_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_arithmetic_binary, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches)
+        anomaly_map_arithmetic_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_arithmetic_binary.png")
         evaluator._save_image(anomaly_map_arithmetic_binary_img, anomaly_map_arithmetic_binary_path, "arithmetic anomaly map binary image")
 
         # Create and save standalone geometric anomaly maps
-        anomaly_map_geometric_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_geometric, patch_size=128, add_grid=True)
-        anomaly_map_geometric_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__anomaly_map_geometric.png")
+        anomaly_map_geometric_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_geometric, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches, is_binary=False)
+        anomaly_map_geometric_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_geometric.png")
         evaluator._save_image(anomaly_map_geometric_img, anomaly_map_geometric_path, "geometric anomaly map image")
         
-        anomaly_map_geometric_binary_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_geometric_binary, patch_size=128, add_grid=True)
-        anomaly_map_geometric_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__anomaly_map_geometric_binary.png")
+        anomaly_map_geometric_binary_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_geometric_binary, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches)
+        anomaly_map_geometric_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_geometric_binary.png")
         evaluator._save_image(anomaly_map_geometric_binary_img, anomaly_map_geometric_binary_path, "geometric anomaly map binary image")
 
         # Create arithmetic overlay images
         overlay_arithmetic_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_arithmetic, alpha=0.8, is_binary=False)
-        overlay_arithmetic_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__anomaly_overlay_arithmetic.png")
+        overlay_arithmetic_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_arithmetic.png")
         evaluator._save_image(overlay_arithmetic_img, overlay_arithmetic_path, "arithmetic anomaly overlay image")
 
-        overlay_arithmetic_binary_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_arithmetic_binary, alpha=0.8, is_binary=True)
-        overlay_arithmetic_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__anomaly_overlay_arithmetic_binary.png")
+        overlay_arithmetic_binary_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_arithmetic_binary, alpha=0.8)
+        overlay_arithmetic_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_arithmetic_binary.png")
         evaluator._save_image(overlay_arithmetic_binary_img, overlay_arithmetic_binary_path, "arithmetic anomaly overlay binary image")
 
         # Create geometric overlay images
         overlay_geometric_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_geometric, alpha=0.8, is_binary=False)
-        overlay_geometric_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__anomaly_overlay_geometric.png")
+        overlay_geometric_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_geometric.png")
         evaluator._save_image(overlay_geometric_img, overlay_geometric_path, "geometric anomaly overlay image")
 
-        overlay_geometric_binary_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_geometric_binary, alpha=0.8, is_binary=True)
-        overlay_geometric_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__anomaly_overlay_geometric_binary.png")
+        overlay_geometric_binary_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_geometric_binary, alpha=0.8)
+        overlay_geometric_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_geometric_binary.png")
         evaluator._save_image(overlay_geometric_binary_img, overlay_geometric_binary_path, "geometric anomaly overlay binary image")
 
         # Save overlay+patches images for arithmetic maps
         marked_overlay_arithmetic_img = draw_patch_rectangles_on_image(overlay_arithmetic_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
-        marked_overlay_arithmetic_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__marked_overlay_arithmetic.png")
+        marked_overlay_arithmetic_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_arithmetic.png")
         evaluator._save_image(marked_overlay_arithmetic_img, marked_overlay_arithmetic_path, "marked arithmetic overlay image")
 
         marked_overlay_arithmetic_binary_img = draw_patch_rectangles_on_image(overlay_arithmetic_binary_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
-        marked_overlay_arithmetic_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__marked_overlay_arithmetic_binary.png")
+        marked_overlay_arithmetic_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_arithmetic_binary.png")
         evaluator._save_image(marked_overlay_arithmetic_binary_img, marked_overlay_arithmetic_binary_path, "marked arithmetic overlay binary image")
 
         # Save overlay+patches images for geometric maps
         marked_overlay_geometric_img = draw_patch_rectangles_on_image(overlay_geometric_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
-        marked_overlay_geometric_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__marked_overlay_geometric.png")
+        marked_overlay_geometric_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_geometric.png")
         evaluator._save_image(marked_overlay_geometric_img, marked_overlay_geometric_path, "marked geometric overlay image")
 
         marked_overlay_geometric_binary_img = draw_patch_rectangles_on_image(overlay_geometric_binary_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
-        marked_overlay_geometric_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__marked_overlay_geometric_binary.png")
+        marked_overlay_geometric_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_geometric_binary.png")
         evaluator._save_image(marked_overlay_geometric_binary_img, marked_overlay_geometric_binary_path, "marked geometric overlay binary image")
     
     # Save evaluation results with white pixel counts
@@ -1359,10 +1584,10 @@ def evaluation_annotated_images(args, diffusion, model, vae):
                 "grid_row": grid_row,
                 "grid_col": grid_col,
                 "anomaly_pixels": int(anomaly_pixels),
-                "is_defective": anomaly_pixels > 0
+                "is_defective": bool(anomaly_pixels > 0)
             })
         
-        result_filename = f"{ImageProcessor.path_to_safe_filename(image_path)}__evaluation.json"
+        result_filename = f"{path_to_safe_filename(image_path)}__evaluation.json"
         result_path = os.path.join(output_dirs['evaluation_results'], result_filename)
         evaluation_result = {
             "image_path": image_path,
@@ -1371,15 +1596,18 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         }
         evaluator._save_json(evaluation_result, result_path, "evaluation result")
     
-    # Create Excel report
-    print("Creating Excel report...")
-    excel_path = make_excel(
-        records=records,
-        image_size=128,
-        save_dir=output_dirs['evaluation_results'],
-        save_filename=f"report_{datetime.now().strftime('%y%m%d_%H%M%S')}"
-    )
-    print(f"Excel report saved to: {excel_path}")
+    # Create Excel report (if enabled)
+    if hasattr(args, 'enable_excel_report') and args.enable_excel_report:
+        print("Creating Excel report...")
+        excel_path = make_excel(
+            records=records,
+            image_size=128,
+            save_dir=output_dirs['evaluation_results'],
+            save_filename=f"report_{datetime.now().strftime('%y%m%d_%H%M%S')}"
+        )
+        print(f"Excel report saved to: {excel_path}")
+    else:
+        print("Skipping Excel report generation (disabled)")
     
     print("==" * 30)
     # Compute confusion matrix and accuracy
@@ -1428,6 +1656,8 @@ def evaluation_irregular_images(args, diffusion, model, vae):
         device,
         args.anomaly_binary_threshold,
         args.anomaly_pixel_num_threshold,
+        0.1,  # adaptive_threshold
+        args.enable_epoch_stats,  # Pass only the boolean flag
     )
     
     # Mark defective regions on original images
@@ -1454,7 +1684,7 @@ def evaluation_irregular_images(args, diffusion, model, vae):
     patch_analysis = {}
     for image_path, patch_results in image_patch_results.items():
         patch_analysis[image_path] = [
-            {"x": x, "y": y, "anomaly_pixels": int(anomaly_pixels), "is_defective": anomaly_pixels > 0}
+            {"x": x, "y": y, "anomaly_pixels": int(anomaly_pixels), "is_defective": bool(anomaly_pixels > 0)}
             for x, y, anomaly_pixels in patch_results
         ]
     
@@ -1835,12 +2065,30 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
     import os
     import json
 
+    # Check if evaluation results directory exists
+    if not os.path.exists(evaluation_results_dir):
+        print(f"Warning: Evaluation results directory {evaluation_results_dir} does not exist")
+        return
+    
     # Find all evaluation result files
     eval_files = glob.glob(os.path.join(evaluation_results_dir, '*__evaluation.json'))
+    
+    if not eval_files:
+        print(f"Warning: No evaluation result files found in {evaluation_results_dir}")
+        return
     all_TP = all_FP = all_FN = all_TN = 0
     for eval_file in eval_files:
-        with open(eval_file, 'r') as f:
-            eval_data = json.load(f)
+        try:
+            with open(eval_file, 'r') as f:
+                eval_data = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"Warning: Corrupted JSON file {eval_file}: {e}")
+            print(f"Skipping this file and continuing...")
+            continue
+        except Exception as e:
+            print(f"Warning: Error reading file {eval_file}: {e}")
+            print(f"Skipping this file and continuing...")
+            continue
         image_path = eval_data['image_path']
         # Handle new format with patch_analysis
         if 'patch_analysis' in eval_data:
@@ -1857,8 +2105,17 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
         if not os.path.exists(annotation_file):
             print(f"Warning: No annotation for {image_path}")
             continue
-        with open(annotation_file, 'r') as f:
-            anno_data = json.load(f)
+        try:
+            with open(annotation_file, 'r') as f:
+                anno_data = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"Warning: Corrupted annotation file {annotation_file}: {e}")
+            print(f"Skipping this file and continuing...")
+            continue
+        except Exception as e:
+            print(f"Warning: Error reading annotation file {annotation_file}: {e}")
+            print(f"Skipping this file and continuing...")
+            continue
         gt = set(tuple(x) for x in anno_data['defective_patches'])
         # Get all possible grid cells
         # (Assume image is divisible by grid_size)
@@ -2058,6 +2315,18 @@ def main():
         action="store_true",
         help="Enable memory optimization for large datasets (reduces batch size and workers)"
     )
+    parser.add_argument(
+        "--enable-epoch-stats",
+        action="store_true",
+        default=False,
+        help="Enable epoch statistics printing (memory intensive for large datasets)"
+    )
+    parser.add_argument(
+        "--enable-excel-report",
+        action="store_true",
+        default=False,
+        help="Enable Excel report generation (memory intensive for large datasets)"
+    )
     args = parser.parse_args()
     
     # Handle input JSON if provided
@@ -2082,7 +2351,7 @@ def main():
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
                     elif key in ['pretrained', 'data_dir', 'split_csv_path', 'annotation_dir']:
                         value = os.path.expanduser(value)
-                    elif key == 'irregular_images':
+                    elif key in ['irregular_images', 'memory_optimization', 'enable_epoch_stats', 'enable_excel_report']:
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
                     setattr(args, key, value)
             
