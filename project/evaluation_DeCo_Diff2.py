@@ -415,9 +415,9 @@ class AnnotatedImageDataset(Dataset):
                 grid_row, grid_col = patch_coord
                 defective_patches.add((grid_row, grid_col))
             
-            # Generate all possible patches
-            grid_rows = original_height // patch_size
-            grid_cols = original_width // patch_size
+            # Generate all possible patches including edge patches
+            grid_rows = (original_height + patch_size - 1) // patch_size  # Ceiling division
+            grid_cols = (original_width + patch_size - 1) // patch_size   # Ceiling division
             
             for grid_row in range(grid_rows):
                 for grid_col in range(grid_cols):
@@ -425,8 +425,18 @@ class AnnotatedImageDataset(Dataset):
                     x = grid_col * patch_size
                     y = grid_row * patch_size
                     
+                    # Calculate actual patch dimensions (may be smaller at edges)
+                    patch_width = min(patch_size, original_width - x)
+                    patch_height = min(patch_size, original_height - y)
+                    
                     # Extract patch
-                    patch = img[y:y + patch_size, x:x + patch_size]
+                    patch = img[y:y + patch_height, x:x + patch_width]
+                    
+                    # Pad patch to full size if necessary
+                    if patch.shape[:2] != (patch_size, patch_size):
+                        padded_patch = np.zeros((patch_size, patch_size, 3), dtype=patch.dtype)
+                        padded_patch[:patch_height, :patch_width] = patch
+                        patch = padded_patch
                     
                     # Determine if this patch is defective
                     is_defective = (grid_row, grid_col) in defective_patches
@@ -550,14 +560,38 @@ class IrregularImageDataset(Dataset):
         print(f"Created {len(self.patches)} patches from {len(set(self.image_paths))} images")
     
     def _extract_patches(self, img):
-        """Extract patches from an image with overlap."""
+        """Extract patches from an image with overlap, including edge patches."""
         height, width = img.shape[:2]
         patches = []
         coords = []
         
-        for y in range(0, height - self.patch_size + 1, self.stride):
-            for x in range(0, width - self.patch_size + 1, self.stride):
-                patch = img[y:y + self.patch_size, x:x + self.patch_size]
+        # Calculate the range of patch positions
+        y_positions = list(range(0, height, self.stride))
+        x_positions = list(range(0, width, self.stride))
+        
+        # Ensure we include edge patches
+        if y_positions and height - y_positions[-1] < self.patch_size:
+            # Add a position that will create an edge patch
+            y_positions.append(max(0, height - self.patch_size))
+        if x_positions and width - x_positions[-1] < self.patch_size:
+            # Add a position that will create an edge patch
+            x_positions.append(max(0, width - self.patch_size))
+        
+        for y in y_positions:
+            for x in x_positions:
+                # Calculate actual patch dimensions
+                patch_width = min(self.patch_size, width - x)
+                patch_height = min(self.patch_size, height - y)
+                
+                # Extract patch
+                patch = img[y:y + patch_height, x:x + patch_width]
+                
+                # Pad patch to full size if necessary
+                if patch.shape[:2] != (self.patch_size, self.patch_size):
+                    padded_patch = np.zeros((self.patch_size, self.patch_size, 3), dtype=patch.dtype)
+                    padded_patch[:patch_height, :patch_width] = patch
+                    patch = padded_patch
+                
                 patches.append(patch)
                 coords.append((x, y))
         
@@ -769,18 +803,27 @@ def _create_contour_based_binary_mask_single(anomaly_map: torch.Tensor, adaptive
     # Convert to uint8 for contour detection (0-255 range)
     map_uint8 = (map_np * 255).astype(np.uint8)
     
+    # Apply morphological operations to reduce noise
+    kernel = np.ones((3, 3), np.uint8)
+    map_uint8 = cv2.morphologyEx(map_uint8, cv2.MORPH_CLOSE, kernel)  # Close small holes
+    map_uint8 = cv2.morphologyEx(map_uint8, cv2.MORPH_OPEN, kernel)   # Remove small noise
+    
+    # Convert to binary image for contour detection
+    # Use Otsu's method for automatic thresholding
+    _, binary_map = cv2.threshold(map_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
     # Check if the image is all zeros (no contours possible)
-    if np.all(map_uint8 == 0):
+    if np.all(binary_map == 0):
         zero_mask = torch.zeros_like(anomaly_map)
         return zero_mask, zero_mask, zero_mask
     
     try:
-        # Find contours
-        contours, _ = cv2.findContours(map_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Find contours on the binary image
+        contours, _ = cv2.findContours(binary_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     except cv2.error as e:
         print(f"OpenCV error in findContours: {e}")
-        print(f"Map shape: {map_uint8.shape}, dtype: {map_uint8.dtype}")
-        print(f"Map min: {map_uint8.min()}, max: {map_uint8.max()}")
+        print(f"Binary map shape: {binary_map.shape}, dtype: {binary_map.dtype}")
+        print(f"Binary map min: {binary_map.min()}, max: {binary_map.max()}")
         zero_mask = torch.zeros_like(anomaly_map)
         return zero_mask, zero_mask, zero_mask
     
@@ -791,27 +834,45 @@ def _create_contour_based_binary_mask_single(anomaly_map: torch.Tensor, adaptive
     
     # Calculate contour statistics (sum of pixel values within each contour)
     contour_stats = []
+    
+    # Filter parameters to reduce noise
+    min_contour_area = 10.0  # Minimum contour area to consider
+    min_white_pixels = 5     # Minimum white pixels to consider
+    
     for i, contour in enumerate(contours):
         # Create a mask for this contour
-        contour_mask = np.zeros_like(map_uint8)
+        contour_mask = np.zeros_like(binary_map)
         cv2.fillPoly(contour_mask, [contour], (255,))
         
         # Calculate sum of pixel values within this contour
+        contour_white_pixels = np.sum(contour_mask > 0)
         contour_sum = np.sum(map_np * (contour_mask > 0))
         contour_area = cv2.contourArea(contour)
         
+        # Filter out noise: skip contours that are too small
+        if contour_area < min_contour_area or contour_white_pixels < min_white_pixels:
+            #print(f"DEBUG: Skipping contour {i} - area: {contour_area}, white_pixels: {contour_white_pixels}")
+            continue
+            
+        ##print(f"DEBUG: Contour {i} has {contour_white_pixels} white pixels")
+        ##print(f"DEBUG: Contour {i} has {contour_sum} sum")
+        ##print(f"DEBUG: Contour {i} has {contour_area} area")
+        ##print(f"DEBUG: Contour {i} has {contour_sum / contour_area} sum/area")
         contour_stats.append({
             'index': i,
             'contour': contour,
             'sum': contour_sum,
-            'area': contour_area
+            'area': contour_area,
+            'white_pixels': contour_white_pixels
         })
+    #print(f'DEBUG: length of contour_stats (after filtering): {len(contour_stats)}')
     
     # Sort by sum (descending)
     contour_stats.sort(key=lambda x: x['sum'], reverse=True)
     
     if not contour_stats:
-        return torch.zeros_like(anomaly_map)
+        zero_mask = torch.zeros_like(anomaly_map)
+        return zero_mask, zero_mask, zero_mask
     
     # Extract sums for adaptive selection
     sums = np.array([stat['sum'] for stat in contour_stats])
@@ -822,45 +883,33 @@ def _create_contour_based_binary_mask_single(anomaly_map: torch.Tensor, adaptive
     mean_sum = np.mean(sums)
     std_sum = np.std(sums)
     
-    # Style 1: Top contours by sum (most significant)
-    threshold_max = adaptive_threshold * max_sum
-    selected_contours_style1 = []
-    for stat in contour_stats:
-        if stat['sum'] >= threshold_max:
-            selected_contours_style1.append(stat)
-    if not selected_contours_style1:
-        selected_contours_style1 = [contour_stats[0]]
+    #print(f"DEBUG: Total sum: {total_sum}, Max sum: {max_sum}, Mean sum: {mean_sum}, Std sum: {std_sum}")
     
-    # Style 2: Statistical outliers (mean + threshold * std)
-    threshold_stat = mean_sum + adaptive_threshold * std_sum
-    selected_contours_style2 = []
-    for stat in contour_stats:
-        if stat['sum'] >= threshold_stat:
-            selected_contours_style2.append(stat)
-    if not selected_contours_style2:
-        selected_contours_style2 = [contour_stats[0]]
+    # Remove statistical outliers (contours with sums > mean + 2*std)
+    outlier_threshold = mean_sum + 2 * std_sum
+    filtered_contour_stats = [stat for stat in contour_stats if stat['sum'] <= outlier_threshold]
     
-    # Style 3: Contours contributing significant portion of total
-    threshold_total = adaptive_threshold * total_sum
-    selected_contours_style3 = []
-    for stat in contour_stats:
-        if stat['sum'] >= threshold_total:
-            selected_contours_style3.append(stat)
-    if not selected_contours_style3:
-        selected_contours_style3 = [contour_stats[0]]
+    if not filtered_contour_stats:
+        # If all contours were outliers, keep the top 3
+        filtered_contour_stats = contour_stats[:3]
+    
+    #print(f"DEBUG: Contours after outlier removal: {len(filtered_contour_stats)}")
+    
+    # Use filtered contours for selection
+    contour_stats = filtered_contour_stats
     
     # Create binary masks for each style
-    binary_mask_style1 = np.zeros_like(map_uint8)
-    binary_mask_style2 = np.zeros_like(map_uint8)
-    binary_mask_style3 = np.zeros_like(map_uint8)
+    binary_mask_style1 = np.zeros_like(binary_map)
+    binary_mask_style2 = np.zeros_like(binary_map)
+    binary_mask_style3 = np.zeros_like(binary_map)
     
-    for contour_info in selected_contours_style1:
+    for contour_info in contour_stats:
         cv2.fillPoly(binary_mask_style1, [contour_info['contour']], (255,))
     
-    for contour_info in selected_contours_style2:
+    for contour_info in contour_stats:
         cv2.fillPoly(binary_mask_style2, [contour_info['contour']], (255,))
     
-    for contour_info in selected_contours_style3:
+    for contour_info in contour_stats:
         cv2.fillPoly(binary_mask_style3, [contour_info['contour']], (255,))
     
     # Convert back to tensors and normalize to [0, 1]
@@ -1437,15 +1486,24 @@ def evaluation(args):
     vae.eval()
     try:
         if args.pretrained != "":
+            # Handle relative paths by checking if they exist relative to current directory
+            # or parent directory (project root)
             ckpt = args.pretrained
+            if not os.path.exists(ckpt):
+                # Try relative to parent directory (project root)
+                parent_ckpt = os.path.join("..", ckpt)
+                if os.path.exists(parent_ckpt):
+                    ckpt = parent_ckpt
+                else:
+                    raise FileNotFoundError(f"Checkpoint not found: {args.pretrained}")
         else:
             path = f"./DeCo-Diff_{args.dataset}_{args.object_class}_{args.model_size}_{args.center_size}"
             try:
                 ckpt = sorted(glob(f"{path}/last.pt"))[-1]
             except (IndexError, FileNotFoundError):
                 ckpt = sorted(glob(f"{path}/*/last.pt"))[-1]
-    except (IndexError, FileNotFoundError, OSError):
-        raise Exception("Please provide the model's pretrained path using --pretrained")
+    except (IndexError, FileNotFoundError, OSError) as e:
+        raise Exception(f"Please provide the model's pretrained path using --pretrained. Error: {e}")
 
     latent_size = int(args.center_size) // 8
     model = UNET_models[args.model_size](latent_size=latent_size)
@@ -1498,8 +1556,16 @@ def evaluation_annotated_images(args, diffusion, model, vae):
     # For annotated images, use patch size as center_size to ensure consistent dimensions
     patch_center_size = 128
     
-    # Process patches
-    records, image_patch_results, image_anomaly_maps = process_split_irregular(
+    # Create checkpoint manager
+    checkpoint_manager = CheckpointManager(args.results_dir, args.annotation_dir)
+    
+    # Print checkpoint status
+    print("=== Checkpoint Status ===")
+    checkpoint_manager.print_checkpoint_status()
+    print("========================")
+    
+    # Process patches with checkpoint functionality
+    records, image_patch_results, image_anomaly_maps = process_split_irregular_with_checkpoint(
         loader,
         args.split,
         diffusion,
@@ -1513,218 +1579,8 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         args.anomaly_pixel_num_threshold,
         0.1,  # adaptive_threshold
         args.enable_epoch_stats,  # Pass only the boolean flag
+        checkpoint_manager,  # Pass checkpoint manager
     )
-    
-    # Mark defective regions on original images
-    print("Marking defective regions on original images...")
-    output_dirs = evaluator._create_output_dirs()
-    
-    for image_path, patch_results in image_patch_results.items():
-        # Load original image
-        original_img = np.array(PILImage.open(image_path).convert('RGB'))
-        
-        # Load ground truth annotations for this image
-        ground_truth_patches = None
-        annotation_filename = f"{path_to_safe_filename(image_path)}__annotations.json"
-        annotation_path = os.path.join(args.annotation_dir, annotation_filename)
-        
-        if os.path.exists(annotation_path):
-            with open(annotation_path, 'r') as f:
-                annotation = json.load(f)
-                ground_truth_patches = annotation.get("defective_patches", [])
-        
-        # Mark defective regions (both predicted and ground truth)
-        marked_img = draw_patch_rectangles_on_image(
-            original_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1
-        )
-        
-        safe_name = path_to_safe_filename(image_path)
-        # Save marked image
-        marked_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__marked.png")
-        evaluator._save_image(marked_img, marked_path, "marked image")
-
-        # --- Create and save anomaly overlay image ---
-        # Reconstruct the full anomaly maps for this image
-        anomaly_map_list = image_anomaly_maps[image_path]
-        # Assume all patches are 128x128 and non-overlapping
-        h, w, _ = original_img.shape
-        full_anomaly_map_arithmetic = np.zeros((h, w), dtype=np.float32)
-        full_anomaly_map_arithmetic_binary = np.zeros((h, w), dtype=np.float32)
-        full_anomaly_map_arithmetic_binary_style1 = np.zeros((h, w), dtype=np.float32)
-        full_anomaly_map_arithmetic_binary_style2 = np.zeros((h, w), dtype=np.float32)
-        full_anomaly_map_arithmetic_binary_style3 = np.zeros((h, w), dtype=np.float32)
-        full_anomaly_map_geometric = np.zeros((h, w), dtype=np.float32)
-        full_anomaly_map_geometric_binary = np.zeros((h, w), dtype=np.float32)
-        full_anomaly_map_geometric_binary_style1 = np.zeros((h, w), dtype=np.float32)
-        full_anomaly_map_geometric_binary_style2 = np.zeros((h, w), dtype=np.float32)
-        full_anomaly_map_geometric_binary_style3 = np.zeros((h, w), dtype=np.float32)
-        
-        for x, y, patch_map_arithmetic, patch_map_arithmetic_binary, patch_map_arithmetic_binary_style1, patch_map_arithmetic_binary_style2, patch_map_arithmetic_binary_style3, patch_map_geometric, patch_map_geometric_binary, patch_map_geometric_binary_style1, patch_map_geometric_binary_style2, patch_map_geometric_binary_style3 in anomaly_map_list:
-            full_anomaly_map_arithmetic[y:y+128, x:x+128] = patch_map_arithmetic.squeeze()
-            full_anomaly_map_arithmetic_binary[y:y+128, x:x+128] = patch_map_arithmetic_binary.squeeze()
-            full_anomaly_map_arithmetic_binary_style1[y:y+128, x:x+128] = patch_map_arithmetic_binary_style1.squeeze()
-            full_anomaly_map_arithmetic_binary_style2[y:y+128, x:x+128] = patch_map_arithmetic_binary_style2.squeeze()
-            full_anomaly_map_arithmetic_binary_style3[y:y+128, x:x+128] = patch_map_arithmetic_binary_style3.squeeze()
-            full_anomaly_map_geometric[y:y+128, x:x+128] = patch_map_geometric.squeeze()
-            full_anomaly_map_geometric_binary[y:y+128, x:x+128] = patch_map_geometric_binary.squeeze()
-            full_anomaly_map_geometric_binary_style1[y:y+128, x:x+128] = patch_map_geometric_binary_style1.squeeze()
-            full_anomaly_map_geometric_binary_style2[y:y+128, x:x+128] = patch_map_geometric_binary_style2.squeeze()
-            full_anomaly_map_geometric_binary_style3[y:y+128, x:x+128] = patch_map_geometric_binary_style3.squeeze()
-        
-        # Create and save standalone arithmetic anomaly maps
-        anomaly_map_arithmetic_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_arithmetic, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches, is_binary=False)
-        anomaly_map_arithmetic_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_arithmetic.png")
-        evaluator._save_image(anomaly_map_arithmetic_img, anomaly_map_arithmetic_path, "arithmetic anomaly map image")
-        
-        anomaly_map_arithmetic_binary_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_arithmetic_binary, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches)
-        anomaly_map_arithmetic_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_arithmetic_binary.png")
-        evaluator._save_image(anomaly_map_arithmetic_binary_img, anomaly_map_arithmetic_binary_path, "arithmetic anomaly map binary image")
-
-        # Create and save standalone geometric anomaly maps
-        anomaly_map_geometric_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_geometric, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches, is_binary=False)
-        anomaly_map_geometric_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_geometric.png")
-        evaluator._save_image(anomaly_map_geometric_img, anomaly_map_geometric_path, "geometric anomaly map image")
-        
-        anomaly_map_geometric_binary_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_geometric_binary, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches)
-        anomaly_map_geometric_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_geometric_binary.png")
-        evaluator._save_image(anomaly_map_geometric_binary_img, anomaly_map_geometric_binary_path, "geometric anomaly map binary image")
-
-        # Create arithmetic overlay images
-        overlay_arithmetic_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_arithmetic, alpha=0.8, is_binary=False)
-        overlay_arithmetic_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_arithmetic.png")
-        evaluator._save_image(overlay_arithmetic_img, overlay_arithmetic_path, "arithmetic anomaly overlay image")
-
-        overlay_arithmetic_binary_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_arithmetic_binary, alpha=0.8)
-        overlay_arithmetic_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_arithmetic_binary.png")
-        evaluator._save_image(overlay_arithmetic_binary_img, overlay_arithmetic_binary_path, "arithmetic anomaly overlay binary image")
-
-        # Create geometric overlay images
-        overlay_geometric_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_geometric, alpha=0.8, is_binary=False)
-        overlay_geometric_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_geometric.png")
-        evaluator._save_image(overlay_geometric_img, overlay_geometric_path, "geometric anomaly overlay image")
-
-        overlay_geometric_binary_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_geometric_binary, alpha=0.8)
-        overlay_geometric_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_geometric_binary.png")
-        evaluator._save_image(overlay_geometric_binary_img, overlay_geometric_binary_path, "geometric anomaly overlay binary image")
-
-        # Save overlay+patches images for arithmetic maps
-        marked_overlay_arithmetic_img = draw_patch_rectangles_on_image(overlay_arithmetic_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
-        marked_overlay_arithmetic_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_arithmetic.png")
-        evaluator._save_image(marked_overlay_arithmetic_img, marked_overlay_arithmetic_path, "marked arithmetic overlay image")
-
-        marked_overlay_arithmetic_binary_img = draw_patch_rectangles_on_image(overlay_arithmetic_binary_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
-        marked_overlay_arithmetic_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_arithmetic_binary.png")
-        evaluator._save_image(marked_overlay_arithmetic_binary_img, marked_overlay_arithmetic_binary_path, "marked arithmetic overlay binary image")
-
-        # Save overlay+patches images for geometric maps
-        marked_overlay_geometric_img = draw_patch_rectangles_on_image(overlay_geometric_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
-        marked_overlay_geometric_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_geometric.png")
-        evaluator._save_image(marked_overlay_geometric_img, marked_overlay_geometric_path, "marked geometric overlay image")
-
-        marked_overlay_geometric_binary_img = draw_patch_rectangles_on_image(overlay_geometric_binary_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
-        marked_overlay_geometric_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_geometric_binary.png")
-        evaluator._save_image(marked_overlay_geometric_binary_img, marked_overlay_geometric_binary_path, "marked geometric overlay binary image")
-
-        # Create and save contour-based binary maps for arithmetic (all three styles)
-        anomaly_map_arithmetic_binary_style1_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_arithmetic_binary_style1, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches)
-        anomaly_map_arithmetic_binary_style1_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_arithmetic_binary_style1.png")
-        evaluator._save_image(anomaly_map_arithmetic_binary_style1_img, anomaly_map_arithmetic_binary_style1_path, "arithmetic anomaly map binary style1 image")
-
-        anomaly_map_arithmetic_binary_style2_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_arithmetic_binary_style2, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches)
-        anomaly_map_arithmetic_binary_style2_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_arithmetic_binary_style2.png")
-        evaluator._save_image(anomaly_map_arithmetic_binary_style2_img, anomaly_map_arithmetic_binary_style2_path, "arithmetic anomaly map binary style2 image")
-
-        anomaly_map_arithmetic_binary_style3_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_arithmetic_binary_style3, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches)
-        anomaly_map_arithmetic_binary_style3_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_arithmetic_binary_style3.png")
-        evaluator._save_image(anomaly_map_arithmetic_binary_style3_img, anomaly_map_arithmetic_binary_style3_path, "arithmetic anomaly map binary style3 image")
-
-        # Create overlay images for arithmetic contour styles
-        overlay_arithmetic_binary_style1_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_arithmetic_binary_style1, alpha=0.8)
-        overlay_arithmetic_binary_style1_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_arithmetic_binary_style1.png")
-        evaluator._save_image(overlay_arithmetic_binary_style1_img, overlay_arithmetic_binary_style1_path, "arithmetic anomaly overlay binary style1 image")
-
-        overlay_arithmetic_binary_style2_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_arithmetic_binary_style2, alpha=0.8)
-        overlay_arithmetic_binary_style2_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_arithmetic_binary_style2.png")
-        evaluator._save_image(overlay_arithmetic_binary_style2_img, overlay_arithmetic_binary_style2_path, "arithmetic anomaly overlay binary style2 image")
-
-        overlay_arithmetic_binary_style3_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_arithmetic_binary_style3, alpha=0.8)
-        overlay_arithmetic_binary_style3_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_arithmetic_binary_style3.png")
-        evaluator._save_image(overlay_arithmetic_binary_style3_img, overlay_arithmetic_binary_style3_path, "arithmetic anomaly overlay binary style3 image")
-
-        # Create marked overlay images for arithmetic contour styles
-        marked_overlay_arithmetic_binary_style1_img = draw_patch_rectangles_on_image(overlay_arithmetic_binary_style1_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
-        marked_overlay_arithmetic_binary_style1_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_arithmetic_binary_style1.png")
-        evaluator._save_image(marked_overlay_arithmetic_binary_style1_img, marked_overlay_arithmetic_binary_style1_path, "marked arithmetic overlay binary style1 image")
-
-        marked_overlay_arithmetic_binary_style2_img = draw_patch_rectangles_on_image(overlay_arithmetic_binary_style2_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
-        marked_overlay_arithmetic_binary_style2_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_arithmetic_binary_style2.png")
-        evaluator._save_image(marked_overlay_arithmetic_binary_style2_img, marked_overlay_arithmetic_binary_style2_path, "marked arithmetic overlay binary style2 image")
-
-        marked_overlay_arithmetic_binary_style3_img = draw_patch_rectangles_on_image(overlay_arithmetic_binary_style3_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
-        marked_overlay_arithmetic_binary_style3_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_arithmetic_binary_style3.png")
-        evaluator._save_image(marked_overlay_arithmetic_binary_style3_img, marked_overlay_arithmetic_binary_style3_path, "marked arithmetic overlay binary style3 image")
-
-        # Create and save contour-based binary maps for geometric (all three styles)
-        anomaly_map_geometric_binary_style1_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_geometric_binary_style1, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches)
-        anomaly_map_geometric_binary_style1_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_geometric_binary_style1.png")
-        evaluator._save_image(anomaly_map_geometric_binary_style1_img, anomaly_map_geometric_binary_style1_path, "geometric anomaly map binary style1 image")
-
-        anomaly_map_geometric_binary_style2_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_geometric_binary_style2, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches)
-        anomaly_map_geometric_binary_style2_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_geometric_binary_style2.png")
-        evaluator._save_image(anomaly_map_geometric_binary_style2_img, anomaly_map_geometric_binary_style2_path, "geometric anomaly map binary style2 image")
-
-        anomaly_map_geometric_binary_style3_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_geometric_binary_style3, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches)
-        anomaly_map_geometric_binary_style3_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_geometric_binary_style3.png")
-        evaluator._save_image(anomaly_map_geometric_binary_style3_img, anomaly_map_geometric_binary_style3_path, "geometric anomaly map binary style3 image")
-
-        # Create overlay images for geometric contour styles
-        overlay_geometric_binary_style1_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_geometric_binary_style1, alpha=0.8)
-        overlay_geometric_binary_style1_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_geometric_binary_style1.png")
-        evaluator._save_image(overlay_geometric_binary_style1_img, overlay_geometric_binary_style1_path, "geometric anomaly overlay binary style1 image")
-
-        overlay_geometric_binary_style2_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_geometric_binary_style2, alpha=0.8)
-        overlay_geometric_binary_style2_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_geometric_binary_style2.png")
-        evaluator._save_image(overlay_geometric_binary_style2_img, overlay_geometric_binary_style2_path, "geometric anomaly overlay binary style2 image")
-
-        overlay_geometric_binary_style3_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_geometric_binary_style3, alpha=0.8)
-        overlay_geometric_binary_style3_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_geometric_binary_style3.png")
-        evaluator._save_image(overlay_geometric_binary_style3_img, overlay_geometric_binary_style3_path, "geometric anomaly overlay binary style3 image")
-
-        # Create marked overlay images for geometric contour styles
-        marked_overlay_geometric_binary_style1_img = draw_patch_rectangles_on_image(overlay_geometric_binary_style1_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
-        marked_overlay_geometric_binary_style1_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_geometric_binary_style1.png")
-        evaluator._save_image(marked_overlay_geometric_binary_style1_img, marked_overlay_geometric_binary_style1_path, "marked geometric overlay binary style1 image")
-
-        marked_overlay_geometric_binary_style2_img = draw_patch_rectangles_on_image(overlay_geometric_binary_style2_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
-        marked_overlay_geometric_binary_style2_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_geometric_binary_style2.png")
-        evaluator._save_image(marked_overlay_geometric_binary_style2_img, marked_overlay_geometric_binary_style2_path, "marked geometric overlay binary style2 image")
-
-        marked_overlay_geometric_binary_style3_img = draw_patch_rectangles_on_image(overlay_geometric_binary_style3_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
-        marked_overlay_geometric_binary_style3_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_geometric_binary_style3.png")
-        evaluator._save_image(marked_overlay_geometric_binary_style3_img, marked_overlay_geometric_binary_style3_path, "marked geometric overlay binary style3 image")
-    
-    # Save evaluation results with white pixel counts
-    for image_path, patch_results in image_patch_results.items():
-        # Convert pixel coordinates back to grid coordinates and include white pixel counts
-        patch_analysis = []
-        for x, y, anomaly_pixels in patch_results:
-            grid_row = y // 128
-            grid_col = x // 128
-            patch_analysis.append({
-                "grid_row": grid_row,
-                "grid_col": grid_col,
-                "anomaly_pixels": int(anomaly_pixels),
-                "is_defective": bool(anomaly_pixels > 0)
-            })
-        
-        result_filename = f"{path_to_safe_filename(image_path)}__evaluation.json"
-        result_path = os.path.join(output_dirs['evaluation_results'], result_filename)
-        evaluation_result = {
-            "image_path": image_path,
-            "patch_analysis": patch_analysis,
-            "grid_size": 128
-        }
-        evaluator._save_json(evaluation_result, result_path, "evaluation result")
     
     # Create Excel report (if enabled)
     if hasattr(args, 'enable_excel_report') and args.enable_excel_report:
@@ -1732,7 +1588,7 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         excel_path = make_excel(
             records=records,
             image_size=128,
-            save_dir=output_dirs['evaluation_results'],
+            save_dir=checkpoint_manager.evaluation_results_dir,
             save_filename=f"report_{datetime.now().strftime('%y%m%d_%H%M%S')}"
         )
         print(f"Excel report saved to: {excel_path}")
@@ -1741,7 +1597,11 @@ def evaluation_annotated_images(args, diffusion, model, vae):
     
     print("==" * 30)
     # Compute confusion matrix and accuracy
-    compute_confusion_matrix_and_accuracy(args.annotation_dir, output_dirs['evaluation_results'])
+    compute_confusion_matrix_and_accuracy(args.annotation_dir, checkpoint_manager.evaluation_results_dir)
+    
+    # Clean up checkpoint files after successful completion
+    checkpoint_manager.cleanup_checkpoint()
+    print("Evaluation completed successfully. Checkpoint files cleaned up.")
 
 
 def evaluation_irregular_images(args, diffusion, model, vae):
@@ -2216,9 +2076,8 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
             print(f"Skipping this file and continuing...")
             continue
         except Exception as e:
-            print(f"Warning: Error reading file {eval_file}: {e}")
-            print(f"Skipping this file and continuing...")
-            continue
+            # handle other exceptions
+            pass
         image_path = eval_data['image_path']
         # Handle new format with patch_analysis
         if 'patch_analysis' in eval_data:
@@ -2247,12 +2106,11 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
             print(f"Skipping this file and continuing...")
             continue
         gt = set(tuple(x) for x in anno_data['defective_patches'])
-        # Get all possible grid cells
-        # (Assume image is divisible by grid_size)
+        # Get all possible grid cells including edge cells
         img = PILImage.open(image_path)
         h, w = img.height, img.width
-        n_rows = h // grid_size
-        n_cols = w // grid_size
+        n_rows = (h + grid_size - 1) // grid_size  # Ceiling division
+        n_cols = (w + grid_size - 1) // grid_size   # Ceiling division
         all_cells = set((r, c) for r in range(n_rows) for c in range(n_cols))
         for cell in all_cells:
             pred = cell in predicted
@@ -2331,6 +2189,613 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
     }
     with open(os.path.join(evaluation_results_dir, "confusion_matrix.json"), "w") as f:
         json.dump(result, f, indent=2)
+
+# ---------------------------------------------------------------------------
+# Checkpoint/Resume System
+# ---------------------------------------------------------------------------
+
+class CheckpointManager:
+    """Manages checkpoint/resume functionality for evaluation."""
+    
+    def __init__(self, results_dir: str, annotation_dir: str = None):
+        self.results_dir = results_dir
+        self.annotation_dir = annotation_dir
+        
+        # Extract base name without timestamp for consistent checkpoint location
+        base_name = self._extract_base_name(results_dir)
+        self.base_checkpoint_dir = os.path.join(os.path.dirname(results_dir), f"{base_name}_checkpoints")
+        
+        # Create checkpoint directory
+        os.makedirs(self.base_checkpoint_dir, exist_ok=True)
+        
+        self.checkpoint_file = os.path.join(self.base_checkpoint_dir, "evaluation_checkpoint.json")
+        self.processed_images_file = os.path.join(self.base_checkpoint_dir, "processed_images.json")
+        
+        # Create results directories
+        self.evaluation_results_dir = os.path.join(results_dir, "evaluation_results")
+        self.marked_images_dir = os.path.join(results_dir, "marked_images")
+        os.makedirs(self.evaluation_results_dir, exist_ok=True)
+        os.makedirs(self.marked_images_dir, exist_ok=True)
+    
+    def _extract_base_name(self, results_dir: str) -> str:
+        """Extract base name from timestamped directory."""
+        # Handle patterns like "test_name_250708_143022" -> "test_name"
+        dir_name = os.path.basename(results_dir)
+        
+        # Try to find the last underscore followed by timestamp pattern
+        import re
+        # Pattern for timestamp: YYMMDD_HHMMSS
+        timestamp_pattern = r'_\d{6}_\d{6}$'
+        match = re.search(timestamp_pattern, dir_name)
+        
+        if match:
+            # Remove the timestamp part
+            base_name = dir_name[:match.start()]
+            return base_name
+        else:
+            # If no timestamp pattern found, use the original name
+            return dir_name
+    
+    def find_latest_checkpoint(self) -> tuple[str, str]:
+        """Find the latest checkpoint files from any timestamped directory."""
+        if os.path.exists(self.checkpoint_file) and os.path.exists(self.processed_images_file):
+            return self.checkpoint_file, self.processed_images_file
+        
+        # Search for checkpoint files in parent directory
+        parent_dir = os.path.dirname(self.base_checkpoint_dir)
+        checkpoint_pattern = os.path.join(parent_dir, "*_checkpoints", "evaluation_checkpoint.json")
+        processed_pattern = os.path.join(parent_dir, "*_checkpoints", "processed_images.json")
+        
+        import glob
+        checkpoint_files = glob.glob(checkpoint_pattern)
+        processed_files = glob.glob(processed_pattern)
+        
+        if checkpoint_files and processed_files:
+            # Use the most recent checkpoint (by file modification time)
+            latest_checkpoint = max(checkpoint_files, key=os.path.getmtime)
+            latest_processed = max(processed_files, key=os.path.getmtime)
+            
+            print(f"Found existing checkpoint: {latest_checkpoint}")
+            return latest_checkpoint, latest_processed
+        
+        return self.checkpoint_file, self.processed_images_file
+    
+    def get_checkpoint_data(self) -> dict:
+        """Load checkpoint data if it exists."""
+        checkpoint_file, _ = self.find_latest_checkpoint()
+        if os.path.exists(checkpoint_file):
+            try:
+                with open(checkpoint_file, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError):
+                pass
+        return {"current_image_index": 0, "processed_images": []}
+    
+    def save_checkpoint(self, current_image_index: int, processed_images: list):
+        """Save current progress to checkpoint file."""
+        checkpoint_data = {
+            "current_image_index": current_image_index,
+            "processed_images": processed_images,
+            "timestamp": datetime.now().isoformat()
+        }
+        with open(self.checkpoint_file, 'w') as f:
+            json.dump(checkpoint_data, f, indent=2)
+    
+    def get_processed_images(self) -> set:
+        """Get set of already processed images."""
+        _, processed_images_file = self.find_latest_checkpoint()
+        if os.path.exists(processed_images_file):
+            try:
+                with open(processed_images_file, 'r') as f:
+                    return set(json.load(f))
+            except (json.JSONDecodeError, FileNotFoundError):
+                pass
+        return set()
+    
+    def mark_image_processed(self, image_path: str):
+        """Mark an image as processed."""
+        processed_images = self.get_processed_images()
+        processed_images.add(image_path)
+        with open(self.processed_images_file, 'w') as f:
+            json.dump(list(processed_images), f, indent=2)
+    
+    def is_image_processed(self, image_path: str) -> bool:
+        """Check if an image has been fully processed."""
+        return image_path in self.get_processed_images()
+    
+    def get_resume_info(self, all_image_paths: list) -> tuple[int, list]:
+        """Get resume information for evaluation."""
+        checkpoint_data = self.get_checkpoint_data()
+        processed_images = self.get_processed_images()
+        
+        # Find the first unprocessed image
+        current_index = 0
+        for i, image_path in enumerate(all_image_paths):
+            if image_path not in processed_images:
+                current_index = i
+                break
+        else:
+            # All images processed
+            current_index = len(all_image_paths)
+        
+        return current_index, list(processed_images)
+    
+    def cleanup_checkpoint(self):
+        """Clean up checkpoint files after successful completion."""
+        if os.path.exists(self.checkpoint_file):
+            os.remove(self.checkpoint_file)
+        if os.path.exists(self.processed_images_file):
+            os.remove(self.processed_images_file)
+        
+        # Also clean up the checkpoint directory if it's empty
+        try:
+            if os.path.exists(self.base_checkpoint_dir) and not os.listdir(self.base_checkpoint_dir):
+                os.rmdir(self.base_checkpoint_dir)
+        except OSError:
+            pass  # Directory not empty or already removed
+
+    def print_checkpoint_status(self):
+        """Print current checkpoint status for debugging."""
+        checkpoint_file, processed_file = self.find_latest_checkpoint()
+        
+        print(f"Checkpoint directory: {self.base_checkpoint_dir}")
+        print(f"Current checkpoint file: {checkpoint_file}")
+        print(f"Current processed file: {processed_file}")
+        
+        if os.path.exists(checkpoint_file):
+            try:
+                with open(checkpoint_file, 'r') as f:
+                    data = json.load(f)
+                    print(f"Checkpoint timestamp: {data.get('timestamp', 'unknown')}")
+                    print(f"Current image index: {data.get('current_image_index', 0)}")
+                    print(f"Processed images: {len(data.get('processed_images', []))}")
+            except Exception as e:
+                print(f"Error reading checkpoint: {e}")
+        else:
+            print("No checkpoint file found")
+        
+        if os.path.exists(processed_file):
+            try:
+                with open(processed_file, 'r') as f:
+                    processed_images = json.load(f)
+                    print(f"Processed images count: {len(processed_images)}")
+                    if processed_images:
+                        print(f"Last processed: {processed_images[-1]}")
+            except Exception as e:
+                print(f"Error reading processed images: {e}")
+        else:
+            print("No processed images file found")
+
+
+def save_image_results(checkpoint_manager: CheckpointManager, image_path: str, 
+                      patch_results: list, image_anomaly_maps: list, 
+                      ground_truth_patches: list = None):
+    """Save all results for a single image immediately."""
+    safe_name = path_to_safe_filename(image_path)
+    
+    # Load original image
+    original_img = np.array(PILImage.open(image_path).convert('RGB'))
+    h, w, _ = original_img.shape
+    
+    # Save marked image
+    marked_img = draw_patch_rectangles_on_image(
+        original_img, patch_results, ground_truth_patches or [], patch_size=128, stride=128, grid_thickness=1
+    )
+    marked_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__marked.png")
+    PILImage.fromarray(marked_img).save(marked_path)
+    
+    # Reconstruct full anomaly maps
+    full_anomaly_map_arithmetic = np.zeros((h, w), dtype=np.float32)
+    full_anomaly_map_arithmetic_binary = np.zeros((h, w), dtype=np.float32)
+    full_anomaly_map_arithmetic_binary_style1 = np.zeros((h, w), dtype=np.float32)
+    full_anomaly_map_arithmetic_binary_style2 = np.zeros((h, w), dtype=np.float32)
+    full_anomaly_map_arithmetic_binary_style3 = np.zeros((h, w), dtype=np.float32)
+    full_anomaly_map_geometric = np.zeros((h, w), dtype=np.float32)
+    full_anomaly_map_geometric_binary = np.zeros((h, w), dtype=np.float32)
+    full_anomaly_map_geometric_binary_style1 = np.zeros((h, w), dtype=np.float32)
+    full_anomaly_map_geometric_binary_style2 = np.zeros((h, w), dtype=np.float32)
+    full_anomaly_map_geometric_binary_style3 = np.zeros((h, w), dtype=np.float32)
+    
+    for x, y, patch_map_arithmetic, patch_map_arithmetic_binary, patch_map_arithmetic_binary_style1, patch_map_arithmetic_binary_style2, patch_map_arithmetic_binary_style3, patch_map_geometric, patch_map_geometric_binary, patch_map_geometric_binary_style1, patch_map_geometric_binary_style2, patch_map_geometric_binary_style3 in image_anomaly_maps:
+        # Calculate actual patch dimensions for this position
+        patch_width = min(128, w - x)
+        patch_height = min(128, h - y)
+        
+        # Extract the actual patch region (may be smaller than 128x128 for edge patches)
+        patch_arithmetic = patch_map_arithmetic.squeeze()[:patch_height, :patch_width]
+        patch_arithmetic_binary = patch_map_arithmetic_binary.squeeze()[:patch_height, :patch_width]
+        patch_arithmetic_binary_style1 = patch_map_arithmetic_binary_style1.squeeze()[:patch_height, :patch_width]
+        patch_arithmetic_binary_style2 = patch_map_arithmetic_binary_style2.squeeze()[:patch_height, :patch_width]
+        patch_arithmetic_binary_style3 = patch_map_arithmetic_binary_style3.squeeze()[:patch_height, :patch_width]
+        patch_geometric = patch_map_geometric.squeeze()[:patch_height, :patch_width]
+        patch_geometric_binary = patch_map_geometric_binary.squeeze()[:patch_height, :patch_width]
+        patch_geometric_binary_style1 = patch_map_geometric_binary_style1.squeeze()[:patch_height, :patch_width]
+        patch_geometric_binary_style2 = patch_map_geometric_binary_style2.squeeze()[:patch_height, :patch_width]
+        patch_geometric_binary_style3 = patch_map_geometric_binary_style3.squeeze()[:patch_height, :patch_width]
+        
+        # Assign to the correct region in the full anomaly map
+        full_anomaly_map_arithmetic[y:y+patch_height, x:x+patch_width] = patch_arithmetic
+        full_anomaly_map_arithmetic_binary[y:y+patch_height, x:x+patch_width] = patch_arithmetic_binary
+        full_anomaly_map_arithmetic_binary_style1[y:y+patch_height, x:x+patch_width] = patch_arithmetic_binary_style1
+        full_anomaly_map_arithmetic_binary_style2[y:y+patch_height, x:x+patch_width] = patch_arithmetic_binary_style2
+        full_anomaly_map_arithmetic_binary_style3[y:y+patch_height, x:x+patch_width] = patch_arithmetic_binary_style3
+        full_anomaly_map_geometric[y:y+patch_height, x:x+patch_width] = patch_geometric
+        full_anomaly_map_geometric_binary[y:y+patch_height, x:x+patch_width] = patch_geometric_binary
+        full_anomaly_map_geometric_binary_style1[y:y+patch_height, x:x+patch_width] = patch_geometric_binary_style1
+        full_anomaly_map_geometric_binary_style2[y:y+patch_height, x:x+patch_width] = patch_geometric_binary_style2
+        full_anomaly_map_geometric_binary_style3[y:y+patch_height, x:x+patch_width] = patch_geometric_binary_style3
+    
+    # Save all anomaly map images
+    anomaly_images = [
+        (full_anomaly_map_arithmetic, "am_ar", False),
+        (full_anomaly_map_arithmetic_binary, "am_ar_bin", True),
+        (full_anomaly_map_arithmetic_binary_style1, "am_ar_bin_st1", True),
+        (full_anomaly_map_arithmetic_binary_style2, "am_ar_bin_st2", True),
+        (full_anomaly_map_arithmetic_binary_style3, "am_ar_bin_st3", True),
+        (full_anomaly_map_geometric, "am_ge", False),
+        (full_anomaly_map_geometric_binary, "am_ge_bin", True),
+        (full_anomaly_map_geometric_binary_style1, "am_ge_bin_st1", True),
+        (full_anomaly_map_geometric_binary_style2, "am_ge_bin_st2", True),
+        (full_anomaly_map_geometric_binary_style3, "am_ge_bin_st3", True),
+    ]
+    
+    for anomaly_map, suffix, is_binary in anomaly_images:
+        # Save anomaly map image
+        anomaly_map_img = ImageProcessor.create_anomaly_map_image(
+            anomaly_map, patch_size=128, add_grid=True, 
+            patch_results=patch_results, ground_truth_patches=ground_truth_patches or [], 
+            is_binary=is_binary
+        )
+        anomaly_map_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__{suffix}.png")
+        PILImage.fromarray(anomaly_map_img).save(anomaly_map_path)
+        
+        # Save overlay image
+        overlay_img = ImageProcessor.create_anomaly_overlay(original_img, anomaly_map, alpha=0.8, is_binary=is_binary)
+        overlay_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__ao_{suffix}.png")
+        PILImage.fromarray(overlay_img).save(overlay_path)
+        
+        # Save marked overlay image
+        marked_overlay_img = draw_patch_rectangles_on_image(overlay_img, patch_results, ground_truth_patches or [], patch_size=128, stride=128, grid_thickness=1)
+        marked_overlay_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__mo_{suffix}.png")
+        PILImage.fromarray(marked_overlay_img).save(marked_overlay_path)
+    
+    # Save evaluation results
+    patch_analysis = []
+    for x, y, anomaly_pixels in patch_results:
+        grid_row = y // 128
+        grid_col = x // 128
+        patch_analysis.append({
+            "grid_row": grid_row,
+            "grid_col": grid_col,
+            "anomaly_pixels": int(anomaly_pixels),
+            "is_defective": bool(anomaly_pixels > 0)
+        })
+    
+    result_filename = f"{safe_name}__evaluation.json"
+    result_path = os.path.join(checkpoint_manager.evaluation_results_dir, result_filename)
+    evaluation_result = {
+        "image_path": image_path,
+        "patch_analysis": patch_analysis,
+        "grid_size": 128
+    }
+    with open(result_path, 'w') as f:
+        json.dump(evaluation_result, f, indent=2)
+    
+    print(f"Saved all results for image: {image_path}")
+
+
+def process_split_irregular_with_checkpoint(
+    dataloader,
+    split: str,
+    diffusion,
+    model,
+    vae,
+    reverse_steps: int,
+    center_size: int,
+    batch_num: int,
+    device: torch.device = torch.device("cpu"),
+    anomaly_binary_threshold: int = 0,
+    anomaly_pixel_num_threshold: int = 0,
+    adaptive_threshold: float = 0.1,
+    enable_epoch_stats: bool = True,
+    checkpoint_manager: CheckpointManager = None,
+) -> tuple[List[Record], defaultdict[str, list[tuple[int, int, bool]]], defaultdict[str, list[tuple[int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]]]:
+    """Run evaluation with checkpoint/resume functionality."""
+    # Initialize evaluation metrics
+    metrics = EvaluationMetrics()
+
+    results: List[Record] = []
+    image_patch_results = defaultdict(list)  # Track results per original image
+    image_anomaly_maps = defaultdict(list)  # Track anomaly maps per original image
+    
+    # Get all unique image paths for checkpoint management
+    all_image_paths = list(set([item[3] for item in dataloader.dataset]))
+    all_image_paths.sort()  # Ensure consistent ordering
+    
+    # Get resume information
+    if checkpoint_manager:
+        current_image_index, processed_images = checkpoint_manager.get_resume_info(all_image_paths)
+        print(f"Resuming from image {current_image_index}/{len(all_image_paths)}")
+        print(f"Already processed: {len(processed_images)} images")
+    else:
+        current_image_index = 0
+        processed_images = []
+    
+    # Memory optimization: Clear cache periodically
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    current_image_path = None
+    current_image_patches = []
+    current_image_anomaly_maps = []
+    
+    try:
+        for idx, (x, seg, object_cls, image_paths, anomaly_classes, patch_coords) in enumerate(
+            tqdm(dataloader, desc=f"{split} split")
+        ):
+            if idx >= batch_num:
+                break
+
+            # Check if we're starting a new image
+            if current_image_path != image_paths[0]:
+                # Save results for previous image if exists
+                if current_image_path and checkpoint_manager:
+                    if not checkpoint_manager.is_image_processed(current_image_path):
+                        # Load ground truth annotations for this image
+                        ground_truth_patches = None
+                        annotation_filename = f"{path_to_safe_filename(current_image_path)}__annotations.json"
+                        annotation_path = os.path.join(checkpoint_manager.annotation_dir, annotation_filename)
+                        
+                        if os.path.exists(annotation_path):
+                            with open(annotation_path, 'r') as f:
+                                annotation = json.load(f)
+                                ground_truth_patches = annotation.get("defective_patches", [])
+                        
+                        # Save all results for this image
+                        save_image_results(
+                            checkpoint_manager, 
+                            current_image_path, 
+                            current_image_patches, 
+                            current_image_anomaly_maps, 
+                            ground_truth_patches or []
+                        )
+                        
+                        # Mark as processed
+                        checkpoint_manager.mark_image_processed(current_image_path)
+                        processed_images.append(current_image_path)
+                
+                # Start new image
+                current_image_path = image_paths[0]
+                current_image_patches = []
+                current_image_anomaly_maps = []
+                
+                # Skip if already processed
+                if checkpoint_manager and checkpoint_manager.is_image_processed(current_image_path):
+                    print(f"Skipping already processed image: {current_image_path}")
+                    continue
+
+            with torch.no_grad():
+                # -----------------------------------------------------------------
+                # Forward pass through VAE encoder (to latent space)
+                # -----------------------------------------------------------------
+                x = x.to(device)
+                object_cls = object_cls.to(device)
+
+                encoded = vae.encode(x).latent_dist.mean * _LATENT_SCALE
+
+                # -----------------------------------------------------------------
+                # Reverse DDIM sampling conditioned on encoder latents
+                # -----------------------------------------------------------------
+                model_kwargs = {"context": object_cls.unsqueeze(1), "mask": None}
+                
+                latent_samples_list = []
+                for samples in diffusion.ddim_deviation_sample_loop_progressive(
+                    model,
+                    shape=encoded.shape,
+                    noise=encoded,
+                    clip_denoised=False,
+                    start_t=reverse_steps,
+                    model_kwargs=model_kwargs,
+                    progress=False,
+                    device=device,
+                    eta=0.0,
+                ):
+                    latent_samples_list.append(samples["sample"])
+                latent_samples_final = latent_samples_list[-1]
+
+                image_samples_list = []
+                for latent_samples in latent_samples_list:
+                    image_samples_list.append(
+                        vae.decode(latent_samples / _LATENT_SCALE).sample
+                    )
+
+                # -----------------------------------------------------------------
+                # Reconstructions & other intermediate images
+                # -----------------------------------------------------------------
+                image_samples = vae.decode(latent_samples_final / _LATENT_SCALE).sample
+                x0 = vae.decode(encoded / _LATENT_SCALE).sample
+
+                # -----------------------------------------------------------------
+                # Difference / binary maps
+                # -----------------------------------------------------------------
+                orig_dodrecon_diff = _compute_diff_mean(x, image_samples)
+                orig_dodrecon_binary = _binary_mask(orig_dodrecon_diff, anomaly_binary_threshold)
+
+                orig_encodedrecon_diff = _compute_diff_mean(x, x0)
+                orig_encodedrecon_binary = _binary_mask(orig_encodedrecon_diff, anomaly_binary_threshold)
+                
+                encodedrecon_dodrecon_diff_raw = _compute_abs_diff_max(x0, image_samples)
+                encodedrecon_dodrecon_diff = torch.clamp(encodedrecon_dodrecon_diff_raw, 0.0, 0.05) * 20
+
+                encoded_latent_diff_raw = _compute_abs_diff_mean(latent_samples_final,encoded)
+                encoded_latent_diff = torch.clamp(encoded_latent_diff_raw, 0.0, 0.05) * 20
+
+                # Resize encoded_latent_diff to match the spatial dimensions of encodedrecon_dodrecon_diff
+                # For irregular images, we want to use the patch size (128) as the target size
+                patch_size = x.shape[-1]  # Should be 128 for patches
+                encoded_latent_diff_resized = F.interpolate(
+                    encoded_latent_diff,
+                    size=(patch_size, patch_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+                # -----------------------------------------------------------------
+                # Composite anomaly maps
+                # -----------------------------------------------------------------
+                anomaly_map_arithmetic = 0.5 * (
+                    encodedrecon_dodrecon_diff + encoded_latent_diff_resized
+                )
+                # Use contour-based binary masks for all three styles
+                anomaly_map_arithmetic_binary_style1, anomaly_map_arithmetic_binary_style2, anomaly_map_arithmetic_binary_style3 = _create_contour_based_binary_mask(anomaly_map_arithmetic, adaptive_threshold=adaptive_threshold)
+                # Use style1 as default for backward compatibility
+                anomaly_map_arithmetic_binary = anomaly_map_arithmetic_binary_style1
+                
+                anomaly_map_geometric = (
+                    encodedrecon_dodrecon_diff * encoded_latent_diff_resized
+                )
+                # Use contour-based binary masks for all three styles
+                anomaly_map_geometric_binary_style1, anomaly_map_geometric_binary_style2, anomaly_map_geometric_binary_style3 = _create_contour_based_binary_mask(anomaly_map_geometric, adaptive_threshold=adaptive_threshold)
+                # Use style1 as default for backward compatibility
+                anomaly_map_geometric_binary = anomaly_map_geometric_binary_style1
+
+                # Collect epoch-wise statistics
+                metrics.add_batch_stats(encodedrecon_dodrecon_diff_raw, encoded_latent_diff_raw, anomaly_map_arithmetic, anomaly_map_geometric)
+            
+            # ---------------------------------------------------------------------
+            # Per‑sample aggregation
+            # ---------------------------------------------------------------------
+            batch_size = x.size(0)
+            
+            for b in range(batch_size):
+                # Determine if this patch is defective
+                anomaly_binary = anomaly_map_arithmetic_binary[b]
+                # Use largest connected component instead of total white pixels
+                anomaly_pixels = torch.sum(anomaly_binary).item()
+                is_defective = anomaly_pixels > anomaly_pixel_num_threshold  # Largest connected component size
+                
+                # Store patch result for original image marking
+                # patch_coords[b] is now a tensor [x, y]
+                patch_coord_tensor = patch_coords[b]
+                if isinstance(patch_coord_tensor, torch.Tensor):
+                    x_coord = int(patch_coord_tensor[0].item())
+                    y_coord = int(patch_coord_tensor[1].item())
+                elif isinstance(patch_coord_tensor, (list, tuple)) and len(patch_coord_tensor) == 2:
+                    x_coord, y_coord = patch_coord_tensor
+                else:
+                    # Fallback
+                    print(f"Warning: unexpected patch_coord format, using default coordinates")
+                    x_coord, y_coord = 0, 0
+                
+                # Store (x_coord, y_coord, anomaly_pixels) instead of (x_coord, y_coord, is_defective)
+                image_patch_results[image_paths[b]].append((x_coord, y_coord, anomaly_pixels))
+                current_image_patches.append((x_coord, y_coord, anomaly_pixels))
+                
+                # Store anomaly maps for overlay creation (including all three contour styles)
+                anomaly_map_arithmetic_np = _to_numpy(anomaly_map_arithmetic[b])
+                anomaly_map_arithmetic_binary_np = _to_numpy(anomaly_map_arithmetic_binary[b])
+                anomaly_map_arithmetic_binary_style1_np = _to_numpy(anomaly_map_arithmetic_binary_style1[b])
+                anomaly_map_arithmetic_binary_style2_np = _to_numpy(anomaly_map_arithmetic_binary_style2[b])
+                anomaly_map_arithmetic_binary_style3_np = _to_numpy(anomaly_map_arithmetic_binary_style3[b])
+                anomaly_map_geometric_np = _to_numpy(anomaly_map_geometric[b])
+                anomaly_map_geometric_binary_np = _to_numpy(anomaly_map_geometric_binary[b])
+                anomaly_map_geometric_binary_style1_np = _to_numpy(anomaly_map_geometric_binary_style1[b])
+                anomaly_map_geometric_binary_style2_np = _to_numpy(anomaly_map_geometric_binary_style2[b])
+                anomaly_map_geometric_binary_style3_np = _to_numpy(anomaly_map_geometric_binary_style3[b])
+                image_anomaly_maps[image_paths[b]].append((x_coord, y_coord, anomaly_map_arithmetic_np, anomaly_map_arithmetic_binary_np, anomaly_map_arithmetic_binary_style1_np, anomaly_map_arithmetic_binary_style2_np, anomaly_map_arithmetic_binary_style3_np, anomaly_map_geometric_np, anomaly_map_geometric_binary_np, anomaly_map_geometric_binary_style1_np, anomaly_map_geometric_binary_style2_np, anomaly_map_geometric_binary_style3_np))
+                current_image_anomaly_maps.append((x_coord, y_coord, anomaly_map_arithmetic_np, anomaly_map_arithmetic_binary_np, anomaly_map_arithmetic_binary_style1_np, anomaly_map_arithmetic_binary_style2_np, anomaly_map_arithmetic_binary_style3_np, anomaly_map_geometric_np, anomaly_map_geometric_binary_np, anomaly_map_geometric_binary_style1_np, anomaly_map_geometric_binary_style2_np, anomaly_map_geometric_binary_style3_np))
+                
+                rec = make_record(
+                    split=("meta", split),
+                    image_path=("meta", image_paths[b]),
+                    anomaly_class=("meta", anomaly_classes[b]),
+                    patch_coords=("meta", (x_coord, y_coord)),
+                    is_defective=("meta", is_defective),
+                    orig=("image", _to_numpy(x[b])),
+                    dod_recon=("image", _to_numpy(image_samples[b])),
+                    encoded_recon=("image", _to_numpy(x0[b])),
+                    orig_dodrecon_diff=("image", _to_numpy(orig_dodrecon_diff[b])),
+                    orig_dodrecon_binary=("image", _to_numpy(orig_dodrecon_binary[b])),
+                    orig_encodedrecon_diff=("image", _to_numpy(orig_encodedrecon_diff[b])),
+                    orig_encodedrecon_binary=(
+                        "image",
+                        _to_numpy(orig_encodedrecon_binary[b]),
+                    ),
+                    encodedrecon_dodrecon_diff=(
+                        "image",
+                        _to_numpy(encodedrecon_dodrecon_diff[b]),
+                    ),
+                    encoded_latent_diff=("image", _to_numpy(encoded_latent_diff[b])),
+                    anomaly_map_arithmetic=("image", _to_numpy(anomaly_map_arithmetic[b])),
+                    anomaly_map_geometric=("image", _to_numpy(anomaly_map_geometric[b])),
+                    anomaly_map_arithmetic_binary=(
+                        "image",
+                        _to_numpy(anomaly_map_arithmetic_binary[b]),
+                    ),
+                    anomaly_map_geometric_binary=(
+                        "image",
+                        _to_numpy(anomaly_map_geometric_binary[b]),
+                    ),
+                    encoded=("image", _to_numpy(encoded[b])),
+                )
+
+                add_metric_fields(rec, device=device)
+                results.append(rec)
+            
+            # Memory optimization: Clear cache every 10 batches
+            if idx % 10 == 0 and idx > 0:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+                
+                # Save checkpoint periodically
+                if checkpoint_manager:
+                    checkpoint_manager.save_checkpoint(idx, processed_images)
+
+        # Save results for the last image
+        if current_image_path and checkpoint_manager:
+            if not checkpoint_manager.is_image_processed(current_image_path):
+                # Load ground truth annotations for this image
+                ground_truth_patches = None
+                annotation_filename = f"{path_to_safe_filename(current_image_path)}__annotations.json"
+                annotation_path = os.path.join(checkpoint_manager.annotation_dir, annotation_filename)
+                
+                if os.path.exists(annotation_path):
+                    with open(annotation_path, 'r') as f:
+                        annotation = json.load(f)
+                        ground_truth_patches = annotation.get("defective_patches", [])
+                
+                # Save all results for this image
+                save_image_results(
+                    checkpoint_manager, 
+                    current_image_path, 
+                    current_image_patches, 
+                    current_image_anomaly_maps, 
+                    ground_truth_patches or []
+                )
+                
+                # Mark as processed
+                checkpoint_manager.mark_image_processed(current_image_path)
+
+    except KeyboardInterrupt:
+        print("\nProcess interrupted. Saving checkpoint...")
+        if checkpoint_manager:
+            checkpoint_manager.save_checkpoint(idx, processed_images)
+        raise
+    except Exception as e:
+        print(f"\nError occurred: {e}")
+        if checkpoint_manager:
+            checkpoint_manager.save_checkpoint(idx, processed_images)
+        raise
+
+    # Print epoch-wise statistics (if enabled)
+    if enable_epoch_stats:
+        metrics.print_epoch_stats()
+    else:
+        print("Skipping epoch statistics (disabled)")
+
+    return results, image_patch_results, image_anomaly_maps
 
 def main():
     REPO_ROOT = os.environ.get("REPO_ROOT", None)

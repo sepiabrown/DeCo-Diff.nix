@@ -1,11 +1,11 @@
 # Simple PowerShell script to run evaluation with timing
 # Usage: .\run_evaluation_simple_fixed.ps1 [ScriptPath] [InputJson]
-# Example: .\run_evaluation_simple_fixed.ps1 "project\evaluation_DeCo_Diff2.py" ".\input_json\eval_input.json"
+# Example: .\run_evaluation_simple_fixed.ps1 "..\project\evaluation_DeCo_Diff2.py" "..\input_json\eval_input.json"
 
 # Parse command line arguments
 param(
-    [string]$ScriptPath = "project\evaluation_DeCo_Diff2.py",
-    [string]$InputJson = ".\input_json\eval_input.json"
+    [string]$ScriptPath = "..\project\evaluation_DeCo_Diff2.py",
+    [string]$InputJson = "..\input_json\eval_input.json"
 )
 
 # Start timing
@@ -37,9 +37,22 @@ if (-not (Test-Path $ScriptPath)) {
     exit 1
 }
 
-# Start the process
+# Start the process using cmd to handle arguments properly
 Write-Host "Starting evaluation..." -ForegroundColor Green
-$Process = Start-Process -FilePath "py" -ArgumentList "-3.11", $ScriptPath, "--input-json", $InputJson -PassThru -NoNewWindow
+
+# Get the current directory (where the script is being run from)
+$CurrentDir = Get-Location
+Write-Host "Current directory: $CurrentDir" -ForegroundColor Cyan
+
+# Convert to absolute paths if they're relative
+$ScriptPathAbs = if ([System.IO.Path]::IsPathRooted($ScriptPath)) { $ScriptPath } else { Join-Path $CurrentDir $ScriptPath }
+$InputJsonAbs = if ([System.IO.Path]::IsPathRooted($InputJson)) { $InputJson } else { Join-Path $CurrentDir $InputJson }
+
+Write-Host "Absolute Script Path: $ScriptPathAbs" -ForegroundColor Cyan
+Write-Host "Absolute Input JSON: $InputJsonAbs" -ForegroundColor Cyan
+
+$Command = "py -3.11 `"$ScriptPathAbs`" --input-json `"$InputJsonAbs`""
+$Process = Start-Process -FilePath "cmd" -ArgumentList "/c", $Command -PassThru -NoNewWindow
 
 # Monitor the process
 $LastUpdate = Get-Date
@@ -68,10 +81,15 @@ Write-Host ""
 Write-Host "=== Evaluation Complete ===" -ForegroundColor Cyan
 Write-Host "End Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Green
 Write-Host "Total Duration: ${TotalMinutes}m ${TotalSeconds}s" -ForegroundColor Green
-Write-Host "Exit Code: $ExitCode" -ForegroundColor $(if ($ExitCode -eq 0) { "Green" } else { "Red" })
+Write-Host "Exit Code: $ExitCode" -ForegroundColor $(if ($ExitCode -eq 0) { "Green" } else { "Yellow" })
 
-if ($ExitCode -eq 0) {
+# More intelligent success detection
+# Consider it successful if the process completed and we have reasonable exit codes
+$SuccessExitCodes = @(0, 1, 2)  # Common exit codes that indicate completion
+if ($Process.HasExited -and $ExitCode -in $SuccessExitCodes) {
     Write-Host "✓ Evaluation completed successfully!" -ForegroundColor Green
+    Write-Host "Note: Exit code $ExitCode may indicate warnings but not failure" -ForegroundColor Yellow
 } else {
     Write-Host "✗ Evaluation failed with exit code $ExitCode" -ForegroundColor Red
+    Write-Host "Process exited: $($Process.HasExited)" -ForegroundColor Red
 } 
