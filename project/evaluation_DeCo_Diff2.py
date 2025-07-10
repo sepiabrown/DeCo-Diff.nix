@@ -693,9 +693,9 @@ def _get_largest_connected_component_pixels(anomaly_binary: torch.Tensor) -> int
     return largest_component_size
 
 
-def _create_contour_based_binary_mask(anomaly_map: torch.Tensor, adaptive_threshold: float = 0.1) -> torch.Tensor:
+def _create_contour_based_binary_mask(anomaly_map: torch.Tensor, adaptive_threshold: float = 0.1) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Create binary mask based on contours with adaptive selection based on distribution.
+    Create three different binary masks based on contours with adaptive selection based on distribution.
     
     Args:
         anomaly_map: Anomaly map tensor with shape (batch_size, 1, H, W) with values in [0, 1]
@@ -704,7 +704,10 @@ def _create_contour_based_binary_mask(anomaly_map: torch.Tensor, adaptive_thresh
                           - Higher values select fewer contours
         
     Returns:
-        Binary tensor with same shape as input where selected contour pixels are 1, others are 0
+        Tuple of three binary tensors with same shape as input where selected contour pixels are 1, others are 0:
+        - style1: Top contours by sum (most significant)
+        - style2: Statistical outliers (mean + threshold * std)
+        - style3: Contours contributing significant portion of total
     """
     import cv2
     import numpy as np
@@ -712,31 +715,41 @@ def _create_contour_based_binary_mask(anomaly_map: torch.Tensor, adaptive_thresh
     # Handle batch processing for shape (batch_size, 1, H, W)
     if anomaly_map.dim() == 4:
         batch_size = anomaly_map.shape[0]
-        binary_masks = []
+        binary_masks_style1 = []
+        binary_masks_style2 = []
+        binary_masks_style3 = []
         
         for b in range(batch_size):
             # Extract single image from batch
             single_map = anomaly_map[b, 0]  # Shape: (H, W)
-            single_binary = _create_contour_based_binary_mask_single(single_map, adaptive_threshold)
-            binary_masks.append(single_binary)
+            single_binary_style1, single_binary_style2, single_binary_style3 = _create_contour_based_binary_mask_single(single_map, adaptive_threshold)
+            binary_masks_style1.append(single_binary_style1)
+            binary_masks_style2.append(single_binary_style2)
+            binary_masks_style3.append(single_binary_style3)
         
         # Stack back into batch
-        return torch.stack(binary_masks, dim=0).unsqueeze(1)  # Shape: (batch_size, 1, H, W)
+        style1 = torch.stack(binary_masks_style1, dim=0).unsqueeze(1)  # Shape: (batch_size, 1, H, W)
+        style2 = torch.stack(binary_masks_style2, dim=0).unsqueeze(1)  # Shape: (batch_size, 1, H, W)
+        style3 = torch.stack(binary_masks_style3, dim=0).unsqueeze(1)  # Shape: (batch_size, 1, H, W)
+        return style1, style2, style3
     else:
         # Handle single image case
         return _create_contour_based_binary_mask_single(anomaly_map, adaptive_threshold)
 
 
-def _create_contour_based_binary_mask_single(anomaly_map: torch.Tensor, adaptive_threshold: float = 0.1) -> torch.Tensor:
+def _create_contour_based_binary_mask_single(anomaly_map: torch.Tensor, adaptive_threshold: float = 0.1) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Create binary mask for a single image based on adaptive contour selection.
+    Create three different binary masks for a single image based on different contour selection styles.
     
     Args:
         anomaly_map: Anomaly map tensor with shape (H, W) with values in [0, 1]
         adaptive_threshold: Threshold for adaptive contour selection (default: 0.1)
         
     Returns:
-        Binary tensor with shape (H, W) where selected contour pixels are 1, others are 0
+        Tuple of three binary tensors with shape (H, W) where selected contour pixels are 1, others are 0:
+        - style1: Top contours by sum (most significant)
+        - style2: Statistical outliers (mean + threshold * std)
+        - style3: Contours contributing significant portion of total
     """
     import cv2
     import numpy as np
@@ -747,7 +760,8 @@ def _create_contour_based_binary_mask_single(anomaly_map: torch.Tensor, adaptive
     # Ensure the map is 2D
     if map_np.ndim != 2:
         print(f"Warning: Expected 2D array, got shape {map_np.shape}")
-        return torch.zeros_like(anomaly_map)
+        zero_mask = torch.zeros_like(anomaly_map)
+        return zero_mask, zero_mask, zero_mask
     
     # Handle negative values and ensure proper range
     map_np = np.clip(map_np, 0, 1)  # Clip to [0, 1] range
@@ -757,7 +771,8 @@ def _create_contour_based_binary_mask_single(anomaly_map: torch.Tensor, adaptive
     
     # Check if the image is all zeros (no contours possible)
     if np.all(map_uint8 == 0):
-        return torch.zeros_like(anomaly_map)
+        zero_mask = torch.zeros_like(anomaly_map)
+        return zero_mask, zero_mask, zero_mask
     
     try:
         # Find contours
@@ -766,11 +781,13 @@ def _create_contour_based_binary_mask_single(anomaly_map: torch.Tensor, adaptive
         print(f"OpenCV error in findContours: {e}")
         print(f"Map shape: {map_uint8.shape}, dtype: {map_uint8.dtype}")
         print(f"Map min: {map_uint8.min()}, max: {map_uint8.max()}")
-        return torch.zeros_like(anomaly_map)
+        zero_mask = torch.zeros_like(anomaly_map)
+        return zero_mask, zero_mask, zero_mask
     
     if not contours:
         # No contours found, return all zeros
-        return torch.zeros_like(anomaly_map)
+        zero_mask = torch.zeros_like(anomaly_map)
+        return zero_mask, zero_mask, zero_mask
     
     # Calculate contour statistics (sum of pixel values within each contour)
     contour_stats = []
@@ -799,48 +816,62 @@ def _create_contour_based_binary_mask_single(anomaly_map: torch.Tensor, adaptive
     # Extract sums for adaptive selection
     sums = np.array([stat['sum'] for stat in contour_stats])
     
-    # Adaptive selection based on distribution
-    if len(sums) == 1:
-        # Only one contour, select it
-        selected_contours = contour_stats
-    else:
-        # Calculate statistics for adaptive selection
-        total_sum = np.sum(sums)
-        max_sum = np.max(sums)
-        mean_sum = np.mean(sums)
-        std_sum = np.std(sums)
-        
-        # Multiple adaptive criteria
-        # 1. Contours with sum > threshold * max_sum
-        threshold_max = adaptive_threshold * max_sum
-        
-        # 2. Contours with sum > mean + threshold * std
-        threshold_stat = mean_sum + adaptive_threshold * std_sum
-        
-        # 3. Contours contributing > threshold of total sum
-        threshold_total = adaptive_threshold * total_sum
-        
-        # Select contours that meet any of the criteria
-        selected_contours = []
-        for stat in contour_stats:
-            if (stat['sum'] >= threshold_max or 
-                stat['sum'] >= threshold_stat or 
-                stat['sum'] >= threshold_total):
-                selected_contours.append(stat)
-        
-        # If no contours meet criteria, select at least the top one
-        if not selected_contours:
-            selected_contours = [contour_stats[0]]
+    # Calculate statistics for adaptive selection
+    total_sum = np.sum(sums)
+    max_sum = np.max(sums)
+    mean_sum = np.mean(sums)
+    std_sum = np.std(sums)
     
-    # Create binary mask with selected contours
-    binary_mask = np.zeros_like(map_uint8)
-    for contour_info in selected_contours:
-        cv2.fillPoly(binary_mask, [contour_info['contour']], (255,))
+    # Style 1: Top contours by sum (most significant)
+    threshold_max = adaptive_threshold * max_sum
+    selected_contours_style1 = []
+    for stat in contour_stats:
+        if stat['sum'] >= threshold_max:
+            selected_contours_style1.append(stat)
+    if not selected_contours_style1:
+        selected_contours_style1 = [contour_stats[0]]
     
-    # Convert back to tensor and normalize to [0, 1]
-    binary_tensor = torch.from_numpy(binary_mask).float() / 255.0
+    # Style 2: Statistical outliers (mean + threshold * std)
+    threshold_stat = mean_sum + adaptive_threshold * std_sum
+    selected_contours_style2 = []
+    for stat in contour_stats:
+        if stat['sum'] >= threshold_stat:
+            selected_contours_style2.append(stat)
+    if not selected_contours_style2:
+        selected_contours_style2 = [contour_stats[0]]
     
-    return binary_tensor.to(anomaly_map.device)
+    # Style 3: Contours contributing significant portion of total
+    threshold_total = adaptive_threshold * total_sum
+    selected_contours_style3 = []
+    for stat in contour_stats:
+        if stat['sum'] >= threshold_total:
+            selected_contours_style3.append(stat)
+    if not selected_contours_style3:
+        selected_contours_style3 = [contour_stats[0]]
+    
+    # Create binary masks for each style
+    binary_mask_style1 = np.zeros_like(map_uint8)
+    binary_mask_style2 = np.zeros_like(map_uint8)
+    binary_mask_style3 = np.zeros_like(map_uint8)
+    
+    for contour_info in selected_contours_style1:
+        cv2.fillPoly(binary_mask_style1, [contour_info['contour']], (255,))
+    
+    for contour_info in selected_contours_style2:
+        cv2.fillPoly(binary_mask_style2, [contour_info['contour']], (255,))
+    
+    for contour_info in selected_contours_style3:
+        cv2.fillPoly(binary_mask_style3, [contour_info['contour']], (255,))
+    
+    # Convert back to tensors and normalize to [0, 1]
+    binary_tensor_style1 = torch.from_numpy(binary_mask_style1).float() / 255.0
+    binary_tensor_style2 = torch.from_numpy(binary_mask_style2).float() / 255.0
+    binary_tensor_style3 = torch.from_numpy(binary_mask_style3).float() / 255.0
+    
+    # Return all three styles
+    return (binary_tensor_style1.to(anomaly_map.device), 
+            binary_tensor_style2.to(anomaly_map.device), 
+            binary_tensor_style3.to(anomaly_map.device))
 
 
 def _to_numpy(
@@ -1112,15 +1143,18 @@ def process_split_irregular(
             anomaly_map_arithmetic = 0.5 * (
                 encodedrecon_dodrecon_diff + encoded_latent_diff_resized
             )
-            # Use contour-based binary mask instead of fixed threshold
-            anomaly_map_arithmetic_binary = _binary_mask(anomaly_map_arithmetic, anomaly_binary_threshold)
-            #anomaly_map_arithmetic_binary = _create_contour_based_binary_mask(anomaly_map_arithmetic, adaptive_threshold=adaptive_threshold)
+            # Use contour-based binary masks for all three styles
+            anomaly_map_arithmetic_binary_style1, anomaly_map_arithmetic_binary_style2, anomaly_map_arithmetic_binary_style3 = _create_contour_based_binary_mask(anomaly_map_arithmetic, adaptive_threshold=adaptive_threshold)
+            # Use style1 as default for backward compatibility
+            anomaly_map_arithmetic_binary = anomaly_map_arithmetic_binary_style1
+            
             anomaly_map_geometric = (
                 encodedrecon_dodrecon_diff * encoded_latent_diff_resized
             )
-            # Use contour-based binary mask instead of fixed threshold
-            anomaly_map_geometric_binary = _binary_mask(anomaly_map_geometric, anomaly_binary_threshold)
-            #anomaly_map_geometric_binary = _create_contour_based_binary_mask(anomaly_map_geometric, adaptive_threshold=adaptive_threshold)
+            # Use contour-based binary masks for all three styles
+            anomaly_map_geometric_binary_style1, anomaly_map_geometric_binary_style2, anomaly_map_geometric_binary_style3 = _create_contour_based_binary_mask(anomaly_map_geometric, adaptive_threshold=adaptive_threshold)
+            # Use style1 as default for backward compatibility
+            anomaly_map_geometric_binary = anomaly_map_geometric_binary_style1
 
             # Collect epoch-wise statistics
             metrics.add_batch_stats(encodedrecon_dodrecon_diff_raw, encoded_latent_diff_raw, anomaly_map_arithmetic, anomaly_map_geometric)
@@ -1183,12 +1217,18 @@ def process_split_irregular(
             # Store (x_coord, y_coord, anomaly_pixels) instead of (x_coord, y_coord, is_defective)
             image_patch_results[image_paths[b]].append((x_coord, y_coord, anomaly_pixels))
             
-            # Store anomaly maps for overlay creation
+            # Store anomaly maps for overlay creation (including all three contour styles)
             anomaly_map_arithmetic_np = _to_numpy(anomaly_map_arithmetic[b])
             anomaly_map_arithmetic_binary_np = _to_numpy(anomaly_map_arithmetic_binary[b])
+            anomaly_map_arithmetic_binary_style1_np = _to_numpy(anomaly_map_arithmetic_binary_style1[b])
+            anomaly_map_arithmetic_binary_style2_np = _to_numpy(anomaly_map_arithmetic_binary_style2[b])
+            anomaly_map_arithmetic_binary_style3_np = _to_numpy(anomaly_map_arithmetic_binary_style3[b])
             anomaly_map_geometric_np = _to_numpy(anomaly_map_geometric[b])
             anomaly_map_geometric_binary_np = _to_numpy(anomaly_map_geometric_binary[b])
-            image_anomaly_maps[image_paths[b]].append((x_coord, y_coord, anomaly_map_arithmetic_np, anomaly_map_arithmetic_binary_np, anomaly_map_geometric_np, anomaly_map_geometric_binary_np))
+            anomaly_map_geometric_binary_style1_np = _to_numpy(anomaly_map_geometric_binary_style1[b])
+            anomaly_map_geometric_binary_style2_np = _to_numpy(anomaly_map_geometric_binary_style2[b])
+            anomaly_map_geometric_binary_style3_np = _to_numpy(anomaly_map_geometric_binary_style3[b])
+            image_anomaly_maps[image_paths[b]].append((x_coord, y_coord, anomaly_map_arithmetic_np, anomaly_map_arithmetic_binary_np, anomaly_map_arithmetic_binary_style1_np, anomaly_map_arithmetic_binary_style2_np, anomaly_map_arithmetic_binary_style3_np, anomaly_map_geometric_np, anomaly_map_geometric_binary_np, anomaly_map_geometric_binary_style1_np, anomaly_map_geometric_binary_style2_np, anomaly_map_geometric_binary_style3_np))
             
             rec = make_record(
                 split=("meta", split),
@@ -1510,14 +1550,26 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         h, w, _ = original_img.shape
         full_anomaly_map_arithmetic = np.zeros((h, w), dtype=np.float32)
         full_anomaly_map_arithmetic_binary = np.zeros((h, w), dtype=np.float32)
+        full_anomaly_map_arithmetic_binary_style1 = np.zeros((h, w), dtype=np.float32)
+        full_anomaly_map_arithmetic_binary_style2 = np.zeros((h, w), dtype=np.float32)
+        full_anomaly_map_arithmetic_binary_style3 = np.zeros((h, w), dtype=np.float32)
         full_anomaly_map_geometric = np.zeros((h, w), dtype=np.float32)
         full_anomaly_map_geometric_binary = np.zeros((h, w), dtype=np.float32)
+        full_anomaly_map_geometric_binary_style1 = np.zeros((h, w), dtype=np.float32)
+        full_anomaly_map_geometric_binary_style2 = np.zeros((h, w), dtype=np.float32)
+        full_anomaly_map_geometric_binary_style3 = np.zeros((h, w), dtype=np.float32)
         
-        for x, y, patch_map_arithmetic, patch_map_arithmetic_binary, patch_map_geometric, patch_map_geometric_binary in anomaly_map_list:
+        for x, y, patch_map_arithmetic, patch_map_arithmetic_binary, patch_map_arithmetic_binary_style1, patch_map_arithmetic_binary_style2, patch_map_arithmetic_binary_style3, patch_map_geometric, patch_map_geometric_binary, patch_map_geometric_binary_style1, patch_map_geometric_binary_style2, patch_map_geometric_binary_style3 in anomaly_map_list:
             full_anomaly_map_arithmetic[y:y+128, x:x+128] = patch_map_arithmetic.squeeze()
             full_anomaly_map_arithmetic_binary[y:y+128, x:x+128] = patch_map_arithmetic_binary.squeeze()
+            full_anomaly_map_arithmetic_binary_style1[y:y+128, x:x+128] = patch_map_arithmetic_binary_style1.squeeze()
+            full_anomaly_map_arithmetic_binary_style2[y:y+128, x:x+128] = patch_map_arithmetic_binary_style2.squeeze()
+            full_anomaly_map_arithmetic_binary_style3[y:y+128, x:x+128] = patch_map_arithmetic_binary_style3.squeeze()
             full_anomaly_map_geometric[y:y+128, x:x+128] = patch_map_geometric.squeeze()
             full_anomaly_map_geometric_binary[y:y+128, x:x+128] = patch_map_geometric_binary.squeeze()
+            full_anomaly_map_geometric_binary_style1[y:y+128, x:x+128] = patch_map_geometric_binary_style1.squeeze()
+            full_anomaly_map_geometric_binary_style2[y:y+128, x:x+128] = patch_map_geometric_binary_style2.squeeze()
+            full_anomaly_map_geometric_binary_style3[y:y+128, x:x+128] = patch_map_geometric_binary_style3.squeeze()
         
         # Create and save standalone arithmetic anomaly maps
         anomaly_map_arithmetic_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_arithmetic, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches, is_binary=False)
@@ -1572,6 +1624,84 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         marked_overlay_geometric_binary_img = draw_patch_rectangles_on_image(overlay_geometric_binary_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
         marked_overlay_geometric_binary_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_geometric_binary.png")
         evaluator._save_image(marked_overlay_geometric_binary_img, marked_overlay_geometric_binary_path, "marked geometric overlay binary image")
+
+        # Create and save contour-based binary maps for arithmetic (all three styles)
+        anomaly_map_arithmetic_binary_style1_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_arithmetic_binary_style1, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches)
+        anomaly_map_arithmetic_binary_style1_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_arithmetic_binary_style1.png")
+        evaluator._save_image(anomaly_map_arithmetic_binary_style1_img, anomaly_map_arithmetic_binary_style1_path, "arithmetic anomaly map binary style1 image")
+
+        anomaly_map_arithmetic_binary_style2_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_arithmetic_binary_style2, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches)
+        anomaly_map_arithmetic_binary_style2_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_arithmetic_binary_style2.png")
+        evaluator._save_image(anomaly_map_arithmetic_binary_style2_img, anomaly_map_arithmetic_binary_style2_path, "arithmetic anomaly map binary style2 image")
+
+        anomaly_map_arithmetic_binary_style3_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_arithmetic_binary_style3, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches)
+        anomaly_map_arithmetic_binary_style3_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_arithmetic_binary_style3.png")
+        evaluator._save_image(anomaly_map_arithmetic_binary_style3_img, anomaly_map_arithmetic_binary_style3_path, "arithmetic anomaly map binary style3 image")
+
+        # Create overlay images for arithmetic contour styles
+        overlay_arithmetic_binary_style1_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_arithmetic_binary_style1, alpha=0.8)
+        overlay_arithmetic_binary_style1_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_arithmetic_binary_style1.png")
+        evaluator._save_image(overlay_arithmetic_binary_style1_img, overlay_arithmetic_binary_style1_path, "arithmetic anomaly overlay binary style1 image")
+
+        overlay_arithmetic_binary_style2_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_arithmetic_binary_style2, alpha=0.8)
+        overlay_arithmetic_binary_style2_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_arithmetic_binary_style2.png")
+        evaluator._save_image(overlay_arithmetic_binary_style2_img, overlay_arithmetic_binary_style2_path, "arithmetic anomaly overlay binary style2 image")
+
+        overlay_arithmetic_binary_style3_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_arithmetic_binary_style3, alpha=0.8)
+        overlay_arithmetic_binary_style3_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_arithmetic_binary_style3.png")
+        evaluator._save_image(overlay_arithmetic_binary_style3_img, overlay_arithmetic_binary_style3_path, "arithmetic anomaly overlay binary style3 image")
+
+        # Create marked overlay images for arithmetic contour styles
+        marked_overlay_arithmetic_binary_style1_img = draw_patch_rectangles_on_image(overlay_arithmetic_binary_style1_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
+        marked_overlay_arithmetic_binary_style1_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_arithmetic_binary_style1.png")
+        evaluator._save_image(marked_overlay_arithmetic_binary_style1_img, marked_overlay_arithmetic_binary_style1_path, "marked arithmetic overlay binary style1 image")
+
+        marked_overlay_arithmetic_binary_style2_img = draw_patch_rectangles_on_image(overlay_arithmetic_binary_style2_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
+        marked_overlay_arithmetic_binary_style2_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_arithmetic_binary_style2.png")
+        evaluator._save_image(marked_overlay_arithmetic_binary_style2_img, marked_overlay_arithmetic_binary_style2_path, "marked arithmetic overlay binary style2 image")
+
+        marked_overlay_arithmetic_binary_style3_img = draw_patch_rectangles_on_image(overlay_arithmetic_binary_style3_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
+        marked_overlay_arithmetic_binary_style3_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_arithmetic_binary_style3.png")
+        evaluator._save_image(marked_overlay_arithmetic_binary_style3_img, marked_overlay_arithmetic_binary_style3_path, "marked arithmetic overlay binary style3 image")
+
+        # Create and save contour-based binary maps for geometric (all three styles)
+        anomaly_map_geometric_binary_style1_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_geometric_binary_style1, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches)
+        anomaly_map_geometric_binary_style1_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_geometric_binary_style1.png")
+        evaluator._save_image(anomaly_map_geometric_binary_style1_img, anomaly_map_geometric_binary_style1_path, "geometric anomaly map binary style1 image")
+
+        anomaly_map_geometric_binary_style2_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_geometric_binary_style2, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches)
+        anomaly_map_geometric_binary_style2_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_geometric_binary_style2.png")
+        evaluator._save_image(anomaly_map_geometric_binary_style2_img, anomaly_map_geometric_binary_style2_path, "geometric anomaly map binary style2 image")
+
+        anomaly_map_geometric_binary_style3_img = ImageProcessor.create_anomaly_map_image(full_anomaly_map_geometric_binary_style3, patch_size=128, add_grid=True, patch_results=patch_results, ground_truth_patches=ground_truth_patches)
+        anomaly_map_geometric_binary_style3_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__am_geometric_binary_style3.png")
+        evaluator._save_image(anomaly_map_geometric_binary_style3_img, anomaly_map_geometric_binary_style3_path, "geometric anomaly map binary style3 image")
+
+        # Create overlay images for geometric contour styles
+        overlay_geometric_binary_style1_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_geometric_binary_style1, alpha=0.8)
+        overlay_geometric_binary_style1_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_geometric_binary_style1.png")
+        evaluator._save_image(overlay_geometric_binary_style1_img, overlay_geometric_binary_style1_path, "geometric anomaly overlay binary style1 image")
+
+        overlay_geometric_binary_style2_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_geometric_binary_style2, alpha=0.8)
+        overlay_geometric_binary_style2_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_geometric_binary_style2.png")
+        evaluator._save_image(overlay_geometric_binary_style2_img, overlay_geometric_binary_style2_path, "geometric anomaly overlay binary style2 image")
+
+        overlay_geometric_binary_style3_img = ImageProcessor.create_anomaly_overlay(original_img, full_anomaly_map_geometric_binary_style3, alpha=0.8)
+        overlay_geometric_binary_style3_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__ao_geometric_binary_style3.png")
+        evaluator._save_image(overlay_geometric_binary_style3_img, overlay_geometric_binary_style3_path, "geometric anomaly overlay binary style3 image")
+
+        # Create marked overlay images for geometric contour styles
+        marked_overlay_geometric_binary_style1_img = draw_patch_rectangles_on_image(overlay_geometric_binary_style1_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
+        marked_overlay_geometric_binary_style1_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_geometric_binary_style1.png")
+        evaluator._save_image(marked_overlay_geometric_binary_style1_img, marked_overlay_geometric_binary_style1_path, "marked geometric overlay binary style1 image")
+
+        marked_overlay_geometric_binary_style2_img = draw_patch_rectangles_on_image(overlay_geometric_binary_style2_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
+        marked_overlay_geometric_binary_style2_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_geometric_binary_style2.png")
+        evaluator._save_image(marked_overlay_geometric_binary_style2_img, marked_overlay_geometric_binary_style2_path, "marked geometric overlay binary style2 image")
+
+        marked_overlay_geometric_binary_style3_img = draw_patch_rectangles_on_image(overlay_geometric_binary_style3_img, patch_results, ground_truth_patches, patch_size=128, stride=128, grid_thickness=1)
+        marked_overlay_geometric_binary_style3_path = os.path.join(output_dirs['marked_images'], f"{safe_name}__mo_geometric_binary_style3.png")
+        evaluator._save_image(marked_overlay_geometric_binary_style3_img, marked_overlay_geometric_binary_style3_path, "marked geometric overlay binary style3 image")
     
     # Save evaluation results with white pixel counts
     for image_path, patch_results in image_patch_results.items():
@@ -2069,7 +2199,7 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
     if not os.path.exists(evaluation_results_dir):
         print(f"Warning: Evaluation results directory {evaluation_results_dir} does not exist")
         return
-    
+
     # Find all evaluation result files
     eval_files = glob.glob(os.path.join(evaluation_results_dir, '*__evaluation.json'))
     
@@ -2151,7 +2281,7 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
     print(f"F1-Score: {f1_score:.4f}")
     
     # Create confusion matrix visualization
-    cm = np.array([[all_TN, all_FP], [all_FN, all_TP]])
+    cm = np.array([[all_TP, all_FN], [all_FP, all_TN]])
     
     plt.figure(figsize=(8, 6))
     plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
@@ -2169,8 +2299,8 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
     
     # Set labels
     tick_marks = np.arange(2)
-    plt.xticks(tick_marks, ['Normal', 'Defective'], fontsize=12)
-    plt.yticks(tick_marks, ['Normal', 'Defective'], fontsize=12)
+    plt.xticks(tick_marks, ['Defective', 'Normal'], fontsize=12)
+    plt.yticks(tick_marks, ['Defective', 'Normal'], fontsize=12)
     plt.ylabel('True Label', fontsize=12)
     plt.xlabel('Predicted Label', fontsize=12)
     
@@ -2201,16 +2331,6 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
     }
     with open(os.path.join(evaluation_results_dir, "confusion_matrix.json"), "w") as f:
         json.dump(result, f, indent=2)
-
-
-
-
-
-
-
-
-
-
 
 def main():
     REPO_ROOT = os.environ.get("REPO_ROOT", None)

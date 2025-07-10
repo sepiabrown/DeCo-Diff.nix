@@ -144,7 +144,7 @@ def compute_confusion_matrix_with_details(annotation_dir, evaluation_results_dir
         print("No false negatives found!")
     
     # Create confusion matrix visualization
-    cm = np.array([[all_TN, all_FP], [all_FN, all_TP]])
+    cm = np.array([[all_TP, all_FN], [all_FP, all_TN]])
     
     plt.figure(figsize=(10, 8))
     plt.imshow(cm, interpolation='nearest', cmap='Blues')
@@ -162,8 +162,8 @@ def compute_confusion_matrix_with_details(annotation_dir, evaluation_results_dir
     
     # Set labels
     tick_marks = np.arange(2)
-    plt.xticks(tick_marks, ['Normal', 'Defective'], fontsize=12)
-    plt.yticks(tick_marks, ['Normal', 'Defective'], fontsize=12)
+    plt.xticks(tick_marks, ['Defective', 'Normal'], fontsize=12)
+    plt.yticks(tick_marks, ['Defective', 'Normal'], fontsize=12)
     plt.ylabel('True Label', fontsize=12)
     plt.xlabel('Predicted Label', fontsize=12)
     
