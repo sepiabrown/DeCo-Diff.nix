@@ -59,7 +59,7 @@ $LastUpdate = Get-Date
 while (-not $Process.HasExited) {
     # Show elapsed time every 30 seconds
     $CurrentTime = Get-Date
-    if (($CurrentTime - $LastUpdate).TotalSeconds -ge 30) {
+    if (($CurrentTime - $LastUpdate).TotalSeconds -ge 60) {
         Show-ElapsedTime
         $LastUpdate = $CurrentTime
     }

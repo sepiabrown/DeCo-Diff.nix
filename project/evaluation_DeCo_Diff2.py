@@ -63,6 +63,7 @@ import cv2
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
 import re
+import platform
 from utils import path_to_safe_filename
 
 torch.set_grad_enabled(False)
@@ -112,12 +113,24 @@ class BaseEvaluator:
             batch_size = min(batch_size, 1)  # Force batch size of 1 for memory optimization
             print(f"Memory optimization enabled: using batch_size={batch_size}")
         
+        # Windows-friendly DataLoader configuration
+        # Use 0 workers on Windows to avoid multiprocessing issues
+        
+        # Use command line argument if provided, otherwise use platform-specific defaults
+        if hasattr(self.args, 'num_workers') and self.args.num_workers is not None:
+            num_workers = self.args.num_workers
+        elif platform.system() == 'Windows':
+            num_workers = 0  # Single-threaded on Windows to avoid hanging
+        else:
+            num_workers = 2 if hasattr(self.args, 'memory_optimization') and self.args.memory_optimization else 4
+        
         return DataLoader(
             dataset, 
             batch_size=batch_size, 
             shuffle=shuffle, 
-            num_workers=2 if hasattr(self.args, 'memory_optimization') and self.args.memory_optimization else 4, 
-            drop_last=False
+            num_workers=num_workers, 
+            drop_last=False,
+            persistent_workers=False if num_workers == 0 else True
         )
     
     def _create_output_dirs(self):
@@ -727,7 +740,7 @@ def _get_largest_connected_component_pixels(anomaly_binary: torch.Tensor) -> int
     return largest_component_size
 
 
-def _create_contour_based_binary_mask(anomaly_map: torch.Tensor, adaptive_threshold: float = 0.1) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _create_contour_based_binary_mask(anomaly_map: torch.Tensor, adaptive_threshold: float = 0.1, anomaly_binary_threshold: int = 5) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Create three different binary masks based on contours with adaptive selection based on distribution.
     
@@ -736,6 +749,9 @@ def _create_contour_based_binary_mask(anomaly_map: torch.Tensor, adaptive_thresh
         adaptive_threshold: Threshold for adaptive contour selection (default: 0.1)
                           - Lower values select more contours
                           - Higher values select fewer contours
+        anomaly_binary_threshold: Threshold value for binary conversion (0-255, default: 5)
+                                 - Lower values create more white pixels
+                                 - Higher values create fewer white pixels
         
     Returns:
         Tuple of three binary tensors with same shape as input where selected contour pixels are 1, others are 0:
@@ -756,7 +772,7 @@ def _create_contour_based_binary_mask(anomaly_map: torch.Tensor, adaptive_thresh
         for b in range(batch_size):
             # Extract single image from batch
             single_map = anomaly_map[b, 0]  # Shape: (H, W)
-            single_binary_style1, single_binary_style2, single_binary_style3 = _create_contour_based_binary_mask_single(single_map, adaptive_threshold)
+            single_binary_style1, single_binary_style2, single_binary_style3 = _create_contour_based_binary_mask_single(single_map, adaptive_threshold, anomaly_binary_threshold)
             binary_masks_style1.append(single_binary_style1)
             binary_masks_style2.append(single_binary_style2)
             binary_masks_style3.append(single_binary_style3)
@@ -768,16 +784,19 @@ def _create_contour_based_binary_mask(anomaly_map: torch.Tensor, adaptive_thresh
         return style1, style2, style3
     else:
         # Handle single image case
-        return _create_contour_based_binary_mask_single(anomaly_map, adaptive_threshold)
+        return _create_contour_based_binary_mask_single(anomaly_map, adaptive_threshold, anomaly_binary_threshold)
 
 
-def _create_contour_based_binary_mask_single(anomaly_map: torch.Tensor, adaptive_threshold: float = 0.1) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _create_contour_based_binary_mask_single(anomaly_map: torch.Tensor, adaptive_threshold: float = 0.1, anomaly_binary_threshold: int = 5) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Create three different binary masks for a single image based on different contour selection styles.
     
     Args:
         anomaly_map: Anomaly map tensor with shape (H, W) with values in [0, 1]
         adaptive_threshold: Threshold for adaptive contour selection (default: 0.1)
+        anomaly_binary_threshold: Threshold value for binary conversion (0-255, default: 5)
+                                 - Lower values create more white pixels
+                                 - Higher values create fewer white pixels
         
     Returns:
         Tuple of three binary tensors with shape (H, W) where selected contour pixels are 1, others are 0:
@@ -809,8 +828,10 @@ def _create_contour_based_binary_mask_single(anomaly_map: torch.Tensor, adaptive
     map_uint8 = cv2.morphologyEx(map_uint8, cv2.MORPH_OPEN, kernel)   # Remove small noise
     
     # Convert to binary image for contour detection
-    # Use Otsu's method for automatic thresholding
-    _, binary_map = cv2.threshold(map_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    ## Use Otsu's method for automatic thresholding
+    #_, binary_map = cv2.threshold(map_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Use anomaly_binary_threshold instead of Otsu's method
+    _, binary_map = cv2.threshold(map_uint8, anomaly_binary_threshold, 255, cv2.THRESH_BINARY)
     
     # Check if the image is all zeros (no contours possible)
     if np.all(binary_map == 0):
@@ -1081,398 +1102,9 @@ def draw_patch_rectangles_on_image(base_img, patch_results, ground_truth_patches
 
 
 
-
-
 # ---------------------------------------------------------------------------
 # Functions
 # ---------------------------------------------------------------------------
-
-def process_split_irregular(
-    dataloader,
-    split: str,
-    diffusion,
-    model,
-    vae,
-    reverse_steps: int,
-    center_size: int,
-    batch_num: int,
-    device: torch.device = torch.device("cpu"),
-    anomaly_binary_threshold: int = 0,
-    anomaly_pixel_num_threshold: int = 0,
-    adaptive_threshold: float = 0.1,
-    enable_epoch_stats: bool = True,
-) -> tuple[List[Record], defaultdict[str, list[tuple[int, int, bool]]], defaultdict[str, list[tuple[int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]]]:
-    """Run a forward‑&‑reverse pass on irregular images and collect metrics."""
-    # Initialize evaluation metrics
-    metrics = EvaluationMetrics()
-
-    results: List[Record] = []
-    image_patch_results = defaultdict(list)  # Track results per original image
-    image_anomaly_maps = defaultdict(list)  # Track anomaly maps per original image
-    
-    # Memory optimization: Clear cache periodically
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    for idx, (x, seg, object_cls, image_paths, anomaly_classes, patch_coords) in enumerate(
-        tqdm(dataloader, desc=f"{split} split")
-    ):
-        if idx >= batch_num:
-            break
-
-        with torch.no_grad():
-            # -----------------------------------------------------------------
-            # Forward pass through VAE encoder (to latent space)
-            # -----------------------------------------------------------------
-            x = x.to(device)
-            object_cls = object_cls.to(device)
-
-            encoded = vae.encode(x).latent_dist.mean * _LATENT_SCALE
-
-            # -----------------------------------------------------------------
-            # Reverse DDIM sampling conditioned on encoder latents
-            # -----------------------------------------------------------------
-            model_kwargs = {"context": object_cls.unsqueeze(1), "mask": None}
-            
-            latent_samples_list = []
-            for samples in diffusion.ddim_deviation_sample_loop_progressive(
-                model,
-                shape=encoded.shape,
-                noise=encoded,
-                clip_denoised=False,
-                start_t=reverse_steps,
-                model_kwargs=model_kwargs,
-                progress=False,
-                device=device,
-                eta=0.0,
-            ):
-                latent_samples_list.append(samples["sample"])
-            latent_samples_final = latent_samples_list[-1]
-
-            image_samples_list = []
-            for latent_samples in latent_samples_list:
-                image_samples_list.append(
-                    vae.decode(latent_samples / _LATENT_SCALE).sample
-                )
-
-            # -----------------------------------------------------------------
-            # Reconstructions & other intermediate images
-            # -----------------------------------------------------------------
-            image_samples = vae.decode(latent_samples_final / _LATENT_SCALE).sample
-            x0 = vae.decode(encoded / _LATENT_SCALE).sample
-
-            # -----------------------------------------------------------------
-            # Difference / binary maps
-            # -----------------------------------------------------------------
-            orig_dodrecon_diff = _compute_diff_mean(x, image_samples)
-            orig_dodrecon_binary = _binary_mask(orig_dodrecon_diff, anomaly_binary_threshold)
-
-            orig_encodedrecon_diff = _compute_diff_mean(x, x0)
-            orig_encodedrecon_binary = _binary_mask(orig_encodedrecon_diff, anomaly_binary_threshold)
-            
-            encodedrecon_dodrecon_diff_raw = _compute_abs_diff_max(x0, image_samples)
-            encodedrecon_dodrecon_diff = torch.clamp(encodedrecon_dodrecon_diff_raw, 0.0, 0.05) * 20
-
-            encoded_latent_diff_raw = _compute_abs_diff_mean(latent_samples_final,encoded)
-            encoded_latent_diff = torch.clamp(encoded_latent_diff_raw, 0.0, 0.05) * 20
-
-            # Resize encoded_latent_diff to match the spatial dimensions of encodedrecon_dodrecon_diff
-            # For irregular images, we want to use the patch size (128) as the target size
-            patch_size = x.shape[-1]  # Should be 128 for patches
-            encoded_latent_diff_resized = F.interpolate(
-                encoded_latent_diff,
-                size=(patch_size, patch_size),
-                mode="bilinear",
-                align_corners=False,
-            )
-
-            # -----------------------------------------------------------------
-            # Composite anomaly maps
-            # -----------------------------------------------------------------
-            anomaly_map_arithmetic = 0.5 * (
-                encodedrecon_dodrecon_diff + encoded_latent_diff_resized
-            )
-            # Use contour-based binary masks for all three styles
-            anomaly_map_arithmetic_binary_style1, anomaly_map_arithmetic_binary_style2, anomaly_map_arithmetic_binary_style3 = _create_contour_based_binary_mask(anomaly_map_arithmetic, adaptive_threshold=adaptive_threshold)
-            # Use style1 as default for backward compatibility
-            anomaly_map_arithmetic_binary = anomaly_map_arithmetic_binary_style1
-            
-            anomaly_map_geometric = (
-                encodedrecon_dodrecon_diff * encoded_latent_diff_resized
-            )
-            # Use contour-based binary masks for all three styles
-            anomaly_map_geometric_binary_style1, anomaly_map_geometric_binary_style2, anomaly_map_geometric_binary_style3 = _create_contour_based_binary_mask(anomaly_map_geometric, adaptive_threshold=adaptive_threshold)
-            # Use style1 as default for backward compatibility
-            anomaly_map_geometric_binary = anomaly_map_geometric_binary_style1
-
-            # Collect epoch-wise statistics
-            metrics.add_batch_stats(encodedrecon_dodrecon_diff_raw, encoded_latent_diff_raw, anomaly_map_arithmetic, anomaly_map_geometric)
-        # ---------------------------------------------------------------------
-        # Per‑sample aggregation
-        # ---------------------------------------------------------------------
-        batch_size = x.size(0)
-        
-        for b in range(batch_size):
-            # Determine if this patch is defective
-            anomaly_binary = anomaly_map_arithmetic_binary[b]
-            #encoded_latent = encoded_latent_diff[b]
-            #x_original = x[b]
-            #
-            #img_path = image_paths[b]
-            #
-            ## Save anomaly_binary to tmp directory
-            #tmp_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'tmp')
-            #os.makedirs(tmp_dir, exist_ok=True)
-            #
-            ## Convert to numpy and save as image
-            #anomaly_binary_np = _to_numpy(anomaly_binary)
-            #encoded_latent_np = _to_numpy(encoded_latent)
-            #x_original_np = _to_numpy(x_original)
-            #x_original_min = np.min(x_original_np)
-            #x_original_max = np.max(x_original_np)
-            #if len(anomaly_binary_np.shape) == 3 and anomaly_binary_np.shape[0] == 1:
-            #    anomaly_binary_np = anomaly_binary_np[0]  # Remove channel dimension if single channel
-            #    encoded_latent_np = encoded_latent_np[0]
-            #    x_original_np = x_original_np[0]
-            ## Save as PNG image
-            #from PIL import Image
-            #anomaly_img = Image.fromarray((anomaly_binary_np * 255).astype(np.uint8))
-            #anomaly_save_path = os.path.join(tmp_dir, f'anomaly_binary_batch_{b}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
-            #anomaly_img.save(anomaly_save_path)
-            #encoded_latent_img = Image.fromarray((encoded_latent_np * 255).astype(np.uint8))
-            #encoded_latent_save_path = os.path.join(tmp_dir, f'encoded_latent_batch_{b}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
-            #encoded_latent_img.save(encoded_latent_save_path)
-            #x_original_img = Image.fromarray(((x_original_np + 1) / 2 * 255).astype(np.uint8))
-            #x_original_save_path = os.path.join(tmp_dir, f'original_batch_{b}_{x_original_min:.3f}_{x_original_max:.3f}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
-            #x_original_img.save(x_original_save_path)
-            # Use largest connected component instead of total white pixels
-            anomaly_pixels = torch.sum(anomaly_binary).item()
-            #anomaly_pixels = _get_largest_connected_component_pixels(anomaly_binary)
-            is_defective = anomaly_pixels > anomaly_pixel_num_threshold  # Largest connected component size
-            
-            # Store patch result for original image marking
-            # patch_coords[b] is now a tensor [x, y]
-            patch_coord_tensor = patch_coords[b]
-            if isinstance(patch_coord_tensor, torch.Tensor):
-                x_coord = int(patch_coord_tensor[0].item())
-                y_coord = int(patch_coord_tensor[1].item())
-            elif isinstance(patch_coord_tensor, (list, tuple)) and len(patch_coord_tensor) == 2:
-                x_coord, y_coord = patch_coord_tensor
-            else:
-                # Fallback
-                print(f"Warning: unexpected patch_coord format, using default coordinates")
-                x_coord, y_coord = 0, 0
-            
-            # Store (x_coord, y_coord, anomaly_pixels) instead of (x_coord, y_coord, is_defective)
-            image_patch_results[image_paths[b]].append((x_coord, y_coord, anomaly_pixels))
-            
-            # Store anomaly maps for overlay creation (including all three contour styles)
-            anomaly_map_arithmetic_np = _to_numpy(anomaly_map_arithmetic[b])
-            anomaly_map_arithmetic_binary_np = _to_numpy(anomaly_map_arithmetic_binary[b])
-            anomaly_map_arithmetic_binary_style1_np = _to_numpy(anomaly_map_arithmetic_binary_style1[b])
-            anomaly_map_arithmetic_binary_style2_np = _to_numpy(anomaly_map_arithmetic_binary_style2[b])
-            anomaly_map_arithmetic_binary_style3_np = _to_numpy(anomaly_map_arithmetic_binary_style3[b])
-            anomaly_map_geometric_np = _to_numpy(anomaly_map_geometric[b])
-            anomaly_map_geometric_binary_np = _to_numpy(anomaly_map_geometric_binary[b])
-            anomaly_map_geometric_binary_style1_np = _to_numpy(anomaly_map_geometric_binary_style1[b])
-            anomaly_map_geometric_binary_style2_np = _to_numpy(anomaly_map_geometric_binary_style2[b])
-            anomaly_map_geometric_binary_style3_np = _to_numpy(anomaly_map_geometric_binary_style3[b])
-            image_anomaly_maps[image_paths[b]].append((x_coord, y_coord, anomaly_map_arithmetic_np, anomaly_map_arithmetic_binary_np, anomaly_map_arithmetic_binary_style1_np, anomaly_map_arithmetic_binary_style2_np, anomaly_map_arithmetic_binary_style3_np, anomaly_map_geometric_np, anomaly_map_geometric_binary_np, anomaly_map_geometric_binary_style1_np, anomaly_map_geometric_binary_style2_np, anomaly_map_geometric_binary_style3_np))
-            
-            rec = make_record(
-                split=("meta", split),
-                image_path=("meta", image_paths[b]),
-                anomaly_class=("meta", anomaly_classes[b]),
-                patch_coords=("meta", (x_coord, y_coord)),
-                is_defective=("meta", is_defective),
-                orig=("image", _to_numpy(x[b])),
-                dod_recon=("image", _to_numpy(image_samples[b])),
-                encoded_recon=("image", _to_numpy(x0[b])),
-                orig_dodrecon_diff=("image", _to_numpy(orig_dodrecon_diff[b])),
-                orig_dodrecon_binary=("image", _to_numpy(orig_dodrecon_binary[b])),
-                orig_encodedrecon_diff=("image", _to_numpy(orig_encodedrecon_diff[b])),
-                orig_encodedrecon_binary=(
-                    "image",
-                    _to_numpy(orig_encodedrecon_binary[b]),
-                ),
-                encodedrecon_dodrecon_diff=(
-                    "image",
-                    _to_numpy(encodedrecon_dodrecon_diff[b]),
-                ),
-                encoded_latent_diff=("image", _to_numpy(encoded_latent_diff[b])),
-                anomaly_map_arithmetic=("image", _to_numpy(anomaly_map_arithmetic[b])),
-                anomaly_map_geometric=("image", _to_numpy(anomaly_map_geometric[b])),
-                anomaly_map_arithmetic_binary=(
-                    "image",
-                    _to_numpy(anomaly_map_arithmetic_binary[b]),
-                ),
-                anomaly_map_geometric_binary=(
-                    "image",
-                    _to_numpy(anomaly_map_geometric_binary[b]),
-                ),
-                encoded=("image", _to_numpy(encoded[b])),
-            )
-
-            add_metric_fields(rec, device=device)
-            results.append(rec)
-        
-        # Memory optimization: Clear cache every 10 batches
-        if idx % 10 == 0 and idx > 0:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            import gc
-            gc.collect()
-
-    # Print epoch-wise statistics (if enabled)
-    if enable_epoch_stats:
-        metrics.print_epoch_stats()
-    else:
-        print("Skipping epoch statistics (disabled)")
-
-    return results, image_patch_results, image_anomaly_maps
-
-
-def process_split(
-    dataloader,
-    split: str,
-    diffusion,
-    model,
-    vae,
-    reverse_steps: int,
-    center_size: int,
-    batch_num: int,
-    device: torch.device | None = None,
-) -> List[Record]:
-    """Run a forward‑&‑reverse pass on *one* dataset split and collect metrics."""
-
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    results: List[Record] = []
-
-    for idx, (x, seg, object_cls, image_paths, anomaly_classes) in enumerate(  # noqa: B905
-        tqdm(dataloader, desc=f"{split} split")
-    ):
-        if idx >= batch_num:
-            break
-
-        with torch.no_grad():
-            # -----------------------------------------------------------------
-            # Forward pass through VAE encoder (to latent space)
-            # -----------------------------------------------------------------
-            x = x.to(device)
-            object_cls = object_cls.to(device)
-
-            encoded = vae.encode(x).latent_dist.mean * _LATENT_SCALE
-
-            # -----------------------------------------------------------------
-            # Reverse DDIM sampling conditioned on encoder latents
-            # -----------------------------------------------------------------
-            model_kwargs = {"context": object_cls.unsqueeze(1), "mask": None}
-            
-            latent_samples_list = []
-            for samples in diffusion.ddim_deviation_sample_loop_progressive(
-                model,
-                shape=encoded.shape,
-                noise=encoded,
-                clip_denoised=False,
-                start_t=reverse_steps,
-                model_kwargs=model_kwargs,
-                progress=False,
-                device=device,
-                eta=0.0,
-            ):
-                latent_samples_list.append(samples["sample"])
-            latent_samples_final = latent_samples_list[-1]
-
-            image_samples_list = []
-            for latent_samples in latent_samples_list:
-                image_samples_list.append(
-                    vae.decode(latent_samples / _LATENT_SCALE).sample
-                )
-
-            # -----------------------------------------------------------------
-            # Reconstructions & other intermediate images
-            # -----------------------------------------------------------------
-            image_samples = vae.decode(latent_samples_final / _LATENT_SCALE).sample
-            x0 = vae.decode(encoded / _LATENT_SCALE).sample
-
-            # -----------------------------------------------------------------
-            # Difference / binary maps
-            # -----------------------------------------------------------------
-            orig_dodrecon_diff = _compute_diff_mean(x, image_samples)
-            orig_encodedrecon_diff = _compute_diff_mean(x, x0)
-            encodedrecon_dodrecon_diff = _compute_diff_mean(x0, image_samples)
-
-            orig_dodrecon_binary = _binary_mask(orig_dodrecon_diff)
-            orig_encodedrecon_binary = _binary_mask(orig_encodedrecon_diff)
-            encodedrecon_dodrecon_diff = _binary_mask(encodedrecon_dodrecon_diff)
-
-            encoded_latent_diff = (
-                (latent_samples_final - encoded).max(dim=1, keepdim=True).values
-            )
-            encoded_latent_diff = _binary_mask(encoded_latent_diff)
-
-            encoded_latent_abs_diff_resized = F.interpolate(
-                encoded_latent_diff.abs(),
-                size=(center_size, center_size),
-                mode="bilinear",
-                align_corners=False,
-            )
-
-            # -----------------------------------------------------------------
-            # Composite anomaly maps
-            # -----------------------------------------------------------------
-            anomaly_map_arithmetic = 0.5 * (
-                encodedrecon_dodrecon_diff + encoded_latent_abs_diff_resized
-            )
-            anomaly_map_arithmetic_binary = _binary_mask(anomaly_map_arithmetic)
-            anomaly_map_geometric = (
-                encodedrecon_dodrecon_diff * encoded_latent_abs_diff_resized
-            )
-            anomaly_map_geometric_binary = _binary_mask(anomaly_map_geometric)
-
-        # ---------------------------------------------------------------------
-        # Per‑sample aggregation
-        # ---------------------------------------------------------------------
-        batch_size = x.size(0)
-        for b in range(batch_size):
-            rec = make_record(
-                split=("meta", split),
-                image_path=("meta", image_paths[b]),
-                anomaly_class=("meta", anomaly_classes[b]),
-                orig=("image", _to_numpy(x[b])),
-                dod_recon=("image", _to_numpy(image_samples[b])),
-                encoded_recon=("image", _to_numpy(x0[b])),
-                orig_dodrecon_diff=("image", _to_numpy(orig_dodrecon_diff[b])),
-                orig_dodrecon_binary=("image", _to_numpy(orig_dodrecon_binary[b])),
-                orig_encodedrecon_diff=("image", _to_numpy(orig_encodedrecon_diff[b])),
-                orig_encodedrecon_binary=(
-                    "image",
-                    _to_numpy(orig_encodedrecon_binary[b]),
-                ),
-                encodedrecon_dodrecon_diff=(
-                    "image",
-                    _to_numpy(encodedrecon_dodrecon_diff[b]),
-                ),
-                encoded_latent_diff=("image", _to_numpy(encoded_latent_diff[b])),
-                anomaly_map_arithmetic=("image", _to_numpy(anomaly_map_arithmetic[b])),
-                anomaly_map_geometric=("image", _to_numpy(anomaly_map_geometric[b])),
-                anomaly_map_arithmetic_binary=(
-                    "image",
-                    _to_numpy(anomaly_map_arithmetic_binary[b]),
-                ),
-                anomaly_map_geometric_binary=(
-                    "image",
-                    _to_numpy(anomaly_map_geometric_binary[b]),
-                ),
-                encoded=("image", _to_numpy(encoded[b])),
-            )
-
-            add_metric_fields(rec, device=device)
-            results.append(rec)
-
-    return results
-
 
 def evaluation(args):
     if os.path.exists("./models/config.json"):
@@ -1525,18 +1157,7 @@ def evaluation(args):
         diffusion_steps=1000,
     )
 
-    # Check if we're processing annotated images
-    if hasattr(args, 'annotation_dir') and args.annotation_dir:
-        print("Processing images with JSON annotations...")
-        evaluation_annotated_images(args, diffusion, model, vae)
-    # Check if we're processing irregular images
-    elif hasattr(args, 'irregular_images') and args.irregular_images:
-        print("Processing irregular-sized images with patch-based approach...")
-        evaluation_irregular_images(args, diffusion, model, vae)
-    else:
-        print("Processing regular-sized images...")
-        evaluation_regular_images(args, diffusion, model, vae)
-
+    evaluation_annotated_images(args, diffusion, model, vae)
 
 def evaluation_annotated_images(args, diffusion, model, vae):
     """Evaluate images with JSON annotations for defective regions."""
@@ -1557,7 +1178,7 @@ def evaluation_annotated_images(args, diffusion, model, vae):
     patch_center_size = 128
     
     # Create checkpoint manager
-    checkpoint_manager = CheckpointManager(args.results_dir, args.annotation_dir)
+    checkpoint_manager = CheckpointManager(args.results_dir, args.annotation_dir, args.force_rerun)
     
     # Print checkpoint status
     print("=== Checkpoint Status ===")
@@ -1565,7 +1186,7 @@ def evaluation_annotated_images(args, diffusion, model, vae):
     print("========================")
     
     # Process patches with checkpoint functionality
-    records, image_patch_results, image_anomaly_maps = process_split_irregular_with_checkpoint(
+    records, optional_records = process_split_irregular_with_checkpoint(
         loader,
         args.split,
         diffusion,
@@ -1579,14 +1200,18 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         args.anomaly_pixel_num_threshold,
         0.1,  # adaptive_threshold
         args.enable_epoch_stats,  # Pass only the boolean flag
+        args.enable_excel_report,
+        args.enable_save_optional_image_results,
         checkpoint_manager,  # Pass checkpoint manager
     )
     
     # Create Excel report (if enabled)
     if hasattr(args, 'enable_excel_report') and args.enable_excel_report:
         print("Creating Excel report...")
+        # Use optional_records for Excel if available, otherwise use regular records
+        excel_records = optional_records if optional_records else records
         excel_path = make_excel(
-            records=records,
+            records=excel_records,
             image_size=128,
             save_dir=checkpoint_manager.evaluation_results_dir,
             save_filename=f"report_{datetime.now().strftime('%y%m%d_%H%M%S')}"
@@ -1598,192 +1223,6 @@ def evaluation_annotated_images(args, diffusion, model, vae):
     print("==" * 30)
     # Compute confusion matrix and accuracy
     compute_confusion_matrix_and_accuracy(args.annotation_dir, checkpoint_manager.evaluation_results_dir)
-    
-    # Clean up checkpoint files after successful completion
-    checkpoint_manager.cleanup_checkpoint()
-    print("Evaluation completed successfully. Checkpoint files cleaned up.")
-
-
-def evaluation_irregular_images(args, diffusion, model, vae):
-    """Evaluate irregular-sized images by splitting into patches."""
-    transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True
-            ),
-        ]
-    )
-    
-    # Create dataset for irregular images
-    dataset = IrregularImageDataset(
-        data_dir=args.data_dir,
-        patch_size=128,
-        stride=128,  # 50% overlap
-        transform=transform,
-        object_class=args.object_class,
-        anomaly_class=args.anomaly_class,
-        split_csv_path=args.split_csv_path,
-    )
-    
-    loader = DataLoader(
-        dataset, batch_size=1, shuffle=False, num_workers=4, drop_last=False
-    )
-    
-    # For irregular images, use patch size as center_size to ensure consistent dimensions
-    patch_center_size = 128
-    
-    # Process patches
-    _recs, image_patch_results, image_anomaly_maps = process_split_irregular(
-        loader,
-        args.split,
-        diffusion,
-        model,
-        vae,
-        args.reverse_steps,
-        patch_center_size,  # Use patch size instead of args.center_size
-        args.batch_num,
-        device,
-        args.anomaly_binary_threshold,
-        args.anomaly_pixel_num_threshold,
-        0.1,  # adaptive_threshold
-        args.enable_epoch_stats,  # Pass only the boolean flag
-    )
-    
-    # Mark defective regions on original images
-    print("Marking defective regions on original images...")
-    marked_images_dir = os.path.join(args.results_dir, "marked_images")
-    
-    for image_path, patch_results in image_patch_results.items():
-        # Load original image
-        original_img = np.array(PILImage.open(image_path).convert('RGB'))
-        
-        # Mark defective regions
-        marked_img = draw_patch_rectangles_on_image(
-            original_img, patch_results, patch_size=128, stride=128, grid_thickness=1
-        )
-        
-        safe_name = path_to_safe_filename(image_path)
-        # Save marked image
-        marked_path = os.path.join(marked_images_dir, f"{safe_name}_marked.png")
-        PILImage.fromarray(marked_img).save(marked_path)
-        print(f"Saved marked image: {marked_path}")
-    
-    # Save patch analysis results
-    patch_analysis_path = os.path.join(args.results_dir, "patch_analysis.json")
-    patch_analysis = {}
-    for image_path, patch_results in image_patch_results.items():
-        patch_analysis[image_path] = [
-            {"x": x, "y": y, "anomaly_pixels": int(anomaly_pixels), "is_defective": bool(anomaly_pixels > 0)}
-            for x, y, anomaly_pixels in patch_results
-        ]
-    
-    with open(patch_analysis_path, 'w') as f:
-        json.dump(patch_analysis, f, indent=2)
-    
-    print(f"Patch analysis saved to: {patch_analysis_path}")
-    print("==" * 30)
-
-
-def evaluation_regular_images(args, diffusion, model, vae):
-    """Evaluate regular-sized images using the original approach."""
-    for object_class in args.object_classes:
-        transform = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True
-                ),
-            ]
-        )
-        # Dataset-specific arguments
-        dataset_args: dict = dict(
-            split=args.split,
-            object_class=object_class,
-            rootdir=args.data_dir,
-            transform=transform,
-            anomaly_class=args.anomaly_class,
-            image_size=args.image_size,
-            center_size=args.actual_image_size,
-            center_crop=True,
-            split_csv_path=args.split_csv_path,
-        )
-        
-        # Function-specific arguments
-        function_args = dict(
-            process_split_fn=process_split,
-            diffusion=diffusion,
-            model=model,
-            vae=vae,
-            reverse_steps=args.reverse_steps,
-            batch_num=args.batch_num,
-            device=device,
-        )
-        
-        if args.dataset == "pcb":
-            dataset_args["dataset_class"] = PCBDataset
-        elif args.dataset == "mvtec":
-            dataset_args["dataset_class"] = MVTECDataset
-        elif args.dataset == "visa":
-            dataset_args["dataset_class"] = VISADataset
-        else:
-            raise ValueError(f"Invalid dataset: {args.dataset}")
-        if args.perturbation is not None:
-            if args.perturbation == "brightness":
-                param_values = np.arange(-20, 21, 1)
-                all_args = {**dataset_args, **function_args}
-                record_pairs = collect_records_for_params(
-                    param_name="brightness", param_values=param_values, **all_args
-                )
-            if args.perturbation == "shift_x":
-                param_values = np.arange(-20, 21, 1)
-                all_args = {**dataset_args, **function_args}
-                record_pairs = collect_records_for_params(
-                    param_name="shift_x", param_values=param_values, **all_args
-                )
-            if args.perturbation == "shift_y":
-                param_values = np.arange(-20, 21, 1)
-                all_args = {**dataset_args, **function_args}
-                record_pairs = collect_records_for_params(
-                    param_name="shift_y", param_values=param_values, **all_args
-                )
-            if args.perturbation == "noise":
-                param_values = np.arange(0, 21, 1)
-                all_args = {**dataset_args, **function_args}
-                record_pairs = collect_records_for_params(
-                    param_name="noise", param_values=param_values, **all_args
-                )
-            if args.perturbation == "blur":
-                param_values = np.arange(1, 42, 2)
-                all_args = {**dataset_args, **function_args}
-                record_pairs = collect_records_for_params(
-                    param_name="blur", param_values=param_values, **all_args
-                )
-            if args.perturbation == "scratch":
-                param_values = [0]
-                all_args = {**dataset_args, **function_args}
-                record_pairs = collect_records_for_params(
-                    param_name="brightness", param_values=param_values, **all_args
-                )
-            y_true_score_list = compute_y_true_y_score(record_pairs)
-            roc_stats = compute_metrics_from_y_true_y_score(y_true_score_list)
-            save_perturbation_results(
-                param_name=args.perturbation,
-                roc_stats=roc_stats,
-                param_values=param_values.tolist() if isinstance(param_values, np.ndarray) else param_values,
-                save_dir=args.results_dir,
-            )
-
-            plot_accuracy_results(
-                param_name=args.perturbation,
-                param_values=param_values,
-                accuracies=roc_stats["accuracies"],
-                color="red",
-                save_dir=args.results_dir,
-            )
-
-        print("==" * 30)
-
 
 def collect_records_for_params(
     *,
@@ -1824,8 +1263,16 @@ def collect_records_for_params(
         kwargs = common_args.copy()
         kwargs[param_name] = val
         dataset = dataset_class(**kwargs)
+        # Windows-friendly DataLoader configuration
+        import platform
+        if platform.system() == 'Windows':
+            num_workers = 0  # Single-threaded on Windows to avoid hanging
+        else:
+            num_workers = 4
+        
         loader = DataLoader(
-            dataset, batch_size=8, shuffle=False, num_workers=4, drop_last=False
+            dataset, batch_size=8, shuffle=False, num_workers=num_workers, drop_last=False,
+            persistent_workers=False if num_workers == 0 else True
         )
         records = process_split_fn(
             loader,
@@ -1842,7 +1289,8 @@ def collect_records_for_params(
         kwargs["scratch"] = True
         dataset_defect = dataset_class(**kwargs)
         loader_defect = DataLoader(
-            dataset_defect, batch_size=8, shuffle=False, num_workers=4, drop_last=False
+            dataset_defect, batch_size=8, shuffle=False, num_workers=num_workers, drop_last=False,
+            persistent_workers=False if num_workers == 0 else True
         )
         records_defect = process_split_fn(
             loader_defect,
@@ -2001,8 +1449,8 @@ def save_perturbation_results(
         param_values: List of parameter values
         save_dir: Directory to save the results
     """
-    save_dir = Path(save_dir).expanduser()
-    save_dir.mkdir(parents=True, exist_ok=True)
+    save_dir_path = Path(save_dir).expanduser()
+    save_dir_path.mkdir(parents=True, exist_ok=True)
 
     # Convert numpy arrays to lists for JSON serialization
     def convert_for_json(obj):
@@ -2142,7 +1590,7 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
     cm = np.array([[all_TP, all_FN], [all_FP, all_TN]])
     
     plt.figure(figsize=(8, 6))
-    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.imshow(cm, interpolation='nearest', cmap='Blues')
     plt.title('Confusion Matrix (Patch-level)', fontsize=16, fontweight='bold')
     plt.colorbar()
     
@@ -2197,9 +1645,10 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
 class CheckpointManager:
     """Manages checkpoint/resume functionality for evaluation."""
     
-    def __init__(self, results_dir: str, annotation_dir: str = None):
+    def __init__(self, results_dir: str, annotation_dir: str | None = None, force_rerun: bool = False):
         self.results_dir = results_dir
         self.annotation_dir = annotation_dir
+        self.force_rerun = force_rerun
         
         # Extract base name without timestamp for consistent checkpoint location
         base_name = self._extract_base_name(results_dir)
@@ -2209,13 +1658,21 @@ class CheckpointManager:
         os.makedirs(self.base_checkpoint_dir, exist_ok=True)
         
         self.checkpoint_file = os.path.join(self.base_checkpoint_dir, "evaluation_checkpoint.json")
-        self.processed_images_file = os.path.join(self.base_checkpoint_dir, "processed_images.json")
-        
+
         # Create results directories
         self.evaluation_results_dir = os.path.join(results_dir, "evaluation_results")
         self.marked_images_dir = os.path.join(results_dir, "marked_images")
         os.makedirs(self.evaluation_results_dir, exist_ok=True)
         os.makedirs(self.marked_images_dir, exist_ok=True)
+        
+        # Clear checkpoint files if force rerun is enabled
+        if self.force_rerun:
+            self.clear_checkpoint_files()
+            print("Force rerun enabled: Cleared existing checkpoint files")
+        
+        # Cache for processed images to avoid frequent file I/O
+        self._processed_images_cache = None
+        self._cache_timestamp = 0
     
     def _extract_base_name(self, results_dir: str) -> str:
         """Extract base name from timestamped directory."""
@@ -2236,33 +1693,26 @@ class CheckpointManager:
             # If no timestamp pattern found, use the original name
             return dir_name
     
-    def find_latest_checkpoint(self) -> tuple[str, str]:
-        """Find the latest checkpoint files from any timestamped directory."""
-        if os.path.exists(self.checkpoint_file) and os.path.exists(self.processed_images_file):
-            return self.checkpoint_file, self.processed_images_file
+    def find_latest_checkpoint(self) -> str:
+        """Find the latest checkpoint file from the specific checkpoint directory."""
+        if os.path.exists(self.checkpoint_file):
+            return self.checkpoint_file
         
-        # Search for checkpoint files in parent directory
-        parent_dir = os.path.dirname(self.base_checkpoint_dir)
-        checkpoint_pattern = os.path.join(parent_dir, "*_checkpoints", "evaluation_checkpoint.json")
-        processed_pattern = os.path.join(parent_dir, "*_checkpoints", "processed_images.json")
+        # Look for checkpoint in the specific directory based on base name
+        # e.g., if results_dir is "test_250711_162955", look for "test_checkpoints"
+        base_name = self._extract_base_name(self.results_dir)
+        specific_checkpoint_dir = os.path.join(os.path.dirname(self.results_dir), f"{base_name}_checkpoints")
+        specific_checkpoint_file = os.path.join(specific_checkpoint_dir, "evaluation_checkpoint.json")
         
-        import glob
-        checkpoint_files = glob.glob(checkpoint_pattern)
-        processed_files = glob.glob(processed_pattern)
+        if os.path.exists(specific_checkpoint_file):
+            print(f"Found existing checkpoint: {specific_checkpoint_file}")
+            return specific_checkpoint_file
         
-        if checkpoint_files and processed_files:
-            # Use the most recent checkpoint (by file modification time)
-            latest_checkpoint = max(checkpoint_files, key=os.path.getmtime)
-            latest_processed = max(processed_files, key=os.path.getmtime)
-            
-            print(f"Found existing checkpoint: {latest_checkpoint}")
-            return latest_checkpoint, latest_processed
-        
-        return self.checkpoint_file, self.processed_images_file
+        return self.checkpoint_file
     
     def get_checkpoint_data(self) -> dict:
         """Load checkpoint data if it exists."""
-        checkpoint_file, _ = self.find_latest_checkpoint()
+        checkpoint_file = self.find_latest_checkpoint()
         if os.path.exists(checkpoint_file):
             try:
                 with open(checkpoint_file, 'r') as f:
@@ -2271,40 +1721,96 @@ class CheckpointManager:
                 pass
         return {"current_image_index": 0, "processed_images": []}
     
+    def _get_processed_images_with_cache(self) -> set:
+        """Get processed images with caching to avoid frequent file I/O."""
+        # Check if cache is valid (file hasn't been modified since last cache)
+        checkpoint_file = self.find_latest_checkpoint()
+        if os.path.exists(checkpoint_file):
+            current_timestamp = os.path.getmtime(checkpoint_file)
+            if (self._processed_images_cache is not None and 
+                self._cache_timestamp == current_timestamp):
+                return self._processed_images_cache
+        
+        # Load from file and update cache
+        checkpoint_data = self.get_checkpoint_data()
+        processed_images = set(checkpoint_data.get("processed_images", []))
+        
+        # Update cache
+        self._processed_images_cache = processed_images
+        self._cache_timestamp = current_timestamp if os.path.exists(checkpoint_file) else 0
+        
+        return processed_images
+    
     def save_checkpoint(self, current_image_index: int, processed_images: list):
         """Save current progress to checkpoint file."""
+        # Get existing checkpoint data to preserve processed_images
+        existing_data = self.get_checkpoint_data()
+        
+        # Merge processed images from both sources (optimized)
+        existing_processed = set(existing_data.get("processed_images", []))
+        new_processed = set(processed_images)
+        
+        # Only merge if there are actually new images to add
+        if new_processed - existing_processed:
+            merged_processed = list(existing_processed.union(new_processed))
+        else:
+            merged_processed = list(existing_processed)
+        
+        # Sort for consistent, predictable order (only when writing to file)
+        merged_processed.sort()
+        
         checkpoint_data = {
             "current_image_index": current_image_index,
-            "processed_images": processed_images,
+            "processed_images": merged_processed,
             "timestamp": datetime.now().isoformat()
         }
+        
         with open(self.checkpoint_file, 'w') as f:
             json.dump(checkpoint_data, f, indent=2)
+        
+        # Invalidate cache since we just wrote to the file
+        self._processed_images_cache = None
     
     def get_processed_images(self) -> set:
-        """Get set of already processed images."""
-        _, processed_images_file = self.find_latest_checkpoint()
-        if os.path.exists(processed_images_file):
-            try:
-                with open(processed_images_file, 'r') as f:
-                    return set(json.load(f))
-            except (json.JSONDecodeError, FileNotFoundError):
-                pass
-        return set()
+        """Get set of already processed images from checkpoint file."""
+        return self._get_processed_images_with_cache()
     
     def mark_image_processed(self, image_path: str):
-        """Mark an image as processed."""
-        processed_images = self.get_processed_images()
-        processed_images.add(image_path)
-        with open(self.processed_images_file, 'w') as f:
-            json.dump(list(processed_images), f, indent=2)
+        """Mark an image as processed by updating the checkpoint file."""
+        # Use cache to avoid reading file again
+        processed_images = self._get_processed_images_with_cache()
+        
+        # Only update if image is not already processed
+        if image_path not in processed_images:
+            processed_images.add(image_path)
+            
+            # Get current checkpoint data
+            checkpoint_data = self.get_checkpoint_data()
+            # Sort for consistent, predictable order (only when writing to file)
+            checkpoint_data["processed_images"] = sorted(processed_images)
+            checkpoint_data["timestamp"] = datetime.now().isoformat()
+            
+            with open(self.checkpoint_file, 'w') as f:
+                json.dump(checkpoint_data, f, indent=2)
+            
+            # Update cache
+            self._processed_images_cache = processed_images
+            self._cache_timestamp = os.path.getmtime(self.checkpoint_file)
     
     def is_image_processed(self, image_path: str) -> bool:
         """Check if an image has been fully processed."""
+        # If force rerun is enabled, no image is considered processed
+        if self.force_rerun:
+            return False
         return image_path in self.get_processed_images()
     
     def get_resume_info(self, all_image_paths: list) -> tuple[int, list]:
         """Get resume information for evaluation."""
+        # If force rerun is enabled, start from the beginning
+        if self.force_rerun:
+            print("Force rerun enabled: Starting from the beginning")
+            return 0, []
+        
         checkpoint_data = self.get_checkpoint_data()
         processed_images = self.get_processed_images()
         
@@ -2318,14 +1824,12 @@ class CheckpointManager:
             # All images processed
             current_index = len(all_image_paths)
         
-        return current_index, list(processed_images)
+        return current_index, sorted(processed_images)
     
     def cleanup_checkpoint(self):
         """Clean up checkpoint files after successful completion."""
         if os.path.exists(self.checkpoint_file):
             os.remove(self.checkpoint_file)
-        if os.path.exists(self.processed_images_file):
-            os.remove(self.processed_images_file)
         
         # Also clean up the checkpoint directory if it's empty
         try:
@@ -2334,13 +1838,50 @@ class CheckpointManager:
         except OSError:
             pass  # Directory not empty or already removed
 
+    def clear_checkpoint_files(self):
+        """Clear all checkpoint files to force a fresh start."""
+        if os.path.exists(self.checkpoint_file):
+            os.remove(self.checkpoint_file)
+            print(f"Removed checkpoint file: {self.checkpoint_file}")
+        
+        # Clear cache
+        self._processed_images_cache = None
+        self._cache_timestamp = 0
+    
+    def batch_mark_images_processed(self, image_paths: list):
+        """Mark multiple images as processed in a single operation for better performance."""
+        if not image_paths:
+            return
+        
+        # Use cache to avoid reading file again
+        processed_images = self._get_processed_images_with_cache()
+        
+        # Find new images to add
+        new_images = [img for img in image_paths if img not in processed_images]
+        
+        if new_images:
+            # Add new images
+            processed_images.update(new_images)
+            
+            # Get current checkpoint data
+            checkpoint_data = self.get_checkpoint_data()
+            # Sort for consistent, predictable order (only when writing to file)
+            checkpoint_data["processed_images"] = sorted(processed_images)
+            checkpoint_data["timestamp"] = datetime.now().isoformat()
+            
+            with open(self.checkpoint_file, 'w') as f:
+                json.dump(checkpoint_data, f, indent=2)
+            
+            # Update cache
+            self._processed_images_cache = processed_images
+            self._cache_timestamp = os.path.getmtime(self.checkpoint_file)
+    
     def print_checkpoint_status(self):
         """Print current checkpoint status for debugging."""
-        checkpoint_file, processed_file = self.find_latest_checkpoint()
+        checkpoint_file = self.find_latest_checkpoint()
         
         print(f"Checkpoint directory: {self.base_checkpoint_dir}")
         print(f"Current checkpoint file: {checkpoint_file}")
-        print(f"Current processed file: {processed_file}")
         
         if os.path.exists(checkpoint_file):
             try:
@@ -2348,116 +1889,137 @@ class CheckpointManager:
                     data = json.load(f)
                     print(f"Checkpoint timestamp: {data.get('timestamp', 'unknown')}")
                     print(f"Current image index: {data.get('current_image_index', 0)}")
-                    print(f"Processed images: {len(data.get('processed_images', []))}")
+                    print(f"Processed images count: {len(data.get('processed_images', []))}")
+                    if data.get('processed_images'):
+                        print(f"Last processed: {data['processed_images'][-1]}")
             except Exception as e:
                 print(f"Error reading checkpoint: {e}")
         else:
             print("No checkpoint file found")
-        
-        if os.path.exists(processed_file):
-            try:
-                with open(processed_file, 'r') as f:
-                    processed_images = json.load(f)
-                    print(f"Processed images count: {len(processed_images)}")
-                    if processed_images:
-                        print(f"Last processed: {processed_images[-1]}")
-            except Exception as e:
-                print(f"Error reading processed images: {e}")
-        else:
-            print("No processed images file found")
 
 
-def save_image_results(checkpoint_manager: CheckpointManager, image_path: str, 
-                      patch_results: list, image_anomaly_maps: list, 
-                      ground_truth_patches: list = None):
-    """Save all results for a single image immediately."""
+def save_image_results_from_records(checkpoint_manager: CheckpointManager, image_path: str, 
+                                  patch_results: list, image_records: list, 
+                                  ground_truth_patches: list | None = None,
+                                  enable_save_optional_image_results: bool = False):
+    """Save all results for a single image immediately using records."""
     safe_name = path_to_safe_filename(image_path)
     
     # Load original image
     original_img = np.array(PILImage.open(image_path).convert('RGB'))
     h, w, _ = original_img.shape
     
-    # Save marked image
+    # Save marked image (always saved)
     marked_img = draw_patch_rectangles_on_image(
         original_img, patch_results, ground_truth_patches or [], patch_size=128, stride=128, grid_thickness=1
     )
     marked_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__marked.png")
     PILImage.fromarray(marked_img).save(marked_path)
     
-    # Reconstruct full anomaly maps
-    full_anomaly_map_arithmetic = np.zeros((h, w), dtype=np.float32)
-    full_anomaly_map_arithmetic_binary = np.zeros((h, w), dtype=np.float32)
-    full_anomaly_map_arithmetic_binary_style1 = np.zeros((h, w), dtype=np.float32)
-    full_anomaly_map_arithmetic_binary_style2 = np.zeros((h, w), dtype=np.float32)
-    full_anomaly_map_arithmetic_binary_style3 = np.zeros((h, w), dtype=np.float32)
-    full_anomaly_map_geometric = np.zeros((h, w), dtype=np.float32)
-    full_anomaly_map_geometric_binary = np.zeros((h, w), dtype=np.float32)
-    full_anomaly_map_geometric_binary_style1 = np.zeros((h, w), dtype=np.float32)
-    full_anomaly_map_geometric_binary_style2 = np.zeros((h, w), dtype=np.float32)
-    full_anomaly_map_geometric_binary_style3 = np.zeros((h, w), dtype=np.float32)
+    # Initialize anomaly maps based on flag
+    anomaly_maps = {
+        'required': {
+            'arithmetic': np.zeros((h, w), dtype=np.float32),
+            'arithmetic_binary': np.zeros((h, w), dtype=np.float32),
+            'geometric': np.zeros((h, w), dtype=np.float32),
+            'geometric_binary': np.zeros((h, w), dtype=np.float32),
+        }
+    }
     
-    for x, y, patch_map_arithmetic, patch_map_arithmetic_binary, patch_map_arithmetic_binary_style1, patch_map_arithmetic_binary_style2, patch_map_arithmetic_binary_style3, patch_map_geometric, patch_map_geometric_binary, patch_map_geometric_binary_style1, patch_map_geometric_binary_style2, patch_map_geometric_binary_style3 in image_anomaly_maps:
+    # Initialize optional maps only when flag is enabled
+    if enable_save_optional_image_results:
+        anomaly_maps['optional'] = {
+            'arithmetic_binary_style1': np.zeros((h, w), dtype=np.float32),
+            'arithmetic_binary_style2': np.zeros((h, w), dtype=np.float32),
+            'arithmetic_binary_style3': np.zeros((h, w), dtype=np.float32),
+            'geometric_binary_style1': np.zeros((h, w), dtype=np.float32),
+            'geometric_binary_style2': np.zeros((h, w), dtype=np.float32),
+            'geometric_binary_style3': np.zeros((h, w), dtype=np.float32),
+        }
+    
+    for record in image_records:
+        # Extract coordinates from record
+        x_coord, y_coord = record["patch_coords"][1]
+        
         # Calculate actual patch dimensions for this position
-        patch_width = min(128, w - x)
-        patch_height = min(128, h - y)
+        patch_width = min(128, w - x_coord)
+        patch_height = min(128, h - y_coord)
         
-        # Extract the actual patch region (may be smaller than 128x128 for edge patches)
-        patch_arithmetic = patch_map_arithmetic.squeeze()[:patch_height, :patch_width]
-        patch_arithmetic_binary = patch_map_arithmetic_binary.squeeze()[:patch_height, :patch_width]
-        patch_arithmetic_binary_style1 = patch_map_arithmetic_binary_style1.squeeze()[:patch_height, :patch_width]
-        patch_arithmetic_binary_style2 = patch_map_arithmetic_binary_style2.squeeze()[:patch_height, :patch_width]
-        patch_arithmetic_binary_style3 = patch_map_arithmetic_binary_style3.squeeze()[:patch_height, :patch_width]
-        patch_geometric = patch_map_geometric.squeeze()[:patch_height, :patch_width]
-        patch_geometric_binary = patch_map_geometric_binary.squeeze()[:patch_height, :patch_width]
-        patch_geometric_binary_style1 = patch_map_geometric_binary_style1.squeeze()[:patch_height, :patch_width]
-        patch_geometric_binary_style2 = patch_map_geometric_binary_style2.squeeze()[:patch_height, :patch_width]
-        patch_geometric_binary_style3 = patch_map_geometric_binary_style3.squeeze()[:patch_height, :patch_width]
+        # Extract required anomaly maps from record
+        patch_arithmetic = record["anomaly_map_arithmetic"][1]
+        patch_arithmetic_binary = record["anomaly_map_arithmetic_binary"][1]
+        patch_geometric = record["anomaly_map_geometric"][1]
+        patch_geometric_binary = record["anomaly_map_geometric_binary"][1]
         
-        # Assign to the correct region in the full anomaly map
-        full_anomaly_map_arithmetic[y:y+patch_height, x:x+patch_width] = patch_arithmetic
-        full_anomaly_map_arithmetic_binary[y:y+patch_height, x:x+patch_width] = patch_arithmetic_binary
-        full_anomaly_map_arithmetic_binary_style1[y:y+patch_height, x:x+patch_width] = patch_arithmetic_binary_style1
-        full_anomaly_map_arithmetic_binary_style2[y:y+patch_height, x:x+patch_width] = patch_arithmetic_binary_style2
-        full_anomaly_map_arithmetic_binary_style3[y:y+patch_height, x:x+patch_width] = patch_arithmetic_binary_style3
-        full_anomaly_map_geometric[y:y+patch_height, x:x+patch_width] = patch_geometric
-        full_anomaly_map_geometric_binary[y:y+patch_height, x:x+patch_width] = patch_geometric_binary
-        full_anomaly_map_geometric_binary_style1[y:y+patch_height, x:x+patch_width] = patch_geometric_binary_style1
-        full_anomaly_map_geometric_binary_style2[y:y+patch_height, x:x+patch_width] = patch_geometric_binary_style2
-        full_anomaly_map_geometric_binary_style3[y:y+patch_height, x:x+patch_width] = patch_geometric_binary_style3
+        # Extract patch regions
+        patch_regions = {
+            'arithmetic': patch_arithmetic.squeeze()[:patch_height, :patch_width],
+            'arithmetic_binary': patch_arithmetic_binary.squeeze()[:patch_height, :patch_width],
+            'geometric': patch_geometric.squeeze()[:patch_height, :patch_width],
+            'geometric_binary': patch_geometric_binary.squeeze()[:patch_height, :patch_width],
+        }
+        
+        # Extract optional patch regions if flag is enabled
+        if enable_save_optional_image_results:
+            # Use default binary maps as fallback for style fields
+            patch_regions.update({
+                'arithmetic_binary_style1': record.get("anomaly_map_arithmetic_binary_style1", [None, patch_arithmetic_binary])[1].squeeze()[:patch_height, :patch_width],
+                'arithmetic_binary_style2': record.get("anomaly_map_arithmetic_binary_style2", [None, patch_arithmetic_binary])[1].squeeze()[:patch_height, :patch_width],
+                'arithmetic_binary_style3': record.get("anomaly_map_arithmetic_binary_style3", [None, patch_arithmetic_binary])[1].squeeze()[:patch_height, :patch_width],
+                'geometric_binary_style1': record.get("anomaly_map_geometric_binary_style1", [None, patch_geometric_binary])[1].squeeze()[:patch_height, :patch_width],
+                'geometric_binary_style2': record.get("anomaly_map_geometric_binary_style2", [None, patch_geometric_binary])[1].squeeze()[:patch_height, :patch_width],
+                'geometric_binary_style3': record.get("anomaly_map_geometric_binary_style3", [None, patch_geometric_binary])[1].squeeze()[:patch_height, :patch_width],
+            })
+        
+        # Assign required regions to anomaly maps
+        for map_name, region in patch_regions.items():
+            if map_name in anomaly_maps['required']:
+                anomaly_maps['required'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] = region
+            elif enable_save_optional_image_results and map_name in anomaly_maps['optional']:
+                anomaly_maps['optional'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] = region
     
-    # Save all anomaly map images
-    anomaly_images = [
-        (full_anomaly_map_arithmetic, "am_ar", False),
-        (full_anomaly_map_arithmetic_binary, "am_ar_bin", True),
-        (full_anomaly_map_arithmetic_binary_style1, "am_ar_bin_st1", True),
-        (full_anomaly_map_arithmetic_binary_style2, "am_ar_bin_st2", True),
-        (full_anomaly_map_arithmetic_binary_style3, "am_ar_bin_st3", True),
-        (full_anomaly_map_geometric, "am_ge", False),
-        (full_anomaly_map_geometric_binary, "am_ge_bin", True),
-        (full_anomaly_map_geometric_binary_style1, "am_ge_bin_st1", True),
-        (full_anomaly_map_geometric_binary_style2, "am_ge_bin_st2", True),
-        (full_anomaly_map_geometric_binary_style3, "am_ge_bin_st3", True),
-    ]
+    # Define image configurations
+    image_configs = {
+        'required': [
+            (anomaly_maps['required']['arithmetic'], "am_ar", False),
+            (anomaly_maps['required']['arithmetic_binary'], "am_ar_bin", True),
+            (anomaly_maps['required']['geometric'], "am_ge", False),
+            (anomaly_maps['required']['geometric_binary'], "am_ge_bin", True),
+        ]
+    }
     
-    for anomaly_map, suffix, is_binary in anomaly_images:
-        # Save anomaly map image
-        anomaly_map_img = ImageProcessor.create_anomaly_map_image(
-            anomaly_map, patch_size=128, add_grid=True, 
-            patch_results=patch_results, ground_truth_patches=ground_truth_patches or [], 
-            is_binary=is_binary
-        )
-        anomaly_map_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__{suffix}.png")
-        PILImage.fromarray(anomaly_map_img).save(anomaly_map_path)
-        
-        # Save overlay image
-        overlay_img = ImageProcessor.create_anomaly_overlay(original_img, anomaly_map, alpha=0.8, is_binary=is_binary)
-        overlay_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__ao_{suffix}.png")
-        PILImage.fromarray(overlay_img).save(overlay_path)
-        
-        # Save marked overlay image
-        marked_overlay_img = draw_patch_rectangles_on_image(overlay_img, patch_results, ground_truth_patches or [], patch_size=128, stride=128, grid_thickness=1)
-        marked_overlay_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__mo_{suffix}.png")
-        PILImage.fromarray(marked_overlay_img).save(marked_overlay_path)
+    # Add optional configurations if flag is enabled
+    if enable_save_optional_image_results:
+        image_configs['optional'] = [
+            (anomaly_maps['optional']['arithmetic_binary_style1'], "am_ar_bin_st1", True),
+            (anomaly_maps['optional']['arithmetic_binary_style2'], "am_ar_bin_st2", True),
+            (anomaly_maps['optional']['arithmetic_binary_style3'], "am_ar_bin_st3", True),
+            (anomaly_maps['optional']['geometric_binary_style1'], "am_ge_bin_st1", True),
+            (anomaly_maps['optional']['geometric_binary_style2'], "am_ge_bin_st2", True),
+            (anomaly_maps['optional']['geometric_binary_style3'], "am_ge_bin_st3", True),
+        ]
+    
+    # Save all configured images
+    for _config_type, configs in image_configs.items():
+        for anomaly_map, suffix, is_binary in configs:
+            # Save anomaly map image
+            anomaly_map_img = ImageProcessor.create_anomaly_map_image(
+                anomaly_map, patch_size=128, add_grid=True, 
+                patch_results=patch_results, ground_truth_patches=ground_truth_patches or [], 
+                is_binary=is_binary
+            )
+            anomaly_map_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__{suffix}.png")
+            PILImage.fromarray(anomaly_map_img).save(anomaly_map_path)
+            
+            # Save overlay image
+            overlay_img = ImageProcessor.create_anomaly_overlay(original_img, anomaly_map, alpha=0.8, is_binary=is_binary)
+            overlay_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__ao_{suffix}.png")
+            PILImage.fromarray(overlay_img).save(overlay_path)
+            
+            # Save marked overlay image
+            marked_overlay_img = draw_patch_rectangles_on_image(overlay_img, patch_results, ground_truth_patches or [], patch_size=128, stride=128, grid_thickness=1)
+            marked_overlay_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__mo_{suffix}.png")
+            PILImage.fromarray(marked_overlay_img).save(marked_overlay_path)
     
     # Save evaluation results
     patch_analysis = []
@@ -2497,16 +2059,18 @@ def process_split_irregular_with_checkpoint(
     anomaly_binary_threshold: int = 0,
     anomaly_pixel_num_threshold: int = 0,
     adaptive_threshold: float = 0.1,
-    enable_epoch_stats: bool = True,
-    checkpoint_manager: CheckpointManager = None,
-) -> tuple[List[Record], defaultdict[str, list[tuple[int, int, bool]]], defaultdict[str, list[tuple[int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]]]:
+    enable_epoch_stats: bool = False,
+    enable_excel_report: bool = False,
+    enable_save_optional_image_results: bool = False,
+    checkpoint_manager: CheckpointManager | None = None,
+) -> tuple[List[Record], List[Record]]:
     """Run evaluation with checkpoint/resume functionality."""
     # Initialize evaluation metrics
-    metrics = EvaluationMetrics()
+    if enable_epoch_stats:
+        metrics = EvaluationMetrics()
 
     results: List[Record] = []
-    image_patch_results = defaultdict(list)  # Track results per original image
-    image_anomaly_maps = defaultdict(list)  # Track anomaly maps per original image
+    optional_results: List[Record] = []  # Store optional results separately
     
     # Get all unique image paths for checkpoint management
     all_image_paths = list(set([item[3] for item in dataloader.dataset]))
@@ -2527,7 +2091,8 @@ def process_split_irregular_with_checkpoint(
 
     current_image_path = None
     current_image_patches = []
-    current_image_anomaly_maps = []
+    current_image_records = []  # Store records for current image
+    skip_current_image = False  # Flag to skip processing for current image
     
     try:
         for idx, (x, seg, object_cls, image_paths, anomaly_classes, patch_coords) in enumerate(
@@ -2544,36 +2109,45 @@ def process_split_irregular_with_checkpoint(
                         # Load ground truth annotations for this image
                         ground_truth_patches = None
                         annotation_filename = f"{path_to_safe_filename(current_image_path)}__annotations.json"
-                        annotation_path = os.path.join(checkpoint_manager.annotation_dir, annotation_filename)
+                        if checkpoint_manager.annotation_dir:
+                            annotation_path = os.path.join(checkpoint_manager.annotation_dir, annotation_filename)
+                        else:
+                            annotation_path = None
                         
-                        if os.path.exists(annotation_path):
+                        if annotation_path and os.path.exists(annotation_path):
                             with open(annotation_path, 'r') as f:
                                 annotation = json.load(f)
                                 ground_truth_patches = annotation.get("defective_patches", [])
                         
-                        # Save all results for this image
-                        save_image_results(
+                        # Save all results for this image using records
+                        save_image_results_from_records(
                             checkpoint_manager, 
                             current_image_path, 
                             current_image_patches, 
-                            current_image_anomaly_maps, 
-                            ground_truth_patches or []
+                            current_image_records, 
+                            ground_truth_patches or [],
+                            enable_save_optional_image_results
                         )
                         
-                        # Mark as processed
+                        # Mark as processed (will be batched for better performance)
                         checkpoint_manager.mark_image_processed(current_image_path)
-                        processed_images.append(current_image_path)
                 
                 # Start new image
                 current_image_path = image_paths[0]
                 current_image_patches = []
-                current_image_anomaly_maps = []
+                current_image_records = []
                 
-                # Skip if already processed
+                # Check if this image should be skipped
                 if checkpoint_manager and checkpoint_manager.is_image_processed(current_image_path):
-                    print(f"Skipping already processed image: {current_image_path}")
-                    continue
+                    print(f"\nSkipping already processed image: {current_image_path}")
+                    skip_current_image = True
+                else:
+                    skip_current_image = False
 
+            # Skip processing if current image should be skipped
+            if skip_current_image:
+                continue
+                
             with torch.no_grad():
                 # -----------------------------------------------------------------
                 # Forward pass through VAE encoder (to latent space)
@@ -2647,7 +2221,7 @@ def process_split_irregular_with_checkpoint(
                     encodedrecon_dodrecon_diff + encoded_latent_diff_resized
                 )
                 # Use contour-based binary masks for all three styles
-                anomaly_map_arithmetic_binary_style1, anomaly_map_arithmetic_binary_style2, anomaly_map_arithmetic_binary_style3 = _create_contour_based_binary_mask(anomaly_map_arithmetic, adaptive_threshold=adaptive_threshold)
+                anomaly_map_arithmetic_binary_style1, anomaly_map_arithmetic_binary_style2, anomaly_map_arithmetic_binary_style3 = _create_contour_based_binary_mask(anomaly_map_arithmetic, adaptive_threshold=adaptive_threshold, anomaly_binary_threshold=anomaly_binary_threshold)
                 # Use style1 as default for backward compatibility
                 anomaly_map_arithmetic_binary = anomaly_map_arithmetic_binary_style1
                 
@@ -2655,12 +2229,13 @@ def process_split_irregular_with_checkpoint(
                     encodedrecon_dodrecon_diff * encoded_latent_diff_resized
                 )
                 # Use contour-based binary masks for all three styles
-                anomaly_map_geometric_binary_style1, anomaly_map_geometric_binary_style2, anomaly_map_geometric_binary_style3 = _create_contour_based_binary_mask(anomaly_map_geometric, adaptive_threshold=adaptive_threshold)
+                anomaly_map_geometric_binary_style1, anomaly_map_geometric_binary_style2, anomaly_map_geometric_binary_style3 = _create_contour_based_binary_mask(anomaly_map_geometric, adaptive_threshold=adaptive_threshold, anomaly_binary_threshold=anomaly_binary_threshold)
                 # Use style1 as default for backward compatibility
                 anomaly_map_geometric_binary = anomaly_map_geometric_binary_style1
 
                 # Collect epoch-wise statistics
-                metrics.add_batch_stats(encodedrecon_dodrecon_diff_raw, encoded_latent_diff_raw, anomaly_map_arithmetic, anomaly_map_geometric)
+                if enable_epoch_stats:
+                    metrics.add_batch_stats(encodedrecon_dodrecon_diff_raw, encoded_latent_diff_raw, anomaly_map_arithmetic, anomaly_map_geometric)
             
             # ---------------------------------------------------------------------
             # Per‑sample aggregation
@@ -2670,9 +2245,8 @@ def process_split_irregular_with_checkpoint(
             for b in range(batch_size):
                 # Determine if this patch is defective
                 anomaly_binary = anomaly_map_arithmetic_binary[b]
-                # Use largest connected component instead of total white pixels
                 anomaly_pixels = torch.sum(anomaly_binary).item()
-                is_defective = anomaly_pixels > anomaly_pixel_num_threshold  # Largest connected component size
+                is_defective = anomaly_pixels > anomaly_pixel_num_threshold
                 
                 # Store patch result for original image marking
                 # patch_coords[b] is now a tensor [x, y]
@@ -2687,25 +2261,11 @@ def process_split_irregular_with_checkpoint(
                     print(f"Warning: unexpected patch_coord format, using default coordinates")
                     x_coord, y_coord = 0, 0
                 
-                # Store (x_coord, y_coord, anomaly_pixels) instead of (x_coord, y_coord, is_defective)
-                image_patch_results[image_paths[b]].append((x_coord, y_coord, anomaly_pixels))
+                # Store (x_coord, y_coord, anomaly_pixels) for current image
                 current_image_patches.append((x_coord, y_coord, anomaly_pixels))
                 
-                # Store anomaly maps for overlay creation (including all three contour styles)
-                anomaly_map_arithmetic_np = _to_numpy(anomaly_map_arithmetic[b])
-                anomaly_map_arithmetic_binary_np = _to_numpy(anomaly_map_arithmetic_binary[b])
-                anomaly_map_arithmetic_binary_style1_np = _to_numpy(anomaly_map_arithmetic_binary_style1[b])
-                anomaly_map_arithmetic_binary_style2_np = _to_numpy(anomaly_map_arithmetic_binary_style2[b])
-                anomaly_map_arithmetic_binary_style3_np = _to_numpy(anomaly_map_arithmetic_binary_style3[b])
-                anomaly_map_geometric_np = _to_numpy(anomaly_map_geometric[b])
-                anomaly_map_geometric_binary_np = _to_numpy(anomaly_map_geometric_binary[b])
-                anomaly_map_geometric_binary_style1_np = _to_numpy(anomaly_map_geometric_binary_style1[b])
-                anomaly_map_geometric_binary_style2_np = _to_numpy(anomaly_map_geometric_binary_style2[b])
-                anomaly_map_geometric_binary_style3_np = _to_numpy(anomaly_map_geometric_binary_style3[b])
-                image_anomaly_maps[image_paths[b]].append((x_coord, y_coord, anomaly_map_arithmetic_np, anomaly_map_arithmetic_binary_np, anomaly_map_arithmetic_binary_style1_np, anomaly_map_arithmetic_binary_style2_np, anomaly_map_arithmetic_binary_style3_np, anomaly_map_geometric_np, anomaly_map_geometric_binary_np, anomaly_map_geometric_binary_style1_np, anomaly_map_geometric_binary_style2_np, anomaly_map_geometric_binary_style3_np))
-                current_image_anomaly_maps.append((x_coord, y_coord, anomaly_map_arithmetic_np, anomaly_map_arithmetic_binary_np, anomaly_map_arithmetic_binary_style1_np, anomaly_map_arithmetic_binary_style2_np, anomaly_map_arithmetic_binary_style3_np, anomaly_map_geometric_np, anomaly_map_geometric_binary_np, anomaly_map_geometric_binary_style1_np, anomaly_map_geometric_binary_style2_np, anomaly_map_geometric_binary_style3_np))
-                
-                rec = make_record(
+                # Create required record (always included)
+                required_rec = make_record(
                     split=("meta", split),
                     image_path=("meta", image_paths[b]),
                     anomaly_class=("meta", anomaly_classes[b]),
@@ -2714,18 +2274,6 @@ def process_split_irregular_with_checkpoint(
                     orig=("image", _to_numpy(x[b])),
                     dod_recon=("image", _to_numpy(image_samples[b])),
                     encoded_recon=("image", _to_numpy(x0[b])),
-                    orig_dodrecon_diff=("image", _to_numpy(orig_dodrecon_diff[b])),
-                    orig_dodrecon_binary=("image", _to_numpy(orig_dodrecon_binary[b])),
-                    orig_encodedrecon_diff=("image", _to_numpy(orig_encodedrecon_diff[b])),
-                    orig_encodedrecon_binary=(
-                        "image",
-                        _to_numpy(orig_encodedrecon_binary[b]),
-                    ),
-                    encodedrecon_dodrecon_diff=(
-                        "image",
-                        _to_numpy(encodedrecon_dodrecon_diff[b]),
-                    ),
-                    encoded_latent_diff=("image", _to_numpy(encoded_latent_diff[b])),
                     anomaly_map_arithmetic=("image", _to_numpy(anomaly_map_arithmetic[b])),
                     anomaly_map_geometric=("image", _to_numpy(anomaly_map_geometric[b])),
                     anomaly_map_arithmetic_binary=(
@@ -2739,8 +2287,54 @@ def process_split_irregular_with_checkpoint(
                     encoded=("image", _to_numpy(encoded[b])),
                 )
 
-                add_metric_fields(rec, device=device)
-                results.append(rec)
+                results.append(required_rec)
+                current_image_records.append(required_rec)
+                
+                # Create optional record (only if flags are enabled)
+                if enable_excel_report or enable_save_optional_image_results:
+                    optional_rec = make_record(
+                        split=("meta", split),
+                        image_path=("meta", image_paths[b]),
+                        anomaly_class=("meta", anomaly_classes[b]),
+                        patch_coords=("meta", (x_coord, y_coord)),
+                        is_defective=("meta", is_defective),
+                        orig=("image", _to_numpy(x[b])),
+                        dod_recon=("image", _to_numpy(image_samples[b])),
+                        encoded_recon=("image", _to_numpy(x0[b])),
+                        orig_dodrecon_diff=("image", _to_numpy(orig_dodrecon_diff[b])),
+                        orig_dodrecon_binary=("image", _to_numpy(orig_dodrecon_binary[b])),
+                        orig_encodedrecon_diff=("image", _to_numpy(orig_encodedrecon_diff[b])),
+                        orig_encodedrecon_binary=(
+                            "image",
+                            _to_numpy(orig_encodedrecon_binary[b]),
+                        ),
+                        encodedrecon_dodrecon_diff=(
+                            "image",
+                            _to_numpy(encodedrecon_dodrecon_diff[b]),
+                        ),
+                        encoded_latent_diff=("image", _to_numpy(encoded_latent_diff[b])),
+                        anomaly_map_arithmetic=("image", _to_numpy(anomaly_map_arithmetic[b])),
+                        anomaly_map_arithmetic_binary=(
+                            "image",
+                            _to_numpy(anomaly_map_arithmetic_binary[b]),
+                        ),
+                        anomaly_map_geometric=("image", _to_numpy(anomaly_map_geometric[b])),
+                        anomaly_map_geometric_binary=(
+                            "image",
+                            _to_numpy(anomaly_map_geometric_binary[b]),
+                        ),
+                        encoded=("image", _to_numpy(encoded[b])),
+                        # Include all contour style anomaly maps in the optional record
+                        anomaly_map_arithmetic_binary_style1=("image", _to_numpy(anomaly_map_arithmetic_binary_style1[b])),
+                        anomaly_map_arithmetic_binary_style2=("image", _to_numpy(anomaly_map_arithmetic_binary_style2[b])),
+                        anomaly_map_arithmetic_binary_style3=("image", _to_numpy(anomaly_map_arithmetic_binary_style3[b])),
+                        anomaly_map_geometric_binary_style1=("image", _to_numpy(anomaly_map_geometric_binary_style1[b])),
+                        anomaly_map_geometric_binary_style2=("image", _to_numpy(anomaly_map_geometric_binary_style2[b])),
+                        anomaly_map_geometric_binary_style3=("image", _to_numpy(anomaly_map_geometric_binary_style3[b])),
+                    )
+
+                    add_metric_fields(optional_rec, device=device)
+                    optional_results.append(optional_rec)
             
             # Memory optimization: Clear cache every 10 batches
             if idx % 10 == 0 and idx > 0:
@@ -2759,23 +2353,27 @@ def process_split_irregular_with_checkpoint(
                 # Load ground truth annotations for this image
                 ground_truth_patches = None
                 annotation_filename = f"{path_to_safe_filename(current_image_path)}__annotations.json"
-                annotation_path = os.path.join(checkpoint_manager.annotation_dir, annotation_filename)
+                if checkpoint_manager.annotation_dir:
+                    annotation_path = os.path.join(checkpoint_manager.annotation_dir, annotation_filename)
+                else:
+                    annotation_path = None
                 
-                if os.path.exists(annotation_path):
+                if annotation_path and os.path.exists(annotation_path):
                     with open(annotation_path, 'r') as f:
                         annotation = json.load(f)
                         ground_truth_patches = annotation.get("defective_patches", [])
                 
-                # Save all results for this image
-                save_image_results(
+                # Save all results for this image using records
+                save_image_results_from_records(
                     checkpoint_manager, 
                     current_image_path, 
                     current_image_patches, 
-                    current_image_anomaly_maps, 
-                    ground_truth_patches or []
+                    current_image_records, 
+                    ground_truth_patches or [],
+                    enable_save_optional_image_results
                 )
                 
-                # Mark as processed
+                # Mark as processed (will be batched for better performance)
                 checkpoint_manager.mark_image_processed(current_image_path)
 
     except KeyboardInterrupt:
@@ -2795,7 +2393,7 @@ def process_split_irregular_with_checkpoint(
     else:
         print("Skipping epoch statistics (disabled)")
 
-    return results, image_patch_results, image_anomaly_maps
+    return results, optional_results
 
 def main():
     REPO_ROOT = os.environ.get("REPO_ROOT", None)
@@ -2855,7 +2453,12 @@ def main():
     parser.add_argument(
         "--vae-type", type=str, choices=["ema", "mse"], default="ema"
     )  # Choice doesn't affect training
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--num-workers", 
+        type=int, 
+        default=None,
+        help="Number of workers for DataLoader (0 for single-threaded, useful on Windows). Default: 0 on Windows, 4 on other platforms"
+    )
     parser.add_argument("--object-class", type=str, default="all")
     parser.add_argument("--pretrained", type=str, default=".")
     parser.add_argument("--anomaly-class", type=str, default="all")
@@ -2895,6 +2498,7 @@ def main():
         default=0,
         help="Threshold for determining if a patch is defective based on number of anomaly pixels (default: 0)"
     )
+
     parser.add_argument(
         "--memory-optimization",
         action="store_true",
@@ -2911,6 +2515,18 @@ def main():
         action="store_true",
         default=False,
         help="Enable Excel report generation (memory intensive for large datasets)"
+    )
+    parser.add_argument(
+        "--enable-save-optional-image-results",
+        action="store_true",
+        default=False,
+        help="Enable saving optional image results (memory intensive for large datasets)"
+    )
+    parser.add_argument(
+        "--force-rerun",
+        action="store_true",
+        default=False,
+        help="Force rerun evaluation even if checkpoint exists (clears existing checkpoint)"
     )
     args = parser.parse_args()
     
@@ -2936,7 +2552,7 @@ def main():
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
                     elif key in ['pretrained', 'data_dir', 'split_csv_path', 'annotation_dir']:
                         value = os.path.expanduser(value)
-                    elif key in ['irregular_images', 'memory_optimization', 'enable_epoch_stats', 'enable_excel_report']:
+                    elif key in ['irregular_images', 'memory_optimization', 'enable_epoch_stats', 'enable_excel_report', 'enable_save_optional_image_results', 'force_rerun']:
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
                     setattr(args, key, value)
             
