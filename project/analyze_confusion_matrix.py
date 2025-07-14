@@ -42,8 +42,13 @@ def compute_confusion_matrix_with_details(annotation_dir, evaluation_results_dir
             eval_data = json.load(f)
         
         image_path = eval_data['image_path']
-        predicted = set(tuple(x) for x in eval_data['defective_patches'])
         grid_size = eval_data['grid_size']
+        
+        # Extract predicted defective patches from patch_analysis
+        predicted = set()
+        for patch in eval_data['patch_analysis']:
+            if patch['is_defective']:
+                predicted.add((patch['grid_row'], patch['grid_col']))
         
         # Look for annotation file with the correct naming convention
         annotation_filename = f"{path_to_safe_filename(image_path)}__annotations.json"
@@ -56,6 +61,7 @@ def compute_confusion_matrix_with_details(annotation_dir, evaluation_results_dir
         with open(annotation_file, 'r') as f:
             anno_data = json.load(f)
         
+        # Extract ground truth defective patches
         gt = set(tuple(x) for x in anno_data['defective_patches'])
         
         # Get image dimensions to calculate grid

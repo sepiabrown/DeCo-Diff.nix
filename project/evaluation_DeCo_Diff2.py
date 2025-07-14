@@ -1017,29 +1017,89 @@ def make_excel(
     image_size: int,
     save_dir: str | Path = "report",
     save_filename: str | None = datetime.now().strftime("%y%m%d_%H%M%S"),
-) -> Path:
-    """Create Excel report with all evaluation records and images."""
+    max_rows_per_file: int = 50,
+) -> List[Path]:
+    """Create Excel report with all evaluation records and images.
+    
+    Args:
+        records: List of evaluation records
+        image_size: Size of images to embed
+        save_dir: Directory to save Excel files
+        save_filename: Base filename for the Excel files
+        max_rows_per_file: Maximum number of rows per Excel file (default: 100)
+    
+    Returns:
+        List of paths to created Excel files
+    """
     save_dir = Path(save_dir).expanduser()
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # Header comes from the first record's keys (order preserved)
     header = list(records[0].keys())
-
-    wb = Workbook()
-    ws = wb.active
-    if ws is not None:
-        ws.title = "Report"
-        ws.append(header)
-
-        for r, rec in enumerate(records, start=2):
-            _write_row(ws, r, rec, image_size)
-        for c in range(1, len(header) + 1):
-            ws.column_dimensions[get_column_letter(c)].width = 18
-
-    out_path = save_dir / f"report_{save_filename}.xlsx"
-    wb.save(out_path)
-    print(f"Report saved to {out_path}")
-    return out_path
+    
+    # Calculate how many files we need
+    total_rows = len(records)
+    num_files = (total_rows + max_rows_per_file - 1) // max_rows_per_file  # Ceiling division
+    
+    # Check if the last file would have fewer than max_rows_per_file rows
+    # If so, reduce the number of files by 1 and append remaining rows to the previous file
+    if num_files > 1:
+        remaining_rows = total_rows % max_rows_per_file
+        if remaining_rows > 0 and remaining_rows < max_rows_per_file:
+            num_files -= 1
+    
+    created_files = []
+    
+    for file_index in range(num_files):
+        # Calculate start and end indices for this file
+        start_idx = file_index * max_rows_per_file
+        
+        # For the last file, include all remaining rows
+        if file_index == num_files - 1:
+            end_idx = total_rows
+        else:
+            end_idx = (file_index + 1) * max_rows_per_file
+        
+        # Get records for this file
+        file_records = records[start_idx:end_idx]
+        
+        # Create workbook for this file
+        wb = Workbook()
+        ws = wb.active
+        if ws is not None:
+            # Set worksheet title
+            if num_files == 1:
+                ws.title = "Report"
+            else:
+                ws.title = f"Report_Part{file_index + 1}"
+            
+            # Add header
+            ws.append(header)
+            
+            # Add data rows
+            for r, rec in enumerate(file_records, start=2):
+                _write_row(ws, r, rec, image_size)
+            
+            # Set column widths
+            for c in range(1, len(header) + 1):
+                ws.column_dimensions[get_column_letter(c)].width = 18
+        
+        # Generate filename
+        if num_files == 1:
+            out_filename = f"report_{save_filename}.xlsx"
+        else:
+            out_filename = f"report_{save_filename}_part{file_index + 1:02d}.xlsx"
+        
+        out_path = save_dir / out_filename
+        wb.save(out_path)
+        created_files.append(out_path)
+        
+        print(f"Report part {file_index + 1}/{num_files} saved to {out_path} ({len(file_records)} rows)")
+    
+    if num_files > 1:
+        print(f"\nTotal: Created {num_files} Excel files with {total_rows} total rows")
+    
+    return created_files
 
 
 def draw_patch_rectangles_on_image(base_img, patch_results, ground_truth_patches=None, patch_size=128, stride=64, grid_thickness=1):
@@ -2192,10 +2252,12 @@ def process_split_irregular_with_checkpoint(
                 # -----------------------------------------------------------------
                 # Difference / binary maps
                 # -----------------------------------------------------------------
-                orig_dodrecon_diff = _compute_diff_mean(x, image_samples)
+                orig_dodrecon_diff_raw = _compute_abs_diff_max(x, image_samples)
+                orig_dodrecon_diff = torch.clamp(orig_dodrecon_diff_raw, 0.0, 0.05) * 20
                 orig_dodrecon_binary = _binary_mask(orig_dodrecon_diff, anomaly_binary_threshold)
 
-                orig_encodedrecon_diff = _compute_diff_mean(x, x0)
+                orig_encodedrecon_diff_raw = _compute_abs_diff_max(x, x0)
+                orig_encodedrecon_diff = torch.clamp(orig_encodedrecon_diff_raw, 0.0, 0.05) * 20
                 orig_encodedrecon_binary = _binary_mask(orig_encodedrecon_diff, anomaly_binary_threshold)
                 
                 encodedrecon_dodrecon_diff_raw = _compute_abs_diff_max(x0, image_samples)
@@ -2221,17 +2283,17 @@ def process_split_irregular_with_checkpoint(
                     encodedrecon_dodrecon_diff + encoded_latent_diff_resized
                 )
                 # Use contour-based binary masks for all three styles
-                anomaly_map_arithmetic_binary_style1, anomaly_map_arithmetic_binary_style2, anomaly_map_arithmetic_binary_style3 = _create_contour_based_binary_mask(anomaly_map_arithmetic, adaptive_threshold=adaptive_threshold, anomaly_binary_threshold=anomaly_binary_threshold)
+                #anomaly_map_arithmetic_binary_style1, anomaly_map_arithmetic_binary_style2, anomaly_map_arithmetic_binary_style3 = _create_contour_based_binary_mask(anomaly_map_arithmetic, adaptive_threshold=adaptive_threshold, anomaly_binary_threshold=anomaly_binary_threshold)
                 # Use style1 as default for backward compatibility
-                anomaly_map_arithmetic_binary = anomaly_map_arithmetic_binary_style1
+                anomaly_map_arithmetic_binary = _binary_mask(anomaly_map_arithmetic, anomaly_binary_threshold) #anomaly_map_arithmetic_binary_style1
                 
                 anomaly_map_geometric = (
                     encodedrecon_dodrecon_diff * encoded_latent_diff_resized
                 )
                 # Use contour-based binary masks for all three styles
-                anomaly_map_geometric_binary_style1, anomaly_map_geometric_binary_style2, anomaly_map_geometric_binary_style3 = _create_contour_based_binary_mask(anomaly_map_geometric, adaptive_threshold=adaptive_threshold, anomaly_binary_threshold=anomaly_binary_threshold)
+                #anomaly_map_geometric_binary_style1, anomaly_map_geometric_binary_style2, anomaly_map_geometric_binary_style3 = _create_contour_based_binary_mask(anomaly_map_geometric, adaptive_threshold=adaptive_threshold, anomaly_binary_threshold=anomaly_binary_threshold)
                 # Use style1 as default for backward compatibility
-                anomaly_map_geometric_binary = anomaly_map_geometric_binary_style1
+                anomaly_map_geometric_binary = _binary_mask(anomaly_map_geometric, anomaly_binary_threshold) #anomaly_map_geometric_binary_style1
 
                 # Collect epoch-wise statistics
                 if enable_epoch_stats:
@@ -2325,12 +2387,12 @@ def process_split_irregular_with_checkpoint(
                         ),
                         encoded=("image", _to_numpy(encoded[b])),
                         # Include all contour style anomaly maps in the optional record
-                        anomaly_map_arithmetic_binary_style1=("image", _to_numpy(anomaly_map_arithmetic_binary_style1[b])),
-                        anomaly_map_arithmetic_binary_style2=("image", _to_numpy(anomaly_map_arithmetic_binary_style2[b])),
-                        anomaly_map_arithmetic_binary_style3=("image", _to_numpy(anomaly_map_arithmetic_binary_style3[b])),
-                        anomaly_map_geometric_binary_style1=("image", _to_numpy(anomaly_map_geometric_binary_style1[b])),
-                        anomaly_map_geometric_binary_style2=("image", _to_numpy(anomaly_map_geometric_binary_style2[b])),
-                        anomaly_map_geometric_binary_style3=("image", _to_numpy(anomaly_map_geometric_binary_style3[b])),
+                        #anomaly_map_arithmetic_binary_style1=("image", _to_numpy(anomaly_map_arithmetic_binary_style1[b])),
+                        #anomaly_map_arithmetic_binary_style2=("image", _to_numpy(anomaly_map_arithmetic_binary_style2[b])),
+                        #anomaly_map_arithmetic_binary_style3=("image", _to_numpy(anomaly_map_arithmetic_binary_style3[b])),
+                        #anomaly_map_geometric_binary_style1=("image", _to_numpy(anomaly_map_geometric_binary_style1[b])),
+                        #anomaly_map_geometric_binary_style2=("image", _to_numpy(anomaly_map_geometric_binary_style2[b])),
+                        #anomaly_map_geometric_binary_style3=("image", _to_numpy(anomaly_map_geometric_binary_style3[b])),
                     )
 
                     add_metric_fields(optional_rec, device=device)
