@@ -196,14 +196,15 @@ def _main(args):
 
     # Setup DDP:
     local_rank = int(os.environ["LOCAL_RANK"])
-    backend = "nccl" if sys.platform != "win32" else "gloo"
+    # Use 'gloo' backend for Windows, 'nccl' for Linux
+    backend = "gloo" if sys.platform == "win32" else "nccl"
     dist.init_process_group(backend)
     assert args.global_batch_size % dist.get_world_size() == 0, (
         f"Batch size must be divisible by world size."
     )
     rank = dist.get_rank()
     device = rank % torch.cuda.device_count()
-    torch_device = torch.device(f"cuda:{rank}")
+    torch_device = torch.device(f"cuda:{device}")
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
@@ -304,6 +305,9 @@ def _main(args):
             center_crop=args.center_crop,
             num_datafile=args.num_datafile,
             split_csv_path=args.split_csv_path,
+            track_crop=True,  # Enable crop tracking
+            save_crop_visualizations=True,  # Save crop visualizations
+            crop_vis_dir=f"./crop_visualizations_{args.object_class}",  # Directory for crop visualizations
         )
 
     batch_size = args.global_batch_size // dist.get_world_size()
@@ -452,6 +456,9 @@ def _main(args):
                         center_crop=args.center_crop,
                         num_datafile=args.num_datafile,
                         split_csv_path=args.split_csv_path,
+                        track_crop=True,  # Enable crop tracking
+                        save_crop_visualizations=True,  # Save crop visualizations
+                        crop_vis_dir=f"./crop_visualizations_{args.object_class}",  # Directory for crop visualizations
                     )
 
                 batch_size = args.global_batch_size // dist.get_world_size()
@@ -463,7 +470,15 @@ def _main(args):
                     drop_last=False,
                 )
 
-        for ii, (x, _, y, _, _) in enumerate(loader):
+        for ii, data in enumerate(loader):
+            # Handle different data structures based on whether crop tracking is enabled
+            if args.dataset == "pcb" and hasattr(dataset, 'track_crop') and dataset.track_crop:
+                # PCB dataset with crop tracking returns additional crop_info
+                x, _, y, _, _, crop_info = data
+            else:
+                # Standard data structure for other datasets
+                x, _, y, _, _ = data
+            
             x = x.to(torch_device)
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
@@ -683,6 +698,10 @@ def _main(args):
         dist.barrier()
 
     logger.info("Done!")
+    
+    # Note: Crop visualizations are now saved in real-time during training
+    # No need to save them again at the end
+    
     cleanup()
 
 
@@ -749,9 +768,25 @@ def main():
         type=str,
         help="Path to JSON file containing multiple training configurations"
     )
+    parser.add_argument(
+        "--no-distributed",
+        action="store_true",
+        help="Run training without distributed training (useful for Windows)"
+    )
 
     args = parser.parse_args()
     print(f'args: {args}')
+    
+    # If no-distributed flag is set, run single-GPU training
+    if args.no_distributed:
+        print("Running single-GPU training (no distributed training)")
+        # Set environment variables for single-GPU training
+        os.environ["LOCAL_RANK"] = "0"
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "12355"
+    
     # Handle input JSON if provided
     if args.input_json:
         with open(args.input_json, 'r') as f:
