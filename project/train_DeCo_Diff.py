@@ -308,6 +308,8 @@ def _main(args):
             track_crop=True,  # Enable crop tracking
             save_crop_visualizations=True,  # Save crop visualizations
             crop_vis_dir=f"./crop_visualizations_{args.object_class}",  # Directory for crop visualizations
+            resume_dir=args.resume_dir,  # Pass resume directory for crop annotation persistence
+            resume_epoch=args.resume_epoch,  # Pass resume epoch for filtering crops
         )
 
     batch_size = args.global_batch_size // dist.get_world_size()
@@ -381,6 +383,7 @@ def _main(args):
     )
 
     start_epoch = 0
+    checkpoint_epoch = None  # Track the epoch from checkpoint
     if args.resume_dir:
         last_ckpt = os.path.join(args.resume_dir, "checkpoints", "last.pt")
         if os.path.isfile(last_ckpt):
@@ -391,7 +394,19 @@ def _main(args):
             model.module.load_state_dict(ckpt["model"])
             opt.load_state_dict(ckpt["opt"])
             scheduler.load_state_dict(ckpt["scheduler"])
-            start_epoch = ckpt.get("epoch", 0) + 1
+            checkpoint_epoch = ckpt.get("epoch", 0)  # Get epoch from checkpoint
+            start_epoch = checkpoint_epoch + 1
+            
+            # If resume_epoch wasn't explicitly set, use checkpoint epoch
+            if args.resume_epoch is None:
+                args.resume_epoch = checkpoint_epoch
+                if rank == 0:
+                    logger.info(f"Setting resume_epoch to {checkpoint_epoch} from checkpoint")
+                dataset.resume_epoch = checkpoint_epoch  # Update dataset's resume_epoch
+                
+            # Now load the crops with the correct resume_epoch
+            if rank == 0:
+                dataset.load_crop_annotations(resume_epoch=args.resume_epoch)
             dist.barrier()
         else:
             if rank == 0:
@@ -422,29 +437,12 @@ def _main(args):
         logger.info(f"Beginning epoch {epoch}...")
         if args.num_datafile is not None and args.rep_datafile is not None:
             if epoch % args.rep_datafile == 0:
-                if args.dataset == "mvtec":
-                    dataset = MVTECDataset(
-                        "train",
-                        object_class=args.object_class,
-                        rootdir=args.data_dir,
-                        transform=transform,
-                        image_size=args.image_size,
-                        center_size=args.center_size,
-                        augment=args.augmentation,
-                        center_crop=args.center_crop,
-                    )
-                elif args.dataset == "visa":
-                    dataset = VISADataset(
-                        "train",
-                        object_class=args.object_class,
-                        rootdir=args.data_dir,
-                        transform=transform,
-                        image_size=args.image_size,
-                        center_size=args.center_size,
-                        augment=args.augmentation,
-                        center_crop=args.center_crop,
-                    )
-                elif args.dataset == "pcb":
+                # Store current cumulative crops before recreating dataset
+                if args.dataset == "pcb" and hasattr(dataset, 'cumulative_crops'):
+                    stored_crops = dataset.cumulative_crops.copy()
+                
+                # Recreate dataset with new data files
+                if args.dataset == "pcb":
                     dataset = PCBDataset(
                         "train",
                         object_class=args.object_class,
@@ -459,25 +457,40 @@ def _main(args):
                         track_crop=True,  # Enable crop tracking
                         save_crop_visualizations=True,  # Save crop visualizations
                         crop_vis_dir=f"./crop_visualizations_{args.object_class}",  # Directory for crop visualizations
+                        resume_dir=args.resume_dir,  # Pass resume directory
+                        resume_epoch=args.resume_epoch,  # Pass resume epoch for filtering crops
                     )
-
-                batch_size = args.global_batch_size // dist.get_world_size()
+                    
+                    # Restore cumulative crops and pass current epoch
+                    if 'stored_crops' in locals():
+                        dataset.cumulative_crops = stored_crops
+                    
+                    # Set the current epoch IMMEDIATELY after dataset recreation
+                    dataset.current_epoch = epoch
+                
+                # Recreate dataloader
                 loader = DataLoader(
                     dataset,
                     batch_size=batch_size,
                     shuffle=True,
-                    num_workers=4,
+                    num_workers=0,
                     drop_last=False,
                 )
 
-        for ii, data in enumerate(loader):
+        # Training loop
+        # Set the current epoch BEFORE starting the batch loop (regardless of dataset recreation)
+        if args.dataset == "pcb" and hasattr(dataset, 'track_crop') and dataset.track_crop:
+            dataset.current_epoch = epoch
+            print(f"DEBUG: Setting dataset.current_epoch to {epoch}")
+            
+        for batch_idx, batch in enumerate(loader):
             # Handle different data structures based on whether crop tracking is enabled
             if args.dataset == "pcb" and hasattr(dataset, 'track_crop') and dataset.track_crop:
                 # PCB dataset with crop tracking returns additional crop_info
-                x, _, y, _, _, crop_info = data
+                x, _, y, _, _, crop_info = batch
             else:
                 # Standard data structure for other datasets
-                x, _, y, _, _ = data
+                x, _, y, _, _ = batch
             
             x = x.to(torch_device)
             with torch.no_grad():
@@ -545,7 +558,7 @@ def _main(args):
             loss = loss_dict["loss"].mean()
             loss.backward()
 
-            if (ii + 1) % accumulation_steps == 0:
+            if (batch_idx + 1) % accumulation_steps == 0:
                 opt.step()
                 opt.zero_grad()
 
@@ -760,6 +773,12 @@ def main():
         default=None,
         help="Dir to a checkpoint/last.pt file to resume training from",
     )
+    parser.add_argument(
+        "--resume-epoch",
+        type=int,
+        default=None,
+        help="Epoch to resume from for crop annotations (filters out crops from later epochs)",
+    )
     parser.add_argument("--num-datafile", type=int, default=None)
     parser.add_argument("--rep-datafile", type=int, default=None)
     parser.add_argument("--split-csv-path", type=str, default=None)
@@ -802,9 +821,9 @@ def main():
                 if hasattr(args, key):
                     # Convert string values to appropriate types
                     if key in ['image_size', 'center_size', 'epochs', 'warmup_epochs', 
-                              'global_seed', 'num_workers', 
-                              'log_every', 'ckpt_every', 'local_rank']:
-                        value = int(value)
+                              'global_seed', 'num_workers', 'log_every', 'ckpt_every', 
+                              'local_rank', 'resume_epoch']:
+                        value = int(value) if value is not None else None
                     elif key in ['lr', 'mask_ratio', 'patch_shuffle_ratio']:
                         value = float(value)
                     elif key in ['center_crop', 'mask_random_ratio', 'from_scratch', 'augmentation']:

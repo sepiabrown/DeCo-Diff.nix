@@ -25,9 +25,8 @@ def find_evaluation_files(base_path, pattern):
         print(f"Error: Base path does not exist: {base_path}")
         return evaluation_files
     
-    # Find all directories that match the pattern with timestamp
-    # Pattern: {pattern}_YYYYMMDD_HHMMSS
-    timestamp_pattern = re.compile(rf"{re.escape(pattern)}_\d{{6}}_\d{{6}}")
+    # Match pattern followed by optional alphanumeric/underscore/hyphen chars, then timestamp
+    timestamp_pattern = re.compile(rf"{re.escape(pattern)}[A-Za-z0-9_-]*_\d{{6}}_\d{{6}}")
     
     # Search for matching directories
     matching_dirs = []

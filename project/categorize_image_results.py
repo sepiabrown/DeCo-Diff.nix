@@ -13,7 +13,12 @@ def categorize_images(annotation_dir, evaluation_results_dir, output_file=None):
         with open(eval_file, 'r') as f:
             eval_data = json.load(f)
         image_path = eval_data['image_path']
-        predicted = set(tuple(x) for x in eval_data['defective_patches'])
+        
+        # Extract defective patches from patch_analysis
+        predicted = set()
+        for patch in eval_data['patch_analysis']:
+            if patch['is_defective']:
+                predicted.add((patch['grid_row'], patch['grid_col']))
         grid_size = eval_data['grid_size']
 
         annotation_filename = f"{path_to_safe_filename(image_path)}__annotations.json"

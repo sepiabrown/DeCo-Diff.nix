@@ -15,6 +15,8 @@ from albumentations.core.transforms_interface import BasicTransform
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from collections import defaultdict
+from matplotlib import transforms
+import json
 
 class CropTrackingTransform(BasicTransform):
     """Custom transform that tracks crop coordinates after rotation"""
@@ -126,6 +128,8 @@ class PCBDataset(Dataset):
         track_crop: bool = False,  # New parameter to enable crop tracking
         save_crop_visualizations: bool = False,  # New parameter to save crop visualizations
         crop_vis_dir: str = "./crop_visualizations",  # Directory to save crop visualizations
+        resume_dir: str = None,  # Directory to resume from (for loading existing crop annotations)
+        resume_epoch: int = None,  # Epoch to resume from (for filtering crops)
     ):
         """
         Args:
@@ -136,6 +140,8 @@ class PCBDataset(Dataset):
             track_crop: If True, track crop coordinates after rotation
             save_crop_visualizations: If True, save crop visualization images
             crop_vis_dir: Directory to save crop visualization images
+            resume_dir: Directory to resume from (for loading existing crop annotations)
+            resume_epoch: Epoch to resume from (for filtering crops)
         """
         self.scratch = scratch
         self.mode = mode
@@ -145,6 +151,9 @@ class PCBDataset(Dataset):
         self.track_crop = track_crop
         self.save_crop_visualizations = save_crop_visualizations
         self.crop_vis_dir = crop_vis_dir
+        self.resume_dir = resume_dir
+        self.resume_epoch = resume_epoch  # Add resume_epoch to class attributes
+        self.current_epoch = 0  # Track current epoch for crop annotations
         
         # Create crop visualization directory if needed
         if self.save_crop_visualizations:
@@ -152,6 +161,13 @@ class PCBDataset(Dataset):
             
         # Dictionary to store cumulative crop information per original image
         self.cumulative_crops = defaultdict(list)
+        
+        # Add a set to track unique crops
+        self.added_crops = set()  # Track (image_path, coords, epoch) tuples
+        
+        # Load existing crop annotations if resuming
+        if self.resume_dir and self.track_crop:
+            self.load_crop_annotations(resume_epoch=resume_epoch)
             
         object_cls_dict = {
             "pcb": 0,
@@ -193,17 +209,17 @@ class PCBDataset(Dataset):
         self.image_paths = []
         self.anomaly_classes = []
         for i, row in df.iterrows():
-            data_path = os.path.join(rootdir, row["image"])
+            data_path = os.path.join(rootdir, str(row["image"]))
             img = np.array(
                 Image.open(data_path).convert("RGB")
                 # .resize((self.image_size, self.image_size))
             ).astype(np.uint8)
             self.image_paths.append(data_path)
             self.images.append(img)
-            self.object_classes.append(object_cls_dict[row["object"]])
-            self.anomaly_classes.append(row["category"])
-            if row["category"] != "good":
-                seg_path = os.path.join(rootdir, row["mask"])
+            self.object_classes.append(object_cls_dict[str(row["object"])])
+            self.anomaly_classes.append(str(row["category"]))
+            if str(row["category"]) != "good":
+                seg_path = os.path.join(rootdir, str(row["mask"]))
                 seg = (
                     np.array(
                         Image.open(seg_path).convert("L")
@@ -213,7 +229,7 @@ class PCBDataset(Dataset):
                 ).astype(np.uint8)
                 self.segs.append((seg))
             else:
-                seg_path = os.path.join(rootdir, row["image"])
+                seg_path = os.path.join(rootdir, str(row["image"]))
                 if os.path.exists(seg_path):
                     seg_shape = np.array(Image.open(seg_path)).shape
                 else:
@@ -250,6 +266,135 @@ class PCBDataset(Dataset):
                 )
         else:
             self.aug = A.CenterCrop(p=1, height=self.image_size, width=self.image_size)
+
+    def load_crop_annotations(self, resume_epoch=None):
+        """Load existing crop annotations from JSON file"""
+        if not self.resume_dir:
+            return
+            
+        # Update instance resume_epoch if provided
+        if resume_epoch is not None:
+            self.resume_epoch = resume_epoch
+            print(f"DEBUG: Resume epoch set to {self.resume_epoch}")
+            
+        crop_annotations_file = os.path.join(self.resume_dir, "crop_annotations.json")
+        if os.path.exists(crop_annotations_file):
+            try:
+                with open(crop_annotations_file, 'r') as f:
+                    loaded_crops = json.load(f)
+                
+                # Clear existing crops and initialize new storage
+                self.cumulative_crops.clear()
+                
+                # Track statistics for debug output
+                kept_crops = 0
+                removed_crops = 0
+                epochs_seen = set()
+                
+                # Process each image's crops
+                for image_path, crops in loaded_crops.items():
+                    self.cumulative_crops[image_path] = []
+                    for crop in crops:
+                        crop_epoch = crop.get("epoch", 0)
+                        epochs_seen.add(crop_epoch)
+                        # Keep crops up to and including resume_epoch
+                        if self.resume_epoch is None or crop_epoch <= self.resume_epoch:
+                            self.cumulative_crops[image_path].append(crop)
+                            kept_crops += 1
+                            print(f"DEBUG: Keeping crop from epoch {crop_epoch} (resume_epoch={self.resume_epoch})")
+                        else:
+                            removed_crops += 1
+                            print(f"DEBUG: Removing crop from epoch {crop_epoch} (resume_epoch={self.resume_epoch})")
+                
+                if self.resume_epoch is not None:
+                    print(f"DEBUG: Loading crops for resume at epoch {self.resume_epoch}:")
+                    print(f"  - Epochs seen in file: {sorted(list(epochs_seen))}")
+                    print(f"  - Kept {kept_crops} crops from epochs up to {self.resume_epoch}")
+                    print(f"  - Removed {removed_crops} crops from epochs after {self.resume_epoch}")
+                else:
+                    print(f"DEBUG: Loaded all {kept_crops} crops (no resume epoch specified)")
+                    
+            except Exception as e:
+                print(f"Warning: Could not load crop annotations: {e}")
+                self.cumulative_crops.clear()
+        else:
+            print("No existing crop annotations found.")
+
+    def save_crop_annotations(self):
+        """Save crop annotations to JSON file"""
+        if not self.resume_dir or not self.track_crop:
+            return
+            
+        crop_annotations_file = os.path.join(self.resume_dir, "crop_annotations.json")
+        try:
+            # Load existing annotations first
+            existing_crops = {}
+            if os.path.exists(crop_annotations_file):
+                try:
+                    with open(crop_annotations_file, 'r') as f:
+                        existing_crops = json.load(f)
+                except Exception as e:
+                    print(f"Warning: Could not load existing crop annotations: {e}")
+            
+            # Convert current cumulative crops to serializable format using absolute image paths as keys
+            output_crops = {}
+            
+            # First, copy all existing crops that we want to keep
+            for image_path, crops in existing_crops.items():
+                # Initialize list for this image if not exists
+                if image_path not in output_crops:
+                    output_crops[image_path] = []
+                
+                # Keep only crops from epochs before resume_epoch if specified
+                for crop in crops:
+                    crop_epoch = crop.get('epoch', 0)
+                    if self.resume_epoch is None or crop_epoch < self.resume_epoch:
+                        output_crops[image_path].append(crop)
+            
+            # Then add new crops from current session, but only if they're from current or later epochs
+            for image_path, crops_info in self.cumulative_crops.items():
+                # Get the absolute path for the image
+                abs_image_path = os.path.abspath(image_path)
+                
+                # Initialize list for this image if not exists
+                if abs_image_path not in output_crops:
+                    output_crops[abs_image_path] = []
+                
+                # Create a set of unique identifiers for existing crops
+                existing_crop_ids = set()
+                for crop in output_crops[abs_image_path]:
+                    crop_coords = tuple(crop['crop_coords'])
+                    rotation_angle = round(crop.get('rotation_angle', 0), 6)
+                    epoch = crop.get('epoch', 0)
+                    crop_id = f"{crop_coords}_{rotation_angle}_{epoch}"
+                    existing_crop_ids.add(crop_id)
+                
+                # Add all new crops for this image, avoiding duplicates and respecting resume_epoch
+                for crop_info in crops_info:
+                    crop_epoch = crop_info.get('epoch', 0)
+                    # Only add crops from current epoch or later epochs
+                    if self.resume_epoch is None or crop_epoch >= self.resume_epoch:
+                        crop_coords = tuple(crop_info['crop_coords'])
+                        rotation_angle = round(crop_info.get('rotation_angle', 0), 6)
+                        crop_id = f"{crop_coords}_{rotation_angle}_{crop_epoch}"
+                        
+                        if crop_id not in existing_crop_ids:
+                            output_crops[abs_image_path].append({
+                                'crop_coords': crop_info['crop_coords'],
+                                'rotation_angle': crop_info['rotation_angle'],
+                                'original_shape': crop_info['original_shape'],
+                                'epoch': crop_info['epoch']
+                            })
+                            existing_crop_ids.add(crop_id)
+            
+            # Save to file
+            with open(crop_annotations_file, 'w') as f:
+                json.dump(output_crops, f, indent=2)
+                
+            print(f"Saved {sum(len(crops) for crops in output_crops.values())} total crop annotations to {crop_annotations_file}")
+            
+        except Exception as e:
+            print(f"Error saving crop annotations: {e}")
 
     def transform_volume(self, x):
         x = torch.from_numpy(x.transpose((-1, 0, 1)))
@@ -321,24 +466,56 @@ class PCBDataset(Dataset):
         
         return (x1_orig, y1_orig, x2_orig, y2_orig)
 
-    def add_crop_to_cumulative_map(self, original_image_index, crop_info):
+    def add_crop_to_cumulative_map(self, original_image_path, crop_info, current_epoch=None):
         """
         Add crop information to the cumulative map for a specific original image
-        and immediately save the updated visualization
+        and immediately save the updated visualization and annotations
         
         Args:
-            original_image_index: Index of the original image
+            original_image_path: Path to the original image
             crop_info: Dictionary containing crop coordinates and rotation info
+            current_epoch: Current training epoch (for tracking when crop was created)
         """
         if crop_info is None or 'crop_coords' not in crop_info:
+            print(f"DEBUG: crop_info is None or missing crop_coords: {crop_info}")
             return
             
-        # Add crop info to the cumulative list for this image
-        self.cumulative_crops[original_image_index].append(crop_info)
+        # Add epoch information to crop_info
+        if current_epoch is not None:
+            crop_info['epoch'] = current_epoch
+            print(f"DEBUG: Setting epoch to {current_epoch} for crop at path {original_image_path}")
         
-        # Immediately save the updated cumulative visualization
-        if self.save_crop_visualizations:
-            self.create_cumulative_crop_visualization(original_image_index)
+        # Initialize list for this image if not exists
+        if original_image_path not in self.cumulative_crops:
+            self.cumulative_crops[original_image_path] = []
+        
+        # Create a unique identifier for this crop
+        crop_coords = tuple(crop_info['crop_coords'])
+        rotation_angle = round(crop_info.get('rotation_angle', 0), 6)
+        epoch = crop_info.get('epoch', 0)
+        crop_id = (crop_coords, rotation_angle, epoch)
+        
+        # Check if this exact crop already exists
+        existing_crop_ids = {
+            (tuple(c['crop_coords']), round(c.get('rotation_angle', 0), 6), c.get('epoch', 0))
+            for c in self.cumulative_crops[original_image_path]
+        }
+        
+        if crop_id not in existing_crop_ids:
+            print(f"DEBUG: Adding new crop with coords {crop_coords}, rotation {rotation_angle}, epoch {epoch}")
+            self.cumulative_crops[original_image_path].append(crop_info)
+            
+            # Update visualization
+            if self.save_crop_visualizations:
+                # Get the index of this image in our paths list
+                try:
+                    image_index = self.image_paths.index(original_image_path)
+                    self.create_cumulative_crop_visualization(image_index)
+                except ValueError:
+                    print(f"Warning: Could not find index for image path {original_image_path}")
+                self.save_crop_annotations()
+        
+        print(f"DEBUG: Total unique crops for image {original_image_path}: {len(self.cumulative_crops[original_image_path])}")
 
     def create_cumulative_crop_visualization(self, original_image_index, save_path=None):
         """
@@ -348,56 +525,84 @@ class PCBDataset(Dataset):
             original_image_index: Index of the original image
             save_path: Optional path to save the visualization
         """
-        if original_image_index not in self.cumulative_crops or not self.cumulative_crops[original_image_index]:
-            return
-            
         # Get the original image
         original_image = self.images[original_image_index]
-        crops = self.cumulative_crops[original_image_index]
-        
-        # Get original image filename for naming
         original_image_path = self.image_paths[original_image_index]
         original_filename = os.path.splitext(os.path.basename(original_image_path))[0]
         
+        # Load ALL crops from JSON file for this image
+        all_crops = []
+        if self.resume_dir:
+            crop_annotations_file = os.path.join(self.resume_dir, "crop_annotations.json")
+            if os.path.exists(crop_annotations_file):
+                try:
+                    with open(crop_annotations_file, 'r') as f:
+                        loaded_crops = json.load(f)
+                    
+                    # Get crops for this specific image path
+                    image_path = os.path.abspath(original_image_path)
+                    if image_path in loaded_crops:
+                        all_crops = loaded_crops[image_path]
+                except Exception as e:
+                    print(f"Warning: Could not load crop annotations for visualization: {e}")
+        
+        # If no crops found in JSON, use in-memory crops as fallback
+        if not all_crops and original_image_index in self.cumulative_crops:
+            all_crops = self.cumulative_crops[original_image_path]
+        
+        if not all_crops:
+            return
+            
         # Create figure and axis
         fig, ax = plt.subplots(1, 1, figsize=(15, 10))
         
         # Display the original image
         ax.imshow(original_image)
         
-        # Define colors for different crops (cycling through a color palette)
-        colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
-        
         # Draw rectangles for all crops
-        for i, crop_info in enumerate(crops):
+        for i, crop_info in enumerate(all_crops):
             x1, y1, x2, y2 = crop_info['crop_coords']
             rotation_angle = crop_info.get('rotation_angle', 0)
-            color = colors[i % len(colors)]
+            epoch = crop_info.get('epoch', 'unknown')
             
-            # Draw crop rectangle
-            rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, 
-                                   linewidth=2, edgecolor=color, facecolor='none')
-            ax.add_patch(rect)
+            # Color scheme: green for latest, red for all others
+            if i == len(all_crops) - 1:  # Latest crop
+                color = 'green'
+                linewidth = 3  # Make latest crop more prominent
+            else:  # Previous crops
+                color = 'red'
+                linewidth = 2
             
-            # Add crop number and coordinates
-            ax.text(x1, y1 - 5, f'Crop {i+1}: ({x1}, {y1}) to ({x2}, {y2})', 
-                    color=color, fontsize=10, weight='bold',
-                    bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.8))
+            # Calculate rectangle center and dimensions
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+            width = x2 - x1
+            height = y2 - y1
             
-            # Add rotation info if applicable
+            # Create rotated rectangle
             if rotation_angle != 0:
-                ax.text(x1, y2 + 15, f'Rot: {rotation_angle:.1f}°', 
-                        color=color, fontsize=8,
-                        bbox=dict(boxstyle="round,pad=0.1", facecolor="white", alpha=0.8))
+                # Convert angle to radians
+                angle_rad = math.radians(rotation_angle)
+                
+                # Create rectangle patch
+                rect = patches.Rectangle((x1, y1), width, height, 
+                                       linewidth=linewidth, edgecolor=color, facecolor='none')
+                
+                # Apply rotation transformation
+                transform = (ax.transData + 
+                           transforms.Affine2D().rotate(angle_rad).translate(center_x, center_y) +
+                           transforms.Affine2D().translate(-center_x, -center_y))
+                rect.set_transform(transform)
+            else:
+                # No rotation - draw regular rectangle
+                rect = patches.Rectangle((x1, y1), width, height, 
+                                       linewidth=linewidth, edgecolor=color, facecolor='none')
+            
+            ax.add_patch(rect)
         
-        # Add legend showing total number of crops
-        ax.text(10, 30, f'Total Crops: {len(crops)}', 
-                color='black', fontsize=14, weight='bold',
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.9))
-        
-        # Set title with original filename
-        ax.set_title(f'Cumulative Crop Map - {original_filename} ({len(crops)} crops)', 
-                    fontsize=16, weight='bold')
+        # Set title with all the information including epoch info
+        title_text = f'Cumulative Crop Map - {original_filename}\nTotal Crops: {len(all_crops)} | Green: Latest | Red: Previous'
+        ax.set_title(title_text, fontsize=14, weight='bold', pad=20)
         ax.axis('off')
         
         # Save the visualization with original filename
@@ -408,7 +613,7 @@ class PCBDataset(Dataset):
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
         
-        print(f"Cumulative crop visualization saved to: {save_path}")
+        print(f"Cumulative crop visualization saved to: {save_path} with {len(all_crops)} crops")
         return save_path
 
     def save_all_cumulative_visualizations(self):
@@ -436,11 +641,13 @@ class PCBDataset(Dataset):
                 crop_coords = None
                 rotation_angle = 0
                 
-                for transform in self.aug.transforms:
-                    if hasattr(transform, 'crop_coords'):
-                        crop_coords = transform.crop_coords
-                    if hasattr(transform, 'rotation_angle'):
-                        rotation_angle = transform.rotation_angle
+                # Check if we have transforms to iterate through
+                if hasattr(self.aug, 'transforms'):
+                    for transform in self.aug.transforms:
+                        if hasattr(transform, 'crop_coords'):
+                            crop_coords = transform.crop_coords
+                        if hasattr(transform, 'rotation_angle'):
+                            rotation_angle = transform.rotation_angle
                 
                 # Calculate final crop coordinates in original image space
                 if crop_coords is not None:
@@ -456,7 +663,8 @@ class PCBDataset(Dataset):
                     
                     # Add to cumulative map instead of creating individual visualizations
                     if self.save_crop_visualizations:
-                        self.add_crop_to_cumulative_map(index, crop_info)
+                        # Pass the current epoch to track when the crop was created
+                        self.add_crop_to_cumulative_map(self.image_paths[index], crop_info, self.current_epoch)
             else:
                 # Original augmentation without tracking
                 augmented = self.aug(image=img, mask=seg)
@@ -475,14 +683,14 @@ class PCBDataset(Dataset):
         if self.shift_x is not None:
             tx = self.shift_x
             assert abs(tx) < img.shape[0], "shift should be less than the image size"
-            M = np.float32([[1, 0, tx], [0, 1, 0]])
+            M = np.array([[1, 0, tx], [0, 1, 0]], dtype=np.float32)
             img = cv2.warpAffine(
                 img, M, (img.shape[1], img.shape[0]), borderMode=cv2.BORDER_REFLECT
             )
         if self.shift_y is not None:
             ty = self.shift_y
             assert abs(ty) < img.shape[1], "shift should be less than the image size"
-            M = np.float32([[1, 0, 0], [0, 1, ty]])
+            M = np.array([[1, 0, 0], [0, 1, ty]], dtype=np.float32)
             img = cv2.warpAffine(
                 img, M, (img.shape[1], img.shape[0]), borderMode=cv2.BORDER_REFLECT
             )
