@@ -31,7 +31,7 @@ class CropTrackingTransform(BasicTransform):
     def targets(self):
         return {"image": self.apply, "mask": self.apply}
         
-    def apply(self, img, **params):
+    def apply(self, img, force_apply=False, **params):
         # Get original image dimensions
         h, w = img.shape[:2]
         
@@ -49,26 +49,22 @@ class CropTrackingTransform(BasicTransform):
         self.crop_coords = (crop_x, crop_y, crop_x + crop_w, crop_y + crop_h)
         
         # Apply the crop
-        return img[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
-    
-    def apply_to_bbox(self, bbox, **params):
-        # Transform bbox coordinates
-        if self.crop_coords is None:
-            return bbox
-            
-        x1, y1, x2, y2 = bbox
-        crop_x, crop_y, _, _ = self.crop_coords
+        cropped = img[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
         
-        # Adjust bbox to cropped area
-        new_x1 = max(0, x1 - crop_x)
-        new_y1 = max(0, y1 - crop_y)
-        new_x2 = min(self.width, x2 - crop_x)
-        new_y2 = min(self.height, y2 - crop_y)
-        
-        return [new_x1, new_y1, new_x2, new_y2]
+        return cropped
     
-    def get_params(self):
-        return {"crop_coords": self.crop_coords}
+    def get_transform_init_args_names(self):
+        return ("height", "width")
+    
+    def get_params_dependent_on_targets(self, params):
+        return {
+            'crop_coords': self.crop_coords
+        }
+    
+    def update_params(self, params, **kwargs):
+        params = super().update_params(params, **kwargs)
+        params['crop_coords'] = self.crop_coords
+        return params
 
 class RotationTrackingTransform(BasicTransform):
     """Custom transform that tracks rotation angle"""
@@ -238,16 +234,55 @@ class PCBDataset(Dataset):
         
         if self.augment:
             if self.track_crop:
-                # Use custom transforms that track coordinates
+                # Use Lambda transform to track coordinates and rotation
+                def rotate_and_crop_func(img, **kwargs):
+                    # First apply rotation
+                    h, w = img.shape[:2]
+                    center = (w // 2, h // 2)
+                    rotation_angle = np.random.uniform(-5, 5)  # -5 to 5 degrees, matching original
+                    rotation_matrix = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
+                    rotated = cv2.warpAffine(img, rotation_matrix, (w, h),
+                                           flags=cv2.INTER_NEAREST,
+                                           borderMode=cv2.BORDER_REPLICATE)
+                    
+                    # Then apply crop
+                    crop_h = min(self.image_size, h)
+                    crop_w = min(self.image_size, w)
+                    max_h = h - crop_h
+                    max_w = w - crop_w
+                    crop_y = np.random.randint(0, max_h + 1) if max_h > 0 else 0
+                    crop_x = np.random.randint(0, max_w + 1) if max_w > 0 else 0
+                    
+                    # Return cropped image and both rotation and crop info
+                    return (rotated[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w], 
+                           {'crop_coords': (crop_x, crop_y, crop_x + crop_w, crop_y + crop_h),
+                            'rotation_angle': rotation_angle})
+
                 self.aug = A.Compose(
                     [
-                        A.RandomBrightnessContrast(
-                            brightness_limit=0.05, contrast_limit=0.05, p=0.5
-                        ),
-                        RotationTrackingTransform(limit=5, p=1),
-                        CropTrackingTransform(height=self.image_size, width=self.image_size, p=1),
+                        A.Lambda(
+                            image=lambda x, **kwargs: rotate_and_crop_func(x)[0],  # Return only the image
+                            mask=lambda x, **kwargs: rotate_and_crop_func(x)[0],   # Return only the image
+                            always_apply=True
+                        )
                     ]
                 )
+                
+                # Store the last transform info
+                self.last_transform_info = None
+                
+                # Override the original augmentation call
+                original_aug = self.aug
+                def augmentation_with_tracking(image, mask):
+                    # Get both image and transform info
+                    cropped_img, transform_info = rotate_and_crop_func(image)
+                    # Store transform info
+                    self.last_transform_info = transform_info
+                    # Apply to mask
+                    cropped_mask = rotate_and_crop_func(mask)[0]
+                    return {'image': cropped_img, 'mask': cropped_mask}
+                
+                self.aug = augmentation_with_tracking
             else:
                 # Original augmentation pipeline
                 self.aug = A.Compose(
@@ -265,7 +300,35 @@ class PCBDataset(Dataset):
                     ]
                 )
         else:
-            self.aug = A.CenterCrop(p=1, height=self.image_size, width=self.image_size)
+            # Use Lambda transform for center crop with tracking
+            if self.track_crop:
+                def center_crop_func(img, **kwargs):
+                    h, w = img.shape[:2]
+                    crop_h = min(self.image_size, h)
+                    crop_w = min(self.image_size, w)
+                    crop_y = (h - crop_h) // 2
+                    crop_x = (w - crop_w) // 2
+                    # For center crop, no rotation is applied
+                    return (img[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w],
+                           {'crop_coords': (crop_x, crop_y, crop_x + crop_w, crop_y + crop_h),
+                            'rotation_angle': 0})
+
+                # Store the last transform info
+                self.last_transform_info = None
+                
+                # Create wrapper function
+                def center_augmentation_with_tracking(image, mask):
+                    # Get both image and transform info
+                    cropped_img, transform_info = center_crop_func(image)
+                    # Store transform info
+                    self.last_transform_info = transform_info
+                    # Apply to mask
+                    cropped_mask = center_crop_func(mask)[0]
+                    return {'image': cropped_img, 'mask': cropped_mask}
+                
+                self.aug = center_augmentation_with_tracking
+            else:
+                self.aug = A.CenterCrop(p=1, height=self.image_size, width=self.image_size)
 
     def load_crop_annotations(self, resume_epoch=None):
         """Load existing crop annotations from JSON file"""
@@ -634,20 +697,17 @@ class PCBDataset(Dataset):
             if self.track_crop:
                 # Apply augmentation and get transformation info
                 augmented = self.aug(image=img, mask=seg)
+                
                 img = augmented["image"]
                 seg = augmented["mask"]
                 
-                # Extract crop coordinates and rotation angle from transforms
-                crop_coords = None
-                rotation_angle = 0
-                
-                # Check if we have transforms to iterate through
-                if hasattr(self.aug, 'transforms'):
-                    for transform in self.aug.transforms:
-                        if hasattr(transform, 'crop_coords'):
-                            crop_coords = transform.crop_coords
-                        if hasattr(transform, 'rotation_angle'):
-                            rotation_angle = transform.rotation_angle
+                # Get crop coordinates and rotation angle from instance variable
+                if self.last_transform_info is not None:
+                    crop_coords = self.last_transform_info['crop_coords']
+                    rotation_angle = self.last_transform_info['rotation_angle']
+                else:
+                    crop_coords = None
+                    rotation_angle = 0
                 
                 # Calculate final crop coordinates in original image space
                 if crop_coords is not None:
@@ -660,6 +720,17 @@ class PCBDataset(Dataset):
                         'rotation_angle': rotation_angle,
                         'original_shape': original_shape
                     }
+                    
+                    # Save the cropped image before normalization
+                    if self.track_crop:
+                        os.makedirs("tmp", exist_ok=True)
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        x1, y1, x2, y2 = crop_info['crop_coords']
+                        coords_str = f"x{x1}-y{y1}-x{x2}-y{y2}"
+                        tmp_filename = os.path.join("tmp", f"crop_verify_{coords_str}_{timestamp}.png")
+                        # Ensure img is uint8 for saving
+                        img_to_save = img.astype(np.uint8) if isinstance(img, np.ndarray) else img
+                        cv2.imwrite(tmp_filename, cv2.cvtColor(img_to_save, cv2.COLOR_RGB2BGR))
                     
                     # Add to cumulative map instead of creating individual visualizations
                     if self.save_crop_visualizations:
@@ -710,41 +781,19 @@ class PCBDataset(Dataset):
         else:
             img = self.transform_volume(img)
             img = (img - 0.5) / 0.5
-
-        #import matplotlib.pyplot as plt
-        ## Convert tensor back to numpy for saving
-        #if isinstance(img, torch.Tensor):
-        #    img_np = img.detach().cpu().numpy()
-        #    if img_np.ndim == 3:
-        #        img_np = img_np.transpose(1, 2, 0)  # CHW to HWC
-        #    # Denormalize
-        #    img_np = (img_np + 1) / 2  # [-1,1] to [0,1]
-        #    img_np = np.clip(img_np, 0, 1)
-        #else:
-        #    img_np = img
-        ## Save image
-        #timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        #filename = f"tmp/pcb_image_{index}_{timestamp}.png"
-        #plt.imsave(filename, img_np)
-        #print(f"Saved image to: {filename}")
-        #breakpoint()
-        #print(f"Image shape: {img_np.shape}, dtype: {img_np.dtype}")
-        #print(f"Image range: [{img_np.min():.3f}, {img_np.max():.3f}]")
         
-        if self.track_crop and crop_info is not None:
-            return (
-                img,
-                seg.astype(np.float32),
-                int(y),
-                self.image_paths[index],
-                anomaly_class,
-                crop_info,  # Add crop information to the return tuple
-            )
-        else:
-            return (
-                img,
-                seg.astype(np.float32),
-                int(y),
-                self.image_paths[index],
-                anomaly_class,
-            )
+        # Always return 6 values, with crop_info being an empty dict when not tracking or no crop was performed
+        default_crop_info = {
+            'crop_coords': (-1, -1, -1, -1),  # Invalid coordinates to indicate no crop
+            'rotation_angle': 0,
+            'original_shape': self.images[index].shape[:2] if self.track_crop else (-1, -1)
+        }
+        
+        return (
+            img,
+            seg.astype(np.float32),
+            int(y),
+            self.image_paths[index],
+            anomaly_class,
+            crop_info if (self.track_crop and crop_info is not None) else default_crop_info,  # Return default dict if not tracking
+        )
