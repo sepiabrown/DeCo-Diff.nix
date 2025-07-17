@@ -484,13 +484,7 @@ def _main(args):
             print(f"DEBUG: Setting dataset.current_epoch to {epoch}")
             
         for batch_idx, batch in enumerate(loader):
-            # Handle different data structures based on whether crop tracking is enabled
-            if args.dataset == "pcb" and hasattr(dataset, 'track_crop') and dataset.track_crop:
-                # PCB dataset with crop tracking returns additional crop_info
-                x, _, y, _, _, crop_info = batch
-            else:
-                # Standard data structure for other datasets
-                x, _, y, _, _ = batch
+            x, _, y, _, _, crop_info = batch
             
             x = x.to(torch_device)
             with torch.no_grad():
