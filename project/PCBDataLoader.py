@@ -17,6 +17,7 @@ import matplotlib.patches as patches
 from collections import defaultdict
 from matplotlib import transforms
 import json
+from utils import path_to_safe_filename
 
 class CropTrackingTransform(BasicTransform):
     """Custom transform that tracks crop coordinates after rotation"""
@@ -126,6 +127,7 @@ class PCBDataset(Dataset):
         crop_vis_dir: str = "./crop_visualizations",  # Directory to save crop visualizations
         resume_dir: str = None,  # Directory to resume from (for loading existing crop annotations)
         resume_epoch: int = None,  # Epoch to resume from (for filtering crops)
+        cumulative_crops: dict = None,  # Dictionary to store cumulative crops
     ):
         """
         Args:
@@ -148,7 +150,7 @@ class PCBDataset(Dataset):
         self.save_crop_visualizations = save_crop_visualizations
         self.crop_vis_dir = crop_vis_dir
         self.resume_dir = resume_dir
-        self.resume_epoch = resume_epoch  # Add resume_epoch to class attributes
+        self.resume_epoch = resume_epoch
         self.current_epoch = 0  # Track current epoch for crop annotations
         
         # Create crop visualization directory if needed
@@ -156,14 +158,16 @@ class PCBDataset(Dataset):
             os.makedirs(self.crop_vis_dir, exist_ok=True)
             
         # Dictionary to store cumulative crop information per original image
-        self.cumulative_crops = defaultdict(list)
+        if cumulative_crops is not None:
+            self.cumulative_crops = cumulative_crops
+        else:
+            self.cumulative_crops = defaultdict(list)
+            # Only load from JSON if not provided
+            if self.resume_dir and self.track_crop:
+                self.load_crop_annotations(resume_epoch)
         
         # Add a set to track unique crops
         self.added_crops = set()  # Track (image_path, coords, epoch) tuples
-        
-        # Load existing crop annotations if resuming
-        if self.resume_dir and self.track_crop:
-            self.load_crop_annotations(resume_epoch=resume_epoch)
             
         object_cls_dict = {
             "pcb": 0,
@@ -232,145 +236,105 @@ class PCBDataset(Dataset):
                     seg_shape = (self.image_size, self.image_size)
                 self.segs.append(np.zeros(seg_shape))
         
-        if self.augment:
-            if self.track_crop:
-                # Use Lambda transform to track coordinates and rotation
-                def rotate_and_crop_func(img, **kwargs):
-                    # First apply rotation
-                    h, w = img.shape[:2]
-                    center = (w // 2, h // 2)
-                    rotation_angle = np.random.uniform(-5, 5)  # -5 to 5 degrees, matching original
-                    #rotation_angle = 0
-                    
-                    # Create rotation matrix and its inverse
-                    rotation_matrix = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
-                    inverse_matrix = cv2.getRotationMatrix2D(center, -rotation_angle, 1.0)
-                    
-                    # Apply rotation to image
-                    rotated = cv2.warpAffine(img, rotation_matrix, (w, h),
-                                           flags=cv2.INTER_NEAREST,
-                                           borderMode=cv2.BORDER_REPLICATE)
-                    
-                    # Then apply crop to rotated image
-                    crop_h = min(self.image_size, h)
-                    crop_w = min(self.image_size, w)
-                    max_h = h - crop_h
-                    max_w = w - crop_w
+        # First check if we're tracking crops
+        if self.track_crop:
+            # Define tracking functions that will be used for both augmented and non-augmented cases
+            def rotate_and_crop_func(img, **kwargs):
+                # Apply brightness/contrast first
+                img, brightness_factor, contrast_factor, bc_applied = random_brightness_contrast(
+                    img, brightness_limit=0.05, contrast_limit=0.05, p=0.5
+                )
+                # First apply rotation
+                h, w = img.shape[:2]
+                center = (w // 2, h // 2)
+                #rotation_angle = np.random.uniform(-5, 5) if self.augment else 0  # Only rotate if augment is True
+                rotation_angle = 30
+
+                # Create rotation matrix and its inverse
+                rotation_matrix = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
+                inverse_matrix = cv2.getRotationMatrix2D(center, -rotation_angle, 1.0)
+                
+                # Apply rotation to image
+                rotated = cv2.warpAffine(img, rotation_matrix, (w, h),
+                                       flags=cv2.INTER_NEAREST,
+                                       borderMode=cv2.BORDER_REPLICATE)
+                
+                # Then apply crop to rotated image
+                crop_h = min(self.image_size, h)
+                crop_w = min(self.image_size, w)
+                max_h = h - crop_h
+                max_w = w - crop_w
+                
+                if self.augment:
+                    # Random crop for augmentation
                     crop_y = np.random.randint(0, max_h + 1) if max_h > 0 else 0
                     crop_x = np.random.randint(0, max_w + 1) if max_w > 0 else 0
-                    
-                    # Get the cropped region from rotated image
-                    cropped_rotated = rotated[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
-                    
-                    # Get crop coordinates in rotated space
-                    crop_corners_rot = np.array([
-                        [crop_x, crop_y],                    # top-left
-                        [crop_x + crop_w, crop_y],          # top-right
-                        [crop_x + crop_w, crop_y + crop_h], # bottom-right
-                        [crop_x, crop_y + crop_h]           # bottom-left
-                    ], dtype=np.float32)
-                    
-                    # Transform coordinates back to original space
-                    # First translate to origin
-                    crop_corners_rot -= np.array([center[0], center[1]])
-                    
-                    # Apply inverse rotation
-                    angle_rad = np.radians(-rotation_angle)
-                    cos_a = np.cos(angle_rad)
-                    sin_a = np.sin(angle_rad)
-                    rotation_mat = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
-                    crop_corners_orig = np.dot(crop_corners_rot, rotation_mat.T)
-                    
-                    # Translate back
-                    crop_corners_orig += np.array([center[0], center[1]])
-                    
-                    # Calculate bounding box in original space
-                    x1_orig = max(0, int(np.min(crop_corners_orig[:, 0])))
-                    y1_orig = max(0, int(np.min(crop_corners_orig[:, 1])))
-                    x2_orig = min(w, int(np.max(crop_corners_orig[:, 0])))
-                    y2_orig = min(h, int(np.max(crop_corners_orig[:, 1])))
-                    
-                    # Get the region from original image and rotate it to match
-                    original_region = img[y1_orig:y2_orig, x1_orig:x2_orig]
-                    region_h, region_w = original_region.shape[:2]
-                    region_center = (region_w // 2, region_h // 2)
-                    region_rotation_matrix = cv2.getRotationMatrix2D(region_center, rotation_angle, 1.0)
-                    rotated_region = cv2.warpAffine(original_region, region_rotation_matrix, (region_w, region_h),
-                                                  flags=cv2.INTER_NEAREST,
-                                                  borderMode=cv2.BORDER_REPLICATE)
-                    
-                    # Save debug images
-                    os.makedirs("tmp", exist_ok=True)
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    
-                    # Save the cropped region from rotated image
-                    cropped_rotated_uint8 = (cropped_rotated * 255).astype(np.uint8)
-                    cv2.imwrite(f"tmp/debug_cropped_rotated_{timestamp}.png", cv2.cvtColor(cropped_rotated_uint8, cv2.COLOR_RGB2BGR))
-                    
-                    # Save the rotated region from original image
-                    rotated_region_uint8 = (rotated_region * 255).astype(np.uint8)
-                    cv2.imwrite(f"tmp/debug_rotated_region_{timestamp}.png", cv2.cvtColor(rotated_region_uint8, cv2.COLOR_RGB2BGR))
-                    
-                    # Save full debug visualization
-                    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
-                    
-                    # Original image with transformed coordinates
-                    ax1.imshow(img)
-                    ax1.plot(crop_corners_orig[:, 0], crop_corners_orig[:, 1], 'r-')
-                    ax1.plot([crop_corners_orig[-1, 0], crop_corners_orig[0, 0]], 
-                            [crop_corners_orig[-1, 1], crop_corners_orig[0, 1]], 'r-')
-                    ax1.set_title('Original Image\nwith Transformed Coords')
-                    
-                    # Rotated image with crop coordinates
-                    ax2.imshow(rotated)
-                    ax2.plot(crop_corners_rot[:, 0], crop_corners_rot[:, 1], 'r-')
-                    ax2.plot([crop_corners_rot[-1, 0], crop_corners_rot[0, 0]], 
-                            [crop_corners_rot[-1, 1], crop_corners_rot[0, 1]], 'r-')
-                    ax2.set_title('Rotated Image\nwith Crop Coords')
-                    
-                    # Comparison of regions
-                    # Resize both regions to the same size for comparison
-                    cropped_rotated_resized = cv2.resize(cropped_rotated_uint8, (crop_w, crop_h))
-                    rotated_region_resized = cv2.resize(rotated_region_uint8, (crop_w, crop_h))
-                    ax3.imshow(np.hstack([cropped_rotated_resized, rotated_region_resized]))
-                    ax3.set_title('Comparison\nCropped (L) vs Rotated Region (R)')
-                    
-                    plt.tight_layout()
-                    plt.savefig(f"tmp/debug_full_comparison_{timestamp}.png")
-                    plt.close()
-                    
-                    # Return cropped image and transform info
-                    return (rotated[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w], 
-                           {'crop_coords': (x1_orig, y1_orig, x2_orig, y2_orig),
-                            'rotation_angle': rotation_angle})
+                else:
+                    # Center crop for non-augmentation
+                    crop_y = (h - crop_h) // 2
+                    crop_x = (w - crop_w) // 2
+                
+                # Get the cropped region from rotated image
+                cropped_rotated = rotated[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+                
+                # Get crop coordinates in rotated space
+                crop_corners_rot = np.array([
+                    [crop_x, crop_y],                    # top-left
+                    [crop_x + crop_w, crop_y],          # top-right
+                    [crop_x + crop_w, crop_y + crop_h], # bottom-right
+                    [crop_x, crop_y + crop_h]           # bottom-left
+                ], dtype=np.float32)
+                # Transform coordinates back to original space using OpenCV's inverse matrix
+                crop_corners_orig = cv2.transform(crop_corners_rot.reshape(-1, 1, 2), inverse_matrix).reshape(-1, 2)
+                
+                ## Debugging: save annotated images
+                #if self.save_crop_visualizations:
+                #    os.makedirs("tmp", exist_ok=True)
+                #    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                #    # 1. Rotated image with crop rectangle and center point
+                #    rotated_vis = rotated.copy()
+                #    # Draw crop rectangle (in rotated space)
+                #    crop_rect = np.array([
+                #        [crop_x, crop_y],
+                #        [crop_x + crop_w, crop_y],
+                #        [crop_x + crop_w, crop_y + crop_h],
+                #        [crop_x, crop_y + crop_h]
+                #    ], dtype=np.int32)
+                #    cv2.polylines(rotated_vis, [crop_rect], isClosed=True, color=(0,255,0), thickness=1)
+                #    # Draw center point
+                #    cv2.circle(rotated_vis, center, 5, (0,0,255), -1)
+                #    rotated_vis_bgr = cv2.cvtColor(rotated_vis, cv2.COLOR_RGB2BGR)
+                #    cv2.imwrite(f"tmp/rotated_with_crop_{timestamp}.png", rotated_vis_bgr)
+                #    # 2. Original image with transformed crop rectangle and center point
+                #    orig_vis = img.copy()
+                #    cv2.polylines(orig_vis, [crop_corners_orig.astype(np.int32)], isClosed=True, color=(255,0,0), thickness=1)
+                #    cv2.circle(orig_vis, center, 5, (0,0,255), -1)
+                #    orig_vis_bgr = cv2.cvtColor(orig_vis, cv2.COLOR_RGB2BGR)
+                #    cv2.imwrite(f"tmp/original_with_crop_{timestamp}.png", orig_vis_bgr)
+                
+                # Return cropped image and transform info
+                crop_corners_orig_flat = [float(x) for x in np.array(crop_corners_orig).flatten()]
+                return (cropped_rotated, 
+                       {
+                           'crop_coords': crop_corners_orig_flat,  # Return as tuple instead of list
+                           'rotation_angle': rotation_angle,
+                           'brightness_factor': brightness_factor,
+                           'contrast_factor': contrast_factor,
+                           'brightness_contrast_applied': bc_applied,
+                           'original_shape': img.shape[:2]
+                       })
+            
+            # Create wrapper function for both augmented and non-augmented cases
+            def transform_with_tracking(image, mask):
+                cropped_img, transform_info = rotate_and_crop_func(image)
+                cropped_mask = rotate_and_crop_func(mask)[0]
+                return {'image': cropped_img, 'mask': cropped_mask, 'transform_info': transform_info}
+            
+            self.aug = transform_with_tracking
 
-                self.aug = A.Compose(
-                    [
-                        A.Lambda(
-                            image=lambda x, **kwargs: rotate_and_crop_func(x)[0],  # Return only the image
-                            mask=lambda x, **kwargs: rotate_and_crop_func(x)[0],   # Return only the image
-                            always_apply=True
-                        )
-                    ]
-                )
-                
-                # Store the last transform info
-                self.last_transform_info = None
-                
-                # Override the original augmentation call
-                original_aug = self.aug
-                def augmentation_with_tracking(image, mask):
-                    # Get both image and transform info
-                    cropped_img, transform_info = rotate_and_crop_func(image)
-                    # Store transform info
-                    self.last_transform_info = transform_info
-                    # Apply to mask
-                    cropped_mask = rotate_and_crop_func(mask)[0]
-                    return {'image': cropped_img, 'mask': cropped_mask}
-                
-                self.aug = augmentation_with_tracking
-            else:
-                # Original augmentation pipeline
+        else:
+            # No crop tracking - use standard augmentations
+            if self.augment:
                 self.aug = A.Compose(
                     [
                         A.RandomBrightnessContrast(
@@ -385,46 +349,13 @@ class PCBDataset(Dataset):
                         A.RandomCrop(p=1, height=self.image_size, width=self.image_size),
                     ]
                 )
-        else:
-            # Use Lambda transform for center crop with tracking
-            if self.track_crop:
-                def center_crop_func(img, **kwargs):
-                    h, w = img.shape[:2]
-                    crop_h = min(self.image_size, h)
-                    crop_w = min(self.image_size, w)
-                    crop_y = (h - crop_h) // 2
-                    crop_x = (w - crop_w) // 2
-                    # For center crop, no rotation is applied
-                    return (img[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w],
-                           {'crop_coords': (crop_x, crop_y, crop_x + crop_w, crop_y + crop_h),
-                            'rotation_angle': 0})
-
-                # Store the last transform info
-                self.last_transform_info = None
-                
-                # Create wrapper function
-                def center_augmentation_with_tracking(image, mask):
-                    # Get both image and transform info
-                    cropped_img, transform_info = center_crop_func(image)
-                    # Store transform info
-                    self.last_transform_info = transform_info
-                    # Apply to mask
-                    cropped_mask = center_crop_func(mask)[0]
-                    return {'image': cropped_img, 'mask': cropped_mask}
-                
-                self.aug = center_augmentation_with_tracking
             else:
                 self.aug = A.CenterCrop(p=1, height=self.image_size, width=self.image_size)
 
-    def load_crop_annotations(self, resume_epoch=None):
+    def load_crop_annotations(self, resume_epoch):
         """Load existing crop annotations from JSON file"""
         if not self.resume_dir:
             return
-            
-        # Update instance resume_epoch if provided
-        if resume_epoch is not None:
-            self.resume_epoch = resume_epoch
-            print(f"DEBUG: Resume epoch set to {self.resume_epoch}")
             
         crop_annotations_file = os.path.join(self.resume_dir, "crop_annotations.json")
         if os.path.exists(crop_annotations_file):
@@ -473,74 +404,13 @@ class PCBDataset(Dataset):
         """Save crop annotations to JSON file"""
         if not self.resume_dir or not self.track_crop:
             return
-            
         crop_annotations_file = os.path.join(self.resume_dir, "crop_annotations.json")
         try:
-            # Load existing annotations first
-            existing_crops = {}
-            if os.path.exists(crop_annotations_file):
-                try:
-                    with open(crop_annotations_file, 'r') as f:
-                        existing_crops = json.load(f)
-                except Exception as e:
-                    print(f"Warning: Could not load existing crop annotations: {e}")
-            
-            # Convert current cumulative crops to serializable format using absolute image paths as keys
-            output_crops = {}
-            
-            # First, copy all existing crops that we want to keep
-            for image_path, crops in existing_crops.items():
-                # Initialize list for this image if not exists
-                if image_path not in output_crops:
-                    output_crops[image_path] = []
-                
-                # Keep only crops from epochs before resume_epoch if specified
-                for crop in crops:
-                    crop_epoch = crop.get('epoch', 0)
-                    if self.resume_epoch is None or crop_epoch < self.resume_epoch:
-                        output_crops[image_path].append(crop)
-            
-            # Then add new crops from current session, but only if they're from current or later epochs
-            for image_path, crops_info in self.cumulative_crops.items():
-                # Get the absolute path for the image
-                abs_image_path = os.path.abspath(image_path)
-                
-                # Initialize list for this image if not exists
-                if abs_image_path not in output_crops:
-                    output_crops[abs_image_path] = []
-                
-                # Create a set of unique identifiers for existing crops
-                existing_crop_ids = set()
-                for crop in output_crops[abs_image_path]:
-                    crop_coords = tuple(crop['crop_coords'])
-                    rotation_angle = round(crop.get('rotation_angle', 0), 6)
-                    epoch = crop.get('epoch', 0)
-                    crop_id = f"{crop_coords}_{rotation_angle}_{epoch}"
-                    existing_crop_ids.add(crop_id)
-                
-                # Add all new crops for this image, avoiding duplicates and respecting resume_epoch
-                for crop_info in crops_info:
-                    crop_epoch = crop_info.get('epoch', 0)
-                    # Only add crops from current epoch or later epochs
-                    if self.resume_epoch is None or crop_epoch >= self.resume_epoch:
-                        crop_coords = tuple(crop_info['crop_coords'])
-                        rotation_angle = round(crop_info.get('rotation_angle', 0), 6)
-                        crop_id = f"{crop_coords}_{rotation_angle}_{crop_epoch}"
-                        
-                        if crop_id not in existing_crop_ids:
-                            output_crops[abs_image_path].append({
-                                'crop_coords': crop_info['crop_coords'],
-                                'rotation_angle': crop_info['rotation_angle'],
-                                'original_shape': crop_info['original_shape'],
-                                'epoch': crop_info['epoch']
-                            })
-                            existing_crop_ids.add(crop_id)
-            
             # Save to file
             with open(crop_annotations_file, 'w') as f:
-                json.dump(output_crops, f, indent=2)
+                json.dump(self.cumulative_crops, f, indent=2)
                 
-            print(f"Saved {sum(len(crops) for crops in output_crops.values())} total crop annotations to {crop_annotations_file}")
+            #print(f"DEBUG:Saved {sum(len(crops) for crops in self.cumulative_crops.values())} total crop annotations to {crop_annotations_file}")
             
         except Exception as e:
             print(f"Error saving crop annotations: {e}")
@@ -583,39 +453,33 @@ class PCBDataset(Dataset):
         # Add epoch information to crop_info
         if current_epoch is not None:
             crop_info['epoch'] = current_epoch
-            print(f"DEBUG: Setting epoch to {current_epoch} for crop at path {original_image_path}")
+            #print(f"DEBUG: Setting epoch to {current_epoch} for crop at path {original_image_path}")
         
         # Initialize list for this image if not exists
         if original_image_path not in self.cumulative_crops:
             self.cumulative_crops[original_image_path] = []
         
-        # Create a unique identifier for this crop
-        crop_coords = tuple(crop_info['crop_coords'])
-        rotation_angle = round(crop_info.get('rotation_angle', 0), 6)
-        epoch = crop_info.get('epoch', 0)
-        crop_id = (crop_coords, rotation_angle, epoch)
-        
         # Check if this exact crop already exists
-        existing_crop_ids = {
-            (tuple(c['crop_coords']), round(c.get('rotation_angle', 0), 6), c.get('epoch', 0))
-            for c in self.cumulative_crops[original_image_path]
-        }
+        #existing_crop_ids = {
+        #    (tuple(c['crop_coords']), round(c.get('rotation_angle', 0), 6), c.get('epoch', 0))
+        #    for c in self.cumulative_crops[original_image_path]
+        #}
         
-        if crop_id not in existing_crop_ids:
-            print(f"DEBUG: Adding new crop with coords {crop_coords}, rotation {rotation_angle}, epoch {epoch}")
-            self.cumulative_crops[original_image_path].append(crop_info)
-            
-            # Update visualization
-            if self.save_crop_visualizations:
-                # Get the index of this image in our paths list
-                self.save_crop_annotations()
-                try:
-                    image_index = self.image_paths.index(original_image_path)
-                    self.create_cumulative_crop_visualization(image_index)
-                except ValueError:
-                    print(f"Warning: Could not find index for image path {original_image_path}")
+        #if crop_id not in existing_crop_ids:
+        #print(f"DEBUG: Adding new crop with coords {crop_coords_tuple}, rotation {rotation_angle}, epoch {epoch}")
+        self.cumulative_crops[original_image_path].append(crop_info)
+         
+        # Update visualization
+        if self.save_crop_visualizations:
+            # Get the index of this image in our paths list
+            self.save_crop_annotations()
+            try:
+                image_index = self.image_paths.index(original_image_path)
+                self.create_cumulative_crop_visualization(image_index)
+            except ValueError:
+                print(f"Warning: Could not find index for image path {original_image_path}")
         
-        print(f"DEBUG: Total unique crops for image {original_image_path}: {len(self.cumulative_crops[original_image_path])}")
+        #print(f"DEBUG: Total unique crops for image {original_image_path}: {len(self.cumulative_crops[original_image_path])}")
 
     def create_cumulative_crop_visualization(self, original_image_index, save_path=None):
         """
@@ -625,11 +489,11 @@ class PCBDataset(Dataset):
             original_image_index: Index of the original image
             save_path: Optional path to save the visualization
         """
-        print(f"DEBUGGGGGGGGGGGGGGGGGG: Creating cumulative crop visualization for image {original_image_index}")
         # Get the original image
         original_image = self.images[original_image_index]
         original_image_path = self.image_paths[original_image_index]
-        original_filename = os.path.splitext(os.path.basename(original_image_path))[0]
+        original_image_basename = os.path.basename(original_image_path)
+        original_filename = path_to_safe_filename(original_image_path)
         
         # Load ALL crops from JSON file for this image
         all_crops = []
@@ -641,12 +505,11 @@ class PCBDataset(Dataset):
                         loaded_crops = json.load(f)
                     
                     # Get crops for this specific image path
-                    image_path = os.path.abspath(original_image_path)
-                    if image_path in loaded_crops:
-                        all_crops = loaded_crops[image_path]
+                    if original_image_path in loaded_crops:
+                        all_crops = loaded_crops[original_image_path]
                 except Exception as e:
                     print(f"Warning: Could not load crop annotations for visualization: {e}")
-        
+
         # If no crops found in JSON, use in-memory crops as fallback
         if not all_crops and original_image_index in self.cumulative_crops:
             all_crops = self.cumulative_crops[original_image_path]
@@ -662,9 +525,7 @@ class PCBDataset(Dataset):
         
         # Draw rectangles for all crops
         for i, crop_info in enumerate(all_crops):
-            x1, y1, x2, y2 = crop_info['crop_coords']
-            rotation_angle = crop_info.get('rotation_angle', 0)
-            epoch = crop_info.get('epoch', 'unknown')
+            corners = crop_info['crop_coords']  # List of 4 (x,y) corner points
             
             # Color scheme: green for latest, red for all others
             if i == len(all_crops) - 1:  # Latest crop
@@ -674,47 +535,31 @@ class PCBDataset(Dataset):
                 color = 'red'
                 linewidth = 2
             
-            # Calculate rectangle center and dimensions
-            center_x = (x1 + x2) / 2
-            center_y = (y1 + y2) / 2
-            width = x2 - x1
-            height = y2 - y1
+            # Create polygon from the 4 corner points
+            # Handle flattened array format: [x1, y1, x2, y2, x3, y3, x4, y4]
+            # Reshape to (4, 2) format for matplotlib Polygon
+            corners_array = np.array(corners)
+            polygon_points = corners_array.reshape(-1, 2)
             
-            # Create rotated rectangle
-            if rotation_angle != 0:
-                # Convert angle to radians
-                angle_rad = math.radians(rotation_angle)
-                
-                # Create rectangle patch
-                rect = patches.Rectangle((x1, y1), width, height, 
-                                       linewidth=linewidth, edgecolor=color, facecolor='none')
-                
-                # Apply rotation transformation
-                transform = (ax.transData + 
-                           transforms.Affine2D().rotate(angle_rad).translate(center_x, center_y) +
-                           transforms.Affine2D().translate(-center_x, -center_y))
-                rect.set_transform(transform)
-            else:
-                # No rotation - draw regular rectangle
-                rect = patches.Rectangle((x1, y1), width, height, 
-                                       linewidth=linewidth, edgecolor=color, facecolor='none')
+            # Create polygon patch
+            polygon = patches.Polygon(polygon_points, 
+                                    linewidth=linewidth, edgecolor=color, facecolor='none')
             
-            ax.add_patch(rect)
+            ax.add_patch(polygon)
         
         # Set title with all the information including epoch info
-        title_text = f'Cumulative Crop Map - {original_filename}\nTotal Crops: {len(all_crops)} | Green: Latest | Red: Previous'
+        title_text = f'Cumulative Crop Map - {original_image_basename}\nTotal Crops: {len(all_crops)} | Green: Latest | Red: Previous'
         ax.set_title(title_text, fontsize=14, weight='bold', pad=20)
         ax.axis('off')
         
         # Save the visualization with original filename
         if save_path is None:
-            save_path = os.path.join(self.crop_vis_dir, f"cumulative_crops_{original_filename}.png")
+            save_path = os.path.join(self.crop_vis_dir, f"{original_filename}.png")
         
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
         
-        print(f"Cumulative crop visualization saved to: {save_path} with {len(all_crops)} crops")
         return save_path
 
     def __getitem__(self, index):
@@ -722,55 +567,27 @@ class PCBDataset(Dataset):
         seg = self.segs[index].astype(np.int32)
         anomaly_class = self.anomaly_classes[index]
         
-        crop_info = None
         if self.augment:
+            augmented = self.aug(image=img, mask=seg)
+            img = augmented["image"]
+            seg = augmented["mask"]
+            transform_info = augmented["transform_info"]
+
             if self.track_crop:
-                # Apply augmentation and get transformation info
-                augmented = self.aug(image=img, mask=seg)
-                
-                img = augmented["image"]
-                seg = augmented["mask"]
-                
-                # Get crop coordinates and rotation angle from instance variable
-                if self.last_transform_info is not None:
-                    crop_coords = self.last_transform_info['crop_coords']
-                    rotation_angle = self.last_transform_info['rotation_angle']
-                else:
-                    crop_coords = None
-                    rotation_angle = 0
-                
-                # Calculate final crop coordinates in original image space
-                if crop_coords is not None:
-                    original_shape = self.images[index].shape[:2]
-                    final_crop_coords = self.get_crop_coordinates_after_rotation(
-                        crop_coords, rotation_angle, original_shape
-                    )
-                    crop_info = {
-                        'crop_coords': final_crop_coords,
-                        'rotation_angle': rotation_angle,
-                        'original_shape': original_shape
-                    }
+                os.makedirs("tmp", exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                corners = transform_info['crop_coords']
+                # Handle flattened array format: [x1, y1, x2, y2, x3, y3, x4, y4]
+                x1, y1 = corners[0], corners[1]  # First corner coordinates
+                coords_str = f"x{x1}-y{y1}"
+                tmp_filename = os.path.join("tmp", f"crop_verify_{coords_str}_{timestamp}.png")
+                # Ensure img is uint8 for saving
+                img_to_save = img.astype(np.uint8) if isinstance(img, np.ndarray) else img
+                cv2.imwrite(tmp_filename, cv2.cvtColor(img_to_save, cv2.COLOR_RGB2BGR))
                     
-                    # Save the cropped image before normalization
-                    if self.track_crop:
-                        os.makedirs("tmp", exist_ok=True)
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        x1, y1, x2, y2 = crop_info['crop_coords']
-                        coords_str = f"x{x1}-y{y1}-x{x2}-y{y2}"
-                        tmp_filename = os.path.join("tmp", f"crop_verify_{coords_str}_{timestamp}.png")
-                        # Ensure img is uint8 for saving
-                        img_to_save = img.astype(np.uint8) if isinstance(img, np.ndarray) else img
-                        cv2.imwrite(tmp_filename, cv2.cvtColor(img_to_save, cv2.COLOR_RGB2BGR))
-                    
-                    # Add to cumulative map instead of creating individual visualizations
-                    if self.save_crop_visualizations:
-                        # Pass the current epoch to track when the crop was created
-                        self.add_crop_to_cumulative_map(self.image_paths[index], crop_info, self.current_epoch)
-            else:
-                # Original augmentation without tracking
-                augmented = self.aug(image=img, mask=seg)
-                img = augmented["image"]
-                seg = augmented["mask"]
+            if self.save_crop_visualizations:
+                self.add_crop_to_cumulative_map(self.image_paths[index], transform_info, self.current_epoch)
+
 
         if self.scratch:
             img, _, _ = add_scratch_controlled(img)
@@ -816,7 +633,7 @@ class PCBDataset(Dataset):
         default_crop_info = {
             'crop_coords': (-1, -1, -1, -1),  # Invalid coordinates to indicate no crop
             'rotation_angle': 0,
-            'original_shape': self.images[index].shape[:2] if self.track_crop else (-1, -1)
+            'original_shape': self.images[index].shape[:2]
         }
         
         return (
@@ -825,5 +642,24 @@ class PCBDataset(Dataset):
             int(y),
             self.image_paths[index],
             anomaly_class,
-            crop_info if (self.track_crop and crop_info is not None) else default_crop_info,  # Return default dict if not tracking
+            transform_info if self.augment else default_crop_info,  # Return default dict if not tracking
         )
+        
+def random_brightness_contrast(img, brightness_limit=0.05, contrast_limit=0.05, p=0.5):
+    import random
+    import numpy as np
+
+    brightness_factor = 0.0
+    contrast_factor = 0.0
+    applied = False
+
+    if np.random.rand() < p:
+        brightness_factor = np.random.uniform(-brightness_limit, brightness_limit)
+        contrast_factor = np.random.uniform(-contrast_limit, contrast_limit)
+        img = img.astype(np.float32)
+        mean = np.mean(img, axis=(0, 1), keepdims=True)
+        img = (img - mean) * (1 + contrast_factor) + mean + brightness_factor * 255
+        img = np.clip(img, 0, 255).astype(np.uint8)
+        applied = True
+
+    return img, brightness_factor, contrast_factor, applied

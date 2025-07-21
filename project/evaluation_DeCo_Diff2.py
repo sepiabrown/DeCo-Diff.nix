@@ -1227,15 +1227,12 @@ def evaluation_annotated_images(args, diffusion, model, vae):
     # Create dataset for annotated images
     dataset = AnnotatedImageDataset(
         annotation_dir=args.annotation_dir,
-        patch_size=128,
+        patch_size=args.patch_size,
         transform=evaluator.transform,
         object_class=args.object_class,
     )
     
     loader = evaluator._get_dataloader(dataset, batch_size=8)
-    
-    # For annotated images, use patch size as center_size to ensure consistent dimensions
-    patch_center_size = 128
     
     # Create checkpoint manager
     checkpoint_manager = CheckpointManager(args.results_dir, args.annotation_dir, args.force_rerun)
@@ -1253,7 +1250,7 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         model,
         vae,
         args.reverse_steps,
-        patch_center_size,  # Use patch size instead of args.center_size
+        args.patch_size,
         args.batch_num,
         device,
         args.anomaly_binary_threshold,
@@ -1272,7 +1269,7 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         excel_records = optional_records if optional_records else records
         excel_path = make_excel(
             records=excel_records,
-            image_size=128,
+            image_size=args.patch_size,
             save_dir=checkpoint_manager.evaluation_results_dir,
             save_filename=f"report_{datetime.now().strftime('%y%m%d_%H%M%S')}"
         )
@@ -1971,7 +1968,7 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
     
     # Save marked image (always saved)
     marked_img = draw_patch_rectangles_on_image(
-        original_img, patch_results, ground_truth_patches or [], patch_size=128, stride=128, grid_thickness=1
+        original_img, patch_results, ground_truth_patches or [], patch_size=args.patch_size, stride=args.patch_size, grid_thickness=1
     )
     marked_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__marked.png")
     PILImage.fromarray(marked_img).save(marked_path)
@@ -2002,8 +1999,8 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
         x_coord, y_coord = record["patch_coords"][1]
         
         # Calculate actual patch dimensions for this position
-        patch_width = min(128, w - x_coord)
-        patch_height = min(128, h - y_coord)
+        patch_width = min(args.patch_size, w - x_coord)
+        patch_height = min(args.patch_size, h - y_coord)
         
         # Extract required anomaly maps from record
         patch_arithmetic = record["anomaly_map_arithmetic"][1]
@@ -2064,7 +2061,7 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
         for anomaly_map, suffix, is_binary in configs:
             # Save anomaly map image
             anomaly_map_img = ImageProcessor.create_anomaly_map_image(
-                anomaly_map, patch_size=128, add_grid=True, 
+                anomaly_map, patch_size=args.patch_size, add_grid=True, 
                 patch_results=patch_results, ground_truth_patches=ground_truth_patches or [], 
                 is_binary=is_binary
             )
@@ -2077,15 +2074,15 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
             PILImage.fromarray(overlay_img).save(overlay_path)
             
             # Save marked overlay image
-            marked_overlay_img = draw_patch_rectangles_on_image(overlay_img, patch_results, ground_truth_patches or [], patch_size=128, stride=128, grid_thickness=1)
+            marked_overlay_img = draw_patch_rectangles_on_image(overlay_img, patch_results, ground_truth_patches or [], patch_size=args.patch_size, stride=args.patch_size, grid_thickness=1)
             marked_overlay_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__mo_{suffix}.png")
             PILImage.fromarray(marked_overlay_img).save(marked_overlay_path)
     
     # Save evaluation results
     patch_analysis = []
     for x, y, anomaly_pixels in patch_results:
-        grid_row = y // 128
-        grid_col = x // 128
+        grid_row = y // args.patch_size
+        grid_col = x // args.patch_size
         patch_analysis.append({
             "grid_row": grid_row,
             "grid_col": grid_col,
@@ -2098,7 +2095,7 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
     evaluation_result = {
         "image_path": image_path,
         "patch_analysis": patch_analysis,
-        "grid_size": 128
+        "grid_size": args.patch_size
     }
     with open(result_path, 'w') as f:
         json.dump(evaluation_result, f, indent=2)
@@ -2123,19 +2120,29 @@ def process_split_irregular_with_checkpoint(
     enable_excel_report: bool = False,
     enable_save_optional_image_results: bool = False,
     checkpoint_manager: CheckpointManager | None = None,
-) -> tuple[List[Record], List[Record]]:
+) -> tuple[list[Record], list[Record]]:
     """Run evaluation with checkpoint/resume functionality."""
     # Initialize evaluation metrics
     if enable_epoch_stats:
         metrics = EvaluationMetrics()
 
-    results: List[Record] = []
-    optional_results: List[Record] = []  # Store optional results separately
-    
+    results: list[Record] = []
+    optional_results: list[Record] = []  # Store optional results separately
+
     # Get all unique image paths for checkpoint management
     all_image_paths = list(set([item[3] for item in dataloader.dataset]))
     all_image_paths.sort()  # Ensure consistent ordering
-    
+
+    # Build a mapping from image_path to number of patches for that image
+    from collections import defaultdict
+    image_patch_counts = defaultdict(int)
+    for item in dataloader.dataset:
+        image_patch_counts[item[3]] += 1
+
+    # Accumulate patches and records for each image
+    image_patch_accum = defaultdict(list)  # image_path -> list of (x_coord, y_coord, anomaly_pixels)
+    image_record_accum = defaultdict(list)  # image_path -> list of records
+
     # Get resume information
     if checkpoint_manager:
         current_image_index, processed_images = checkpoint_manager.get_resume_info(all_image_paths)
@@ -2144,16 +2151,12 @@ def process_split_irregular_with_checkpoint(
     else:
         current_image_index = 0
         processed_images = []
-    
+
     # Memory optimization: Clear cache periodically
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    current_image_path = None
-    current_image_patches = []
-    current_image_records = []  # Store records for current image
-    skip_current_image = False  # Flag to skip processing for current image
-    
+    idx = -1  # Ensure idx is always defined for exception handling
     try:
         for idx, (x, seg, object_cls, image_paths, anomaly_classes, patch_coords) in enumerate(
             tqdm(dataloader, desc=f"{split} split")
@@ -2161,53 +2164,6 @@ def process_split_irregular_with_checkpoint(
             if idx >= batch_num:
                 break
 
-            # Check if we're starting a new image
-            if current_image_path != image_paths[0]:
-                # Save results for previous image if exists
-                if current_image_path and checkpoint_manager:
-                    if not checkpoint_manager.is_image_processed(current_image_path):
-                        # Load ground truth annotations for this image
-                        ground_truth_patches = None
-                        annotation_filename = f"{path_to_safe_filename(current_image_path)}__annotations.json"
-                        if checkpoint_manager.annotation_dir:
-                            annotation_path = os.path.join(checkpoint_manager.annotation_dir, annotation_filename)
-                        else:
-                            annotation_path = None
-                        
-                        if annotation_path and os.path.exists(annotation_path):
-                            with open(annotation_path, 'r') as f:
-                                annotation = json.load(f)
-                                ground_truth_patches = annotation.get("defective_patches", [])
-                        
-                        # Save all results for this image using records
-                        save_image_results_from_records(
-                            checkpoint_manager, 
-                            current_image_path, 
-                            current_image_patches, 
-                            current_image_records, 
-                            ground_truth_patches or [],
-                            enable_save_optional_image_results
-                        )
-                        
-                        # Mark as processed (will be batched for better performance)
-                        checkpoint_manager.mark_image_processed(current_image_path)
-                
-                # Start new image
-                current_image_path = image_paths[0]
-                current_image_patches = []
-                current_image_records = []
-                
-                # Check if this image should be skipped
-                if checkpoint_manager and checkpoint_manager.is_image_processed(current_image_path):
-                    print(f"\nSkipping already processed image: {current_image_path}")
-                    skip_current_image = True
-                else:
-                    skip_current_image = False
-
-            # Skip processing if current image should be skipped
-            if skip_current_image:
-                continue
-                
             with torch.no_grad():
                 # -----------------------------------------------------------------
                 # Forward pass through VAE encoder (to latent space)
@@ -2324,7 +2280,7 @@ def process_split_irregular_with_checkpoint(
                     x_coord, y_coord = 0, 0
                 
                 # Store (x_coord, y_coord, anomaly_pixels) for current image
-                current_image_patches.append((x_coord, y_coord, anomaly_pixels))
+                image_patch_accum[image_paths[b]].append((x_coord, y_coord, anomaly_pixels))
                 
                 # Create required record (always included)
                 required_rec = make_record(
@@ -2350,7 +2306,7 @@ def process_split_irregular_with_checkpoint(
                 )
 
                 results.append(required_rec)
-                current_image_records.append(required_rec)
+                image_record_accum[image_paths[b]].append(required_rec)
                 
                 # Create optional record (only if flags are enabled)
                 if enable_excel_report or enable_save_optional_image_results:
@@ -2409,34 +2365,48 @@ def process_split_irregular_with_checkpoint(
                 if checkpoint_manager:
                     checkpoint_manager.save_checkpoint(idx, processed_images)
 
-        # Save results for the last image
-        if current_image_path and checkpoint_manager:
-            if not checkpoint_manager.is_image_processed(current_image_path):
-                # Load ground truth annotations for this image
-                ground_truth_patches = None
-                annotation_filename = f"{path_to_safe_filename(current_image_path)}__annotations.json"
-                if checkpoint_manager.annotation_dir:
-                    annotation_path = os.path.join(checkpoint_manager.annotation_dir, annotation_filename)
-                else:
-                    annotation_path = None
-                
-                if annotation_path and os.path.exists(annotation_path):
-                    with open(annotation_path, 'r') as f:
-                        annotation = json.load(f)
-                        ground_truth_patches = annotation.get("defective_patches", [])
-                
-                # Save all results for this image using records
-                save_image_results_from_records(
-                    checkpoint_manager, 
-                    current_image_path, 
-                    current_image_patches, 
-                    current_image_records, 
-                    ground_truth_patches or [],
-                    enable_save_optional_image_results
-                )
-                
-                # Mark as processed (will be batched for better performance)
-                checkpoint_manager.mark_image_processed(current_image_path)
+        # After processing this batch, check for any images that have all their patches processed
+        completed_images = []
+        for image_path in list(image_patch_accum.keys()):
+            if len(image_patch_accum[image_path]) == image_patch_counts[image_path]:
+                # Save results for this image
+                if not checkpoint_manager or not checkpoint_manager.is_image_processed(image_path):
+                    # Load ground truth annotations for this image
+                    ground_truth_patches = None
+                    annotation_filename = f"{path_to_safe_filename(image_path)}__annotations.json"
+                    if checkpoint_manager and checkpoint_manager.annotation_dir:
+                        annotation_path = os.path.join(checkpoint_manager.annotation_dir, annotation_filename)
+                    else:
+                        annotation_path = None
+                    if annotation_path and os.path.exists(annotation_path):
+                        with open(annotation_path, 'r') as f:
+                            annotation = json.load(f)
+                            ground_truth_patches = annotation.get("defective_patches", [])
+                        save_image_results_from_records(
+                            checkpoint_manager,
+                            image_path,
+                            image_patch_accum[image_path],
+                            image_record_accum[image_path],
+                            ground_truth_patches or [],
+                            enable_save_optional_image_results
+                        )
+                        if checkpoint_manager:
+                            checkpoint_manager.mark_image_processed(image_path)
+                    # Mark for removal from accum dicts
+                    completed_images.append(image_path)
+        # Remove completed images from accum dicts
+        for image_path in completed_images:
+            del image_patch_accum[image_path]
+            del image_record_accum[image_path]
+
+        # Memory optimization: Clear cache every 10 batches
+        if idx % 10 == 0 and idx > 0:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+            if checkpoint_manager:
+                checkpoint_manager.save_checkpoint(idx, processed_images)
 
     except KeyboardInterrupt:
         print("\nProcess interrupted. Saving checkpoint...")
@@ -2589,6 +2559,12 @@ def main():
         action="store_true",
         default=False,
         help="Force rerun evaluation even if checkpoint exists (clears existing checkpoint)"
+    )
+    parser.add_argument(
+        "--patch-size",
+        type=int,
+        default=128,
+        help="Patch size for splitting images (default: 128)"
     )
     args = parser.parse_args()
     

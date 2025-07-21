@@ -305,8 +305,8 @@ def _main(args):
             center_crop=args.center_crop,
             num_datafile=args.num_datafile,
             split_csv_path=args.split_csv_path,
-            track_crop=True,  # Enable crop tracking
-            save_crop_visualizations=True,  # Save crop visualizations
+            track_crop=args.track_crop,  # Enable crop tracking
+            save_crop_visualizations=args.save_crop_visualizations,  # Save crop visualizations
             crop_vis_dir=f"./crop_visualizations_{args.object_class}",  # Directory for crop visualizations
             resume_dir=args.resume_dir,  # Pass resume directory for crop annotation persistence
             resume_epoch=args.resume_epoch,  # Pass resume epoch for filtering crops
@@ -437,9 +437,6 @@ def _main(args):
         logger.info(f"Beginning epoch {epoch}...")
         if args.num_datafile is not None and args.rep_datafile is not None:
             if epoch % args.rep_datafile == 0:
-                # Store current cumulative crops before recreating dataset
-                if args.dataset == "pcb" and hasattr(dataset, 'cumulative_crops'):
-                    stored_crops = dataset.cumulative_crops.copy()
                 
                 # Recreate dataset with new data files
                 if args.dataset == "pcb":
@@ -454,16 +451,13 @@ def _main(args):
                         center_crop=args.center_crop,
                         num_datafile=args.num_datafile,
                         split_csv_path=args.split_csv_path,
-                        track_crop=True,  # Enable crop tracking
-                        save_crop_visualizations=True,  # Save crop visualizations
+                        track_crop=args.track_crop,  # Enable crop tracking
+                        save_crop_visualizations=args.save_crop_visualizations,  # Save crop visualizations
                         crop_vis_dir=f"./crop_visualizations_{args.object_class}",  # Directory for crop visualizations
                         resume_dir=args.resume_dir,  # Pass resume directory
-                        resume_epoch=args.resume_epoch,  # Pass resume epoch for filtering crops
+                        resume_epoch=epoch,  # Pass resume epoch for filtering crops
+                        cumulative_crops=dataset.cumulative_crops
                     )
-                    
-                    # Restore cumulative crops and pass current epoch
-                    if 'stored_crops' in locals():
-                        dataset.cumulative_crops = stored_crops
                     
                     # Set the current epoch IMMEDIATELY after dataset recreation
                     dataset.current_epoch = epoch
@@ -481,7 +475,7 @@ def _main(args):
         # Set the current epoch BEFORE starting the batch loop (regardless of dataset recreation)
         if args.dataset == "pcb" and hasattr(dataset, 'track_crop') and dataset.track_crop:
             dataset.current_epoch = epoch
-            print(f"DEBUG: Setting dataset.current_epoch to {epoch}")
+            #print(f"DEBUG: Setting dataset.current_epoch to {epoch}")
             
         for batch_idx, batch in enumerate(loader):
             x, _, y, _, _, crop_info = batch
@@ -786,6 +780,16 @@ def main():
         action="store_true",
         help="Run training without distributed training (useful for Windows)"
     )
+    parser.add_argument(
+        "--track-crop",
+        type=lambda v: True if v.lower() in ("yes", "true", "t", "y", "1") else False,
+        default=True,
+    )
+    parser.add_argument(
+        "--save-crop-visualizations",
+        type=lambda v: True if v.lower() in ("yes", "true", "t", "y", "1") else False,
+        default=True,
+    )
 
     args = parser.parse_args()
     print(f'args: {args}')
@@ -820,7 +824,7 @@ def main():
                         value = int(value) if value is not None else None
                     elif key in ['lr', 'mask_ratio', 'patch_shuffle_ratio']:
                         value = float(value)
-                    elif key in ['center_crop', 'mask_random_ratio', 'from_scratch', 'augmentation']:
+                    elif key in ['center_crop', 'mask_random_ratio', 'from_scratch', 'augmentation', 'track_crop', 'save_crop_visualizations']:
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
                     elif key in ['data_dir', 'resume_dir', 'split_csv_path']:
                         if value:  # Only expand if not None/empty
