@@ -128,6 +128,7 @@ class PCBDataset(Dataset):
         resume_dir: str = None,  # Directory to resume from (for loading existing crop annotations)
         resume_epoch: int = None,  # Epoch to resume from (for filtering crops)
         cumulative_crops: dict = None,  # Dictionary to store cumulative crops
+        annotation_dir: str = None,  # Directory for annotation JSONs for patch selection
     ):
         """
         Args:
@@ -244,75 +245,54 @@ class PCBDataset(Dataset):
                 img, brightness_factor, contrast_factor, bc_applied = random_brightness_contrast(
                     img, brightness_limit=0.05, contrast_limit=0.05, p=0.5
                 )
-                # First apply rotation
                 h, w = img.shape[:2]
                 center = (w // 2, h // 2)
-                #rotation_angle = np.random.uniform(-5, 5) if self.augment else 0  # Only rotate if augment is True
                 rotation_angle = 30
-
-                # Create rotation matrix and its inverse
                 rotation_matrix = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
                 inverse_matrix = cv2.getRotationMatrix2D(center, -rotation_angle, 1.0)
-                
-                # Apply rotation to image
                 rotated = cv2.warpAffine(img, rotation_matrix, (w, h),
                                        flags=cv2.INTER_NEAREST,
                                        borderMode=cv2.BORDER_REPLICATE)
-                
-                # Then apply crop to rotated image
                 crop_h = min(self.image_size, h)
                 crop_w = min(self.image_size, w)
                 max_h = h - crop_h
                 max_w = w - crop_w
-                
-                if self.augment:
-                    # Random crop for augmentation
-                    crop_y = np.random.randint(0, max_h + 1) if max_h > 0 else 0
-                    crop_x = np.random.randint(0, max_w + 1) if max_w > 0 else 0
-                else:
-                    # Center crop for non-augmentation
-                    crop_y = (h - crop_h) // 2
-                    crop_x = (w - crop_w) // 2
-                
-                # Get the cropped region from rotated image
+                # If annotation_dir is set and there are false positive patches for this image, use one
+                use_fp_patch = False
+                crop_x = crop_y = None
+                if self.annotation_dir and hasattr(self, 'image_paths'):
+                    # Find the original image path for this sample
+                    # This function is called inside __getitem__, so self.image_paths[index] is available
+                    # But we don't have index here, so we need to pass it in via kwargs
+                    index = kwargs.get('index', None)
+                    if index is not None:
+                        img_path = self.image_paths[index]
+                        fp_patches = self.false_positive_patches.get(img_path, [])
+                        if fp_patches:
+                            use_fp_patch = True
+                            # Randomly select a false positive patch
+                            patch = np.random.choice(fp_patches)
+                            # patch['pixel_coordinates'] = [x1, y1, x2, y2]
+                            crop_x, crop_y, crop_x2, crop_y2 = patch['pixel_coordinates']
+                            crop_x = int(crop_x)
+                            crop_y = int(crop_y)
+                            crop_w = int(crop_x2 - crop_x)
+                            crop_h = int(crop_y2 - crop_y)
+                if not use_fp_patch:
+                    if self.augment:
+                        crop_y = np.random.randint(0, max_h + 1) if max_h > 0 else 0
+                        crop_x = np.random.randint(0, max_w + 1) if max_w > 0 else 0
+                    else:
+                        crop_y = (h - crop_h) // 2
+                        crop_x = (w - crop_w) // 2
                 cropped_rotated = rotated[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
-                
-                # Get crop coordinates in rotated space
                 crop_corners_rot = np.array([
-                    [crop_x, crop_y],                    # top-left
-                    [crop_x + crop_w, crop_y],          # top-right
-                    [crop_x + crop_w, crop_y + crop_h], # bottom-right
-                    [crop_x, crop_y + crop_h]           # bottom-left
+                    [crop_x, crop_y],
+                    [crop_x + crop_w, crop_y],
+                    [crop_x + crop_w, crop_y + crop_h],
+                    [crop_x, crop_y + crop_h]
                 ], dtype=np.float32)
-                # Transform coordinates back to original space using OpenCV's inverse matrix
                 crop_corners_orig = cv2.transform(crop_corners_rot.reshape(-1, 1, 2), inverse_matrix).reshape(-1, 2)
-                
-                ## Debugging: save annotated images
-                #if self.save_crop_visualizations:
-                #    os.makedirs("tmp", exist_ok=True)
-                #    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                #    # 1. Rotated image with crop rectangle and center point
-                #    rotated_vis = rotated.copy()
-                #    # Draw crop rectangle (in rotated space)
-                #    crop_rect = np.array([
-                #        [crop_x, crop_y],
-                #        [crop_x + crop_w, crop_y],
-                #        [crop_x + crop_w, crop_y + crop_h],
-                #        [crop_x, crop_y + crop_h]
-                #    ], dtype=np.int32)
-                #    cv2.polylines(rotated_vis, [crop_rect], isClosed=True, color=(0,255,0), thickness=1)
-                #    # Draw center point
-                #    cv2.circle(rotated_vis, center, 5, (0,0,255), -1)
-                #    rotated_vis_bgr = cv2.cvtColor(rotated_vis, cv2.COLOR_RGB2BGR)
-                #    cv2.imwrite(f"tmp/rotated_with_crop_{timestamp}.png", rotated_vis_bgr)
-                #    # 2. Original image with transformed crop rectangle and center point
-                #    orig_vis = img.copy()
-                #    cv2.polylines(orig_vis, [crop_corners_orig.astype(np.int32)], isClosed=True, color=(255,0,0), thickness=1)
-                #    cv2.circle(orig_vis, center, 5, (0,0,255), -1)
-                #    orig_vis_bgr = cv2.cvtColor(orig_vis, cv2.COLOR_RGB2BGR)
-                #    cv2.imwrite(f"tmp/original_with_crop_{timestamp}.png", orig_vis_bgr)
-                
-                # Return cropped image and transform info
                 crop_corners_orig_flat = [float(x) for x in np.array(crop_corners_orig).flatten()]
                 return (cropped_rotated, 
                        {
@@ -325,9 +305,9 @@ class PCBDataset(Dataset):
                        })
             
             # Create wrapper function for both augmented and non-augmented cases
-            def transform_with_tracking(image, mask):
-                cropped_img, transform_info = rotate_and_crop_func(image)
-                cropped_mask = rotate_and_crop_func(mask)[0]
+            def transform_with_tracking(image, mask, index=None):
+                cropped_img, transform_info = rotate_and_crop_func(image, index=index)
+                cropped_mask = rotate_and_crop_func(mask, index=index)[0]
                 return {'image': cropped_img, 'mask': cropped_mask, 'transform_info': transform_info}
             
             self.aug = transform_with_tracking
@@ -351,6 +331,24 @@ class PCBDataset(Dataset):
                 )
             else:
                 self.aug = A.CenterCrop(p=1, height=self.image_size, width=self.image_size)
+
+        self.annotation_dir = annotation_dir
+        self.false_positive_patches = {}  # {image_path: [patch_info, ...]}
+        if self.annotation_dir:
+            self._load_false_positive_patches()
+
+    def _load_false_positive_patches(self):
+        import glob
+        # Find all annotation JSONs
+        annotation_files = glob.glob(os.path.join(self.annotation_dir, '*__false_positives.json'))
+        for ann_file in annotation_files:
+            with open(ann_file, 'r') as f:
+                anno = json.load(f)
+            image_path = anno.get('image_path')
+            # Only consider if there are false positives
+            fp_patches = anno.get('false_positives', [])
+            if fp_patches:
+                self.false_positive_patches[image_path] = fp_patches
 
     def load_crop_annotations(self, resume_epoch):
         """Load existing crop annotations from JSON file"""
@@ -568,7 +566,7 @@ class PCBDataset(Dataset):
         anomaly_class = self.anomaly_classes[index]
         
         if self.augment:
-            augmented = self.aug(image=img, mask=seg)
+            augmented = self.aug(image=img, mask=seg, index=index)
             img = augmented["image"]
             seg = augmented["mask"]
             transform_info = augmented["transform_info"]
