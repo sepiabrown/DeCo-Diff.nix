@@ -188,7 +188,7 @@ class ImageProcessor:
     """Utility class for common image processing operations."""
     
     @staticmethod
-    def create_anomaly_map_image(anomaly_map, is_binary=True, patch_size=128, add_grid=True, grid_color=(255, 255, 255), grid_thickness=1, patch_results=None, ground_truth_patches=None):
+    def create_anomaly_map_image(anomaly_map, predicted_defective_set, ground_truth_defective, overlapping, is_binary=True, patch_size=128, add_grid=True, grid_color=(255, 255, 255), grid_thickness=1):
         """Create anomaly map visualization with optional grid overlay and patch prediction rectangles."""
         if is_binary:
             # Binary map: 0 or 1 - create custom red colormap
@@ -221,13 +221,13 @@ class ImageProcessor:
         anomaly_map_colored = cv2.cvtColor(anomaly_map_colored_bgr, cv2.COLOR_BGR2RGB)
         
         # Add patch prediction rectangles if provided
-        if patch_results is not None:
+        if predicted_defective_set is not None and ground_truth_defective is not None and overlapping is not None:
             anomaly_map_colored = draw_patch_rectangles_on_image(
                 anomaly_map_colored, 
-                patch_results, 
-                ground_truth_patches, 
+                predicted_defective_set, 
+                ground_truth_defective, 
+                overlapping, 
                 patch_size=patch_size, 
-                stride=patch_size, 
                 grid_thickness=grid_thickness
             )
         
@@ -981,7 +981,10 @@ def _tensor_to_xlimage(arr, size: int) -> XLImage:
         )  # make 3 channels
     elif c != 3:
         raise ValueError(f"unsupported channels: {c}")
-    arr = ((np.clip(arr, -1, 1) + 1) / 2 * 255).astype(np.uint8)
+    if np.any(arr < 0):
+        arr = ((np.clip(arr, -1, 1) + 1) / 2 * 255).astype(np.uint8)
+    else:
+        arr = (arr * 255).astype(np.uint8)
 
     buf = BytesIO()
     PILImage.fromarray(arr, mode="RGB").save(buf, format="PNG")
@@ -998,6 +1001,7 @@ def _write_row(ws, row_idx: int, rec: dict, size: int):
         if kind == "image":
             embeds.append((col_idx, _tensor_to_xlimage(val, size)))
             scalars.append("")
+            ws.column_dimensions[get_column_letter(col_idx)].width = size // 8
         else:
             # Convert tuples and other non-serializable types to strings
             if isinstance(val, (tuple, list)):
@@ -1102,62 +1106,38 @@ def make_excel(
     return created_files
 
 
-def draw_patch_rectangles_on_image(base_img, patch_results, ground_truth_patches=None, patch_size=128, stride=64, grid_thickness=1):
+def draw_patch_rectangles_on_image(base_img, predicted_defective_set, ground_truth_defective, overlapping, patch_size=128, grid_thickness=1):
     """
     Draw patch rectangles (TP/FP/FN) on top of an image.
-    
     Args:
         base_img: The image to draw on (np.uint8, HxWx3)
-        patch_results: List of (x, y, is_defective) tuples for each patch
-        ground_truth_patches: List of [grid_row, grid_col] coordinates for ground truth defective patches
+        predicted_defective: Set of (grid_row, grid_col) for predicted defective patches
+        ground_truth_defective: Set of (grid_row, grid_col) for ground truth defective patches
+        overlapping: Set of (grid_row, grid_col) where prediction and ground truth overlap
         patch_size: Size of patches
-        stride: Stride used for patch extraction
         grid_thickness: Thickness of the rectangle lines (default: 1)
-    
     Returns:
         Image with rectangles drawn:
         - Yellow rectangles around predicted defective regions
-        - Red rectangles around ground truth defective regions  
-        - HOT colormap colored rectangles where prediction and ground truth overlap
+        - Red rectangles around ground truth defective regions
+        - Green rectangles where prediction and ground truth overlap
     """
     img = base_img.copy()
-    
-    # Create sets for efficient lookup
-    predicted_defective = set()
-    ground_truth_defective = set()
-    
-    # Collect predicted defective patches
-    for x, y, anomaly_pixels in patch_results:
-        # Consider patch defective if it has any anomaly pixels (anomaly_pixels > 0)
-        if anomaly_pixels > 0:
-            grid_row = y // patch_size
-            grid_col = x // patch_size
-            predicted_defective.add((grid_row, grid_col))
-    
-    # Collect ground truth defective patches
-    if ground_truth_patches:
-        for grid_row, grid_col in ground_truth_patches:
-            ground_truth_defective.add((grid_row, grid_col))
-    
     # Draw predicted defective regions (yellow)
-    for grid_row, grid_col in predicted_defective:
+    for grid_row, grid_col in predicted_defective_set:
         x = grid_col * patch_size
         y = grid_row * patch_size
         cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (255, 255, 0), grid_thickness)
-    
     # Draw ground truth defective regions (red)
     for grid_row, grid_col in ground_truth_defective:
         x = grid_col * patch_size
         y = grid_row * patch_size
         cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (255, 0, 0), grid_thickness)
-    
-    # Draw overlapping regions (green) - where prediction and ground truth match
-    overlapping = predicted_defective.intersection(ground_truth_defective)
+    # Draw overlapping regions (green)
     for grid_row, grid_col in overlapping:
         x = grid_col * patch_size
         y = grid_row * patch_size
         cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (0, 255, 0), grid_thickness)
-    
     return img
 
 
@@ -1260,6 +1240,7 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         args.enable_excel_report,
         args.enable_save_optional_image_results,
         checkpoint_manager,  # Pass checkpoint manager
+        args.patch_size
     )
     
     # Create Excel report (if enabled)
@@ -1589,7 +1570,7 @@ def compute_confusion_matrix_and_accuracy(annotation_dir, evaluation_results_dir
             # New format: extract defective patches from patch_analysis
             predicted = set()
             for patch in eval_data['patch_analysis']:
-                if patch['is_defective']:
+                if patch['status'] == "TP" or patch['status'] == "FP":
                     predicted.add((patch['grid_row'], patch['grid_col']))
         else:
             # Old format: direct defective_patches list
@@ -1956,9 +1937,9 @@ class CheckpointManager:
 
 
 def save_image_results_from_records(checkpoint_manager: CheckpointManager, image_path: str, 
-                                  patch_results: list, image_records: list, 
-                                  ground_truth_patches: list | None = None,
-                                  enable_save_optional_image_results: bool = False):
+                                  image_records: list, 
+                                  predicted_defective_set: set, ground_truth_defective: set, overlapping: set,
+                                  enable_save_optional_image_results: bool = False, patch_size: int = 256):
     """Save all results for a single image immediately using records."""
     safe_name = path_to_safe_filename(image_path)
     
@@ -1968,7 +1949,7 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
     
     # Save marked image (always saved)
     marked_img = draw_patch_rectangles_on_image(
-        original_img, patch_results, ground_truth_patches or [], patch_size=args.patch_size, stride=args.patch_size, grid_thickness=1
+        original_img, predicted_defective_set, ground_truth_defective, overlapping, patch_size=patch_size, grid_thickness=1
     )
     marked_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__marked.png")
     PILImage.fromarray(marked_img).save(marked_path)
@@ -1999,8 +1980,8 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
         x_coord, y_coord = record["patch_coords"][1]
         
         # Calculate actual patch dimensions for this position
-        patch_width = min(args.patch_size, w - x_coord)
-        patch_height = min(args.patch_size, h - y_coord)
+        patch_width = min(patch_size, w - x_coord)
+        patch_height = min(patch_size, h - y_coord)
         
         # Extract required anomaly maps from record
         patch_arithmetic = record["anomaly_map_arithmetic"][1]
@@ -2061,9 +2042,9 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
         for anomaly_map, suffix, is_binary in configs:
             # Save anomaly map image
             anomaly_map_img = ImageProcessor.create_anomaly_map_image(
-                anomaly_map, patch_size=args.patch_size, add_grid=True, 
-                patch_results=patch_results, ground_truth_patches=ground_truth_patches or [], 
-                is_binary=is_binary
+                anomaly_map, patch_size=patch_size, add_grid=True, 
+                predicted_defective_set=predicted_defective_set, ground_truth_defective=ground_truth_defective, 
+                overlapping=overlapping, is_binary=is_binary
             )
             anomaly_map_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__{suffix}.png")
             PILImage.fromarray(anomaly_map_img).save(anomaly_map_path)
@@ -2074,20 +2055,24 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
             PILImage.fromarray(overlay_img).save(overlay_path)
             
             # Save marked overlay image
-            marked_overlay_img = draw_patch_rectangles_on_image(overlay_img, patch_results, ground_truth_patches or [], patch_size=args.patch_size, stride=args.patch_size, grid_thickness=1)
+            marked_overlay_img = draw_patch_rectangles_on_image(overlay_img, predicted_defective_set, ground_truth_defective, overlapping, patch_size=patch_size, grid_thickness=1)
             marked_overlay_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__mo_{suffix}.png")
             PILImage.fromarray(marked_overlay_img).save(marked_overlay_path)
     
     # Save evaluation results
     patch_analysis = []
-    for x, y, anomaly_pixels in patch_results:
-        grid_row = y // args.patch_size
-        grid_col = x // args.patch_size
+    for record in image_records:
+        x, y = record["patch_coords"][1]
+        anomaly_map = record["anomaly_map_arithmetic_binary"][1]
+        anomaly_pixels = int(np.sum(anomaly_map))
+        grid_row = y // patch_size
+        grid_col = x // patch_size
         patch_analysis.append({
             "grid_row": grid_row,
             "grid_col": grid_col,
-            "anomaly_pixels": int(anomaly_pixels),
-            "is_defective": bool(anomaly_pixels > 0)
+            "anomaly_max": record["anomaly_max"][1],
+            "anomaly_pixels":record["anomaly_pixels"][1],
+            "status": record["status"][1]
         })
     
     result_filename = f"{safe_name}__evaluation.json"
@@ -2095,12 +2080,12 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
     evaluation_result = {
         "image_path": image_path,
         "patch_analysis": patch_analysis,
-        "grid_size": args.patch_size
+        "grid_size": patch_size
     }
     with open(result_path, 'w') as f:
         json.dump(evaluation_result, f, indent=2)
     
-    print(f"Saved all results for image: {image_path}")
+    #print(f"Saved all results for image: {image_path}")
 
 
 def process_split_irregular_with_checkpoint(
@@ -2120,6 +2105,7 @@ def process_split_irregular_with_checkpoint(
     enable_excel_report: bool = False,
     enable_save_optional_image_results: bool = False,
     checkpoint_manager: CheckpointManager | None = None,
+    patch_size: int = 256
 ) -> tuple[list[Record], list[Record]]:
     """Run evaluation with checkpoint/resume functionality."""
     # Initialize evaluation metrics
@@ -2138,10 +2124,6 @@ def process_split_irregular_with_checkpoint(
     image_patch_counts = defaultdict(int)
     for item in dataloader.dataset:
         image_patch_counts[item[3]] += 1
-
-    # Accumulate patches and records for each image
-    image_patch_accum = defaultdict(list)  # image_path -> list of (x_coord, y_coord, anomaly_pixels)
-    image_record_accum = defaultdict(list)  # image_path -> list of records
 
     # Get resume information
     if checkpoint_manager:
@@ -2163,6 +2145,21 @@ def process_split_irregular_with_checkpoint(
         ):
             if idx >= batch_num:
                 break
+
+            # Build ground_truth_map for all unique image_paths in this batch
+            ground_truth_map = {}
+            for unique_image_path in set(image_paths):
+                annotation_filename = f"{path_to_safe_filename(unique_image_path)}__annotations.json"
+                if checkpoint_manager and checkpoint_manager.annotation_dir:
+                    annotation_path = os.path.join(checkpoint_manager.annotation_dir, annotation_filename)
+                else:
+                    annotation_path = None
+                if annotation_path and os.path.exists(annotation_path):
+                    with open(annotation_path, 'r') as f:
+                        annotation = json.load(f)
+                        ground_truth_map[unique_image_path] = set(tuple(x) for x in annotation.get("defective_patches", []))
+                else:
+                    ground_truth_map[unique_image_path] = set()
 
             with torch.no_grad():
                 # -----------------------------------------------------------------
@@ -2262,9 +2259,10 @@ def process_split_irregular_with_checkpoint(
             
             for b in range(batch_size):
                 # Determine if this patch is defective
+                anomaly_max = int(round(anomaly_map_arithmetic[b].max().item() * 255))
                 anomaly_binary = anomaly_map_arithmetic_binary[b]
                 anomaly_pixels = torch.sum(anomaly_binary).item()
-                is_defective = anomaly_pixels > anomaly_pixel_num_threshold
+                is_predicted_defective = anomaly_pixels > anomaly_pixel_num_threshold
                 
                 # Store patch result for original image marking
                 # patch_coords[b] is now a tensor [x, y]
@@ -2279,8 +2277,11 @@ def process_split_irregular_with_checkpoint(
                     print(f"Warning: unexpected patch_coord format, using default coordinates")
                     x_coord, y_coord = 0, 0
                 
-                # Store (x_coord, y_coord, anomaly_pixels) for current image
-                image_patch_accum[image_paths[b]].append((x_coord, y_coord, anomaly_pixels))
+                # Always set ground_truth_defective before using it
+                ground_truth_defective = ground_truth_map.get(image_paths[b], set())
+                status = "TP" if is_predicted_defective and (x_coord, y_coord) in ground_truth_defective else \
+                         "FP" if is_predicted_defective else \
+                         "FN" if (x_coord, y_coord) in ground_truth_defective else "TN"
                 
                 # Create required record (always included)
                 required_rec = make_record(
@@ -2288,7 +2289,9 @@ def process_split_irregular_with_checkpoint(
                     image_path=("meta", image_paths[b]),
                     anomaly_class=("meta", anomaly_classes[b]),
                     patch_coords=("meta", (x_coord, y_coord)),
-                    is_defective=("meta", is_defective),
+                    anomaly_max=("meta", anomaly_max),
+                    anomaly_pixels=("meta", anomaly_pixels),
+                    status=("meta", status),
                     orig=("image", _to_numpy(x[b])),
                     dod_recon=("image", _to_numpy(image_samples[b])),
                     encoded_recon=("image", _to_numpy(x0[b])),
@@ -2306,8 +2309,7 @@ def process_split_irregular_with_checkpoint(
                 )
 
                 results.append(required_rec)
-                image_record_accum[image_paths[b]].append(required_rec)
-                
+
                 # Create optional record (only if flags are enabled)
                 if enable_excel_report or enable_save_optional_image_results:
                     optional_rec = make_record(
@@ -2315,7 +2317,7 @@ def process_split_irregular_with_checkpoint(
                         image_path=("meta", image_paths[b]),
                         anomaly_class=("meta", anomaly_classes[b]),
                         patch_coords=("meta", (x_coord, y_coord)),
-                        is_defective=("meta", is_defective),
+                        status=("meta", status),
                         orig=("image", _to_numpy(x[b])),
                         dod_recon=("image", _to_numpy(image_samples[b])),
                         encoded_recon=("image", _to_numpy(x0[b])),
@@ -2364,40 +2366,50 @@ def process_split_irregular_with_checkpoint(
                 # Save checkpoint periodically
                 if checkpoint_manager:
                     checkpoint_manager.save_checkpoint(idx, processed_images)
+        
+        image_results = defaultdict(list)
+        for record in results:
+            image_path = record["image_path"][1]  # Extract image_path from record
+            image_results[image_path].append(record)
 
         # After processing this batch, check for any images that have all their patches processed
         completed_images = []
-        for image_path in list(image_patch_accum.keys()):
-            if len(image_patch_accum[image_path]) == image_patch_counts[image_path]:
-                # Save results for this image
-                if not checkpoint_manager or not checkpoint_manager.is_image_processed(image_path):
+        for image_path in list(image_results.keys()):
+            image_records = image_results[image_path]
+            # Build predicted_defective_set for this image
+            predicted_defective_set = set()
+            for record in image_records:
+                x, y = record["patch_coords"][1]
+                anomaly_map = record["anomaly_map_arithmetic_binary"][1]
+                anomaly_pixels = np.sum(anomaly_map)
+                if anomaly_pixels > 0:
+                    grid_row = y // patch_size
+                    grid_col = x // patch_size
+                    predicted_defective_set.add((grid_row, grid_col))
+            # Now you can safely do:
+            # Compute ground_truth_defective as before
+            # ...
+            overlapping = predicted_defective_set.intersection(ground_truth_defective)
+            if not checkpoint_manager or not checkpoint_manager.is_image_processed(image_path):
                     # Load ground truth annotations for this image
-                    ground_truth_patches = None
-                    annotation_filename = f"{path_to_safe_filename(image_path)}__annotations.json"
-                    if checkpoint_manager and checkpoint_manager.annotation_dir:
-                        annotation_path = os.path.join(checkpoint_manager.annotation_dir, annotation_filename)
-                    else:
-                        annotation_path = None
-                    if annotation_path and os.path.exists(annotation_path):
-                        with open(annotation_path, 'r') as f:
-                            annotation = json.load(f)
-                            ground_truth_patches = annotation.get("defective_patches", [])
-                        save_image_results_from_records(
-                            checkpoint_manager,
-                            image_path,
-                            image_patch_accum[image_path],
-                            image_record_accum[image_path],
-                            ground_truth_patches or [],
-                            enable_save_optional_image_results
-                        )
-                        if checkpoint_manager:
-                            checkpoint_manager.mark_image_processed(image_path)
-                    # Mark for removal from accum dicts
+                    ground_truth_defective = ground_truth_map.get(image_path, set())
+                    save_image_results_from_records(
+                        checkpoint_manager,
+                        image_path,
+                        image_results[image_path],
+                        predicted_defective_set,
+                        ground_truth_defective,
+                        overlapping,
+                        enable_save_optional_image_results,
+                        patch_size
+                    )
+                    if checkpoint_manager:
+                        checkpoint_manager.mark_image_processed(image_path)
+                    # Mark for removal from dict
                     completed_images.append(image_path)
-        # Remove completed images from accum dicts
+        # Remove completed images from dict
         for image_path in completed_images:
-            del image_patch_accum[image_path]
-            del image_record_accum[image_path]
+            del image_results[image_path]
 
         # Memory optimization: Clear cache every 10 batches
         if idx % 10 == 0 and idx > 0:
@@ -2584,7 +2596,7 @@ def main():
                 key = key.replace('-', '_')
                 if hasattr(args, key):
                     # Convert string values to appropriate types
-                    if key in ['image_size', 'center_size', 'batch_num', 'reverse_steps', 'anomaly_binary_threshold', 'anomaly_pixel_num_threshold']:
+                    if key in ['image_size', 'center_size', 'patch_size', 'batch_num', 'reverse_steps', 'anomaly_binary_threshold', 'anomaly_pixel_num_threshold']:
                         value = int(value)
                     elif key == 'center_crop':
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
