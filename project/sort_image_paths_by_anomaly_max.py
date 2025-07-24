@@ -3,25 +3,31 @@ import os
 import json
 import argparse
 from pathlib import Path
+import re
+
+def natural_key(string):
+    return [int(s) if s.isdigit() else s.lower() for s in re.split(r'(\d+)', string)]
 
 def collect_fp_patches(input_dir):
     fp_patches = []
-    for filename in os.listdir(input_dir):
-        if filename.endswith('.json'):
-            file_path = os.path.join(input_dir, filename)
-            try:
-                with open(file_path, 'r') as f:
-                    data = json.load(f)
-                image_path = data.get('image_path', '')
-                for patch in data.get('patch_analysis', []):
-                    if patch.get('status') == 'FP':
-                        anomaly_max = patch.get('anomaly_max')
-                        grid_row = patch.get('grid_row')
-                        grid_col = patch.get('grid_col')
-                        if anomaly_max is not None and grid_row is not None and grid_col is not None:
-                            fp_patches.append((anomaly_max, image_path, grid_row, grid_col))
-            except Exception as e:
-                print(f"Warning: Could not process {file_path}: {e}")
+    # Natural sort of JSON filenames
+    filenames = [f for f in os.listdir(input_dir) if f.endswith('.json')]
+    filenames.sort(key=natural_key)
+    for filename in filenames:
+        file_path = os.path.join(input_dir, filename)
+        try:
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+            image_path = data.get('image_path', '')
+            for patch in data.get('patch_analysis', []):
+                if patch.get('status') == 'FP':
+                    anomaly_max = patch.get('anomaly_max')
+                    grid_row = patch.get('grid_row')
+                    grid_col = patch.get('grid_col')
+                    if anomaly_max is not None and grid_row is not None and grid_col is not None:
+                        fp_patches.append((anomaly_max, image_path, grid_row, grid_col))
+        except Exception as e:
+            print(f"Warning: Could not process {file_path}: {e}")
     return fp_patches
 
 def write_sorted_image_paths(fp_patches, output_path):
