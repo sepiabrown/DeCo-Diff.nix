@@ -310,7 +310,7 @@ def _main(args):
             crop_vis_dir=f"./crop_visualizations_{args.object_class}",  # Directory for crop visualizations
             resume_dir=args.resume_dir,  # Pass resume directory for crop annotation persistence
             resume_epoch=args.resume_epoch,  # Pass resume epoch for filtering crops
-            annotation_dir=args.annotation_dir,  # Pass annotation dir for patch selection
+            fine_tuning_json=args.fine_tuning_json,  # Pass fine-tuning JSON file for patch selection
         )
 
     batch_size = args.global_batch_size // dist.get_world_size()
@@ -792,10 +792,10 @@ def main():
         default=True,
     )
     parser.add_argument(
-        "--annotation-dir",
+        "--fine-tuning-json",
         type=str,
         default=None,
-        help="Directory containing annotation JSON files for false positive patch selection (optional)",
+        help="Path to fp_review_list.json file for fine-tuning. The script will randomly select patches from the review list for training.",
     )
 
     args = parser.parse_args()
@@ -833,7 +833,7 @@ def main():
                         value = float(value)
                     elif key in ['center_crop', 'mask_random_ratio', 'from_scratch', 'augmentation', 'track_crop', 'save_crop_visualizations']:
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
-                    elif key in ['data_dir', 'resume_dir', 'split_csv_path', 'annotation_dir']:
+                    elif key in ['data_dir', 'resume_dir', 'split_csv_path', 'fine_tuning_json']:
                         if value:  # Only expand if not None/empty
                             value = os.path.expanduser(value)
                     elif key in ['global_batch_size']:

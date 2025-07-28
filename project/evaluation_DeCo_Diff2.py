@@ -1943,16 +1943,40 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
     """Save all results for a single image immediately using records."""
     safe_name = path_to_safe_filename(image_path)
     
+    # Create status-based subfolders
+    status_folders = {}
+    for status in ['TP', 'FN', 'FP', 'TN']:
+        status_dir = os.path.join(checkpoint_manager.marked_images_dir, status)
+        os.makedirs(status_dir, exist_ok=True)
+        status_folders[status] = status_dir
+    
+    # Determine the overall status of this image based on its patches
+    image_status = determine_image_status(image_records)
+    
+    # Debug: Print status information
+    status_counts = {'TP': 0, 'FN': 0, 'FP': 0, 'TN': 0}
+    for record in image_records:
+        status = record["status"][1]
+        if status in status_counts:
+            status_counts[status] += 1
+    #print(f"Image {os.path.basename(image_path)} status: {image_status} (TP:{status_counts['TP']}, FN:{status_counts['FN']}, FP:{status_counts['FP']}, TN:{status_counts['TN']})")
+    
     # Load original image
     original_img = np.array(PILImage.open(image_path).convert('RGB'))
     h, w, _ = original_img.shape
     
-    # Save marked image (always saved)
+    # Save marked image (always saved) in the appropriate status folder
     marked_img = draw_patch_rectangles_on_image(
         original_img, predicted_defective_set, ground_truth_defective, overlapping, patch_size=patch_size, grid_thickness=1
     )
-    marked_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__marked.png")
+    marked_path = os.path.join(status_folders[image_status], f"{safe_name}__marked.png")
     PILImage.fromarray(marked_img).save(marked_path)
+    
+    # Also save image-level images without classification
+    image_level_dir = os.path.join(checkpoint_manager.marked_images_dir, "image_level")
+    os.makedirs(image_level_dir, exist_ok=True)
+    image_level_path = os.path.join(image_level_dir, f"{safe_name}__marked.png")
+    PILImage.fromarray(marked_img).save(image_level_path)
     
     # Initialize anomaly maps based on flag
     anomaly_maps = {
@@ -2037,7 +2061,7 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
             (anomaly_maps['optional']['geometric_binary_style3'], "am_ge_bin_st3", True),
         ]
     
-    # Save all configured images
+    # Save all configured images in the appropriate status folder
     for _config_type, configs in image_configs.items():
         for anomaly_map, suffix, is_binary in configs:
             # Save anomaly map image
@@ -2046,18 +2070,28 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
                 predicted_defective_set=predicted_defective_set, ground_truth_defective=ground_truth_defective, 
                 overlapping=overlapping, is_binary=is_binary
             )
-            anomaly_map_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__{suffix}.png")
+            anomaly_map_path = os.path.join(status_folders[image_status], f"{safe_name}__{suffix}.png")
             PILImage.fromarray(anomaly_map_img).save(anomaly_map_path)
             
             # Save overlay image
             overlay_img = ImageProcessor.create_anomaly_overlay(original_img, anomaly_map, alpha=0.8, is_binary=is_binary)
-            overlay_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__ao_{suffix}.png")
+            overlay_path = os.path.join(status_folders[image_status], f"{safe_name}__ao_{suffix}.png")
             PILImage.fromarray(overlay_img).save(overlay_path)
             
             # Save marked overlay image
             marked_overlay_img = draw_patch_rectangles_on_image(overlay_img, predicted_defective_set, ground_truth_defective, overlapping, patch_size=patch_size, grid_thickness=1)
-            marked_overlay_path = os.path.join(checkpoint_manager.marked_images_dir, f"{safe_name}__mo_{suffix}.png")
+            marked_overlay_path = os.path.join(status_folders[image_status], f"{safe_name}__mo_{suffix}.png")
             PILImage.fromarray(marked_overlay_img).save(marked_overlay_path)
+            
+            # Also save to image_level directory (without classification)
+            image_level_anomaly_path = os.path.join(image_level_dir, f"{safe_name}__{suffix}.png")
+            PILImage.fromarray(anomaly_map_img).save(image_level_anomaly_path)
+            
+            image_level_overlay_path = os.path.join(image_level_dir, f"{safe_name}__ao_{suffix}.png")
+            PILImage.fromarray(overlay_img).save(image_level_overlay_path)
+            
+            image_level_marked_overlay_path = os.path.join(image_level_dir, f"{safe_name}__mo_{suffix}.png")
+            PILImage.fromarray(marked_overlay_img).save(image_level_marked_overlay_path)
     
     # Save evaluation results
     patch_analysis = []
@@ -2086,6 +2120,116 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
         json.dump(evaluation_result, f, indent=2)
     
     #print(f"Saved all results for image: {image_path}")
+
+
+def determine_image_status(image_records: list) -> str:
+    """
+    Determine the overall status of an image based on its patch records.
+    
+    Returns:
+        str: 'TP', 'FN', 'FP', or 'TN' based on the image's classification status
+    """
+    # Count patches by their individual status
+    status_counts = {'TP': 0, 'FN': 0, 'FP': 0, 'TN': 0}
+    
+    for record in image_records:
+        status = record["status"][1]  # Get the status from the record
+        if status in status_counts:
+            status_counts[status] += 1
+    
+    # Determine overall image status based on the most common patch status
+    # If there are any defective patches (TP or FP), the image is considered defective
+    # If there are no defective patches but there are normal patches (TN or FN), the image is considered normal
+    # Priority: TP > FP > FN > TN (defective patches take precedence)
+    
+    if status_counts['TP'] > 0 or status_counts['FP'] > 0:
+        # Image has defective patches
+        if status_counts['TP'] > 0:
+            return 'TP'  # True Positive: correctly identified as defective
+        else:
+            return 'FP'  # False Positive: incorrectly identified as defective
+    else:
+        # Image has no defective patches
+        if status_counts['FN'] > 0:
+            return 'FN'  # False Negative: missed defective patches
+        else:
+            return 'TN'  # True Negative: correctly identified as normal
+
+
+def save_patch_results_from_records(checkpoint_manager: CheckpointManager, image_path: str, 
+                                  patch_records: list, 
+                                  predicted_defective_set: set, ground_truth_defective: set, overlapping: set,
+                                  enable_save_optional_image_results: bool = False, patch_size: int = 256,
+                                  patch_x: int = 0, patch_y: int = 0):
+    """Save patch-level results immediately."""
+    safe_name = path_to_safe_filename(image_path)
+    patch_coord_str = f"x{patch_x}_y{patch_y}"
+    
+    # Create status-based subfolders
+    status_folders = {}
+    for status in ['TP', 'FN', 'FP', 'TN']:
+        status_dir = os.path.join(checkpoint_manager.marked_images_dir, status)
+        os.makedirs(status_dir, exist_ok=True)
+        status_folders[status] = status_dir
+    
+    # Determine the status of this patch
+    if not patch_records:
+        print(f"Warning: No patch records provided for {image_path}")
+        return
+        
+    patch_status = patch_records[0]["status"][1]
+    
+    # Load original image
+    try:
+        original_img = np.array(PILImage.open(image_path).convert('RGB'))
+        h, w, _ = original_img.shape
+    except Exception as e:
+        print(f"Warning: Failed to load image {image_path}: {e}")
+        return
+    
+    # Extract patch region from original image
+    patch_width = min(patch_size, w - patch_x)
+    patch_height = min(patch_size, h - patch_y)
+    patch_img = original_img[patch_y:patch_y+patch_height, patch_x:patch_x+patch_width]
+    
+    # Save patch image in the appropriate status folder
+    patch_filename = f"{safe_name}__{patch_coord_str}.png"
+    patch_path = os.path.join(status_folders[patch_status], patch_filename)
+    PILImage.fromarray(patch_img).save(patch_path)
+    
+    # Save patch-level anomaly maps
+    for record in patch_records:
+        # Extract anomaly maps for this patch
+        patch_arithmetic = record["anomaly_map_arithmetic"][1]
+        patch_arithmetic_binary = record["anomaly_map_arithmetic_binary"][1]
+        patch_geometric = record["anomaly_map_geometric"][1]
+        patch_geometric_binary = record["anomaly_map_geometric_binary"][1]
+        
+        # Extract patch regions
+        patch_regions = {
+            'ar': patch_arithmetic.squeeze()[:patch_height, :patch_width],
+            'ar_bin': patch_arithmetic_binary.squeeze()[:patch_height, :patch_width],
+            'ge': patch_geometric.squeeze()[:patch_height, :patch_width],
+            'ge_bin': patch_geometric_binary.squeeze()[:patch_height, :patch_width],
+        }
+        
+        # Save patch-level anomaly maps
+        for map_name, region in patch_regions.items():
+            # Create anomaly map image for this patch
+            anomaly_map_img = ImageProcessor.create_anomaly_map_image(
+                region, patch_size=patch_size, add_grid=False, 
+                predicted_defective_set=predicted_defective_set, ground_truth_defective=ground_truth_defective, 
+                overlapping=overlapping, is_binary=(map_name.endswith('binary'))
+            )
+            anomaly_map_filename = f"{safe_name}__{patch_coord_str}_{map_name}.png"
+            anomaly_map_path = os.path.join(status_folders[patch_status], anomaly_map_filename)
+            PILImage.fromarray(anomaly_map_img).save(anomaly_map_path)
+    
+    # Mark this patch as processed
+    if checkpoint_manager:
+        checkpoint_manager.mark_image_processed(image_path)  # For now, mark entire image
+    
+    #print(f"Saved patch-level results for {os.path.basename(image_path)} at ({patch_x}, {patch_y}) - Status: {patch_status}")
 
 
 def process_split_irregular_with_checkpoint(
@@ -2134,17 +2278,43 @@ def process_split_irregular_with_checkpoint(
         current_image_index = 0
         processed_images = []
 
+    # Track patches per image for image-level evaluation JSON
+    image_patch_records = {}  # image_path -> list of patch records
+    image_patch_counts = {}  # image_path -> total expected patches
+    completed_images = set()  # images that have all patches processed
+
     # Memory optimization: Clear cache periodically
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     idx = -1  # Ensure idx is always defined for exception handling
+    
+
+    
     try:
         for idx, (x, seg, object_cls, image_paths, anomaly_classes, patch_coords) in enumerate(
             tqdm(dataloader, desc=f"{split} split")
         ):
             if idx >= batch_num:
                 break
+                
+
+
+            # Check if all images in this batch are already processed
+            if checkpoint_manager:
+                all_images_processed = True
+                skipped_patches = 0
+                for image_path in image_paths:
+                    if checkpoint_manager.is_image_processed(image_path):
+                        skipped_patches += 1
+                    else:
+                        all_images_processed = False
+                
+                if all_images_processed:
+                    print(f"Batch {idx}: All images already processed, skipping entire batch...")
+                    continue
+                elif skipped_patches > 0:
+                    print(f"Batch {idx}: {skipped_patches}/{len(image_paths)} patches from already processed images will be skipped")
 
             # Build ground_truth_map for all unique image_paths in this batch
             ground_truth_map = {}
@@ -2165,10 +2335,10 @@ def process_split_irregular_with_checkpoint(
                 # -----------------------------------------------------------------
                 # Forward pass through VAE encoder (to latent space)
                 # -----------------------------------------------------------------
-                x = x.to(device)
+                x_device = x.to(device)
                 object_cls = object_cls.to(device)
 
-                encoded = vae.encode(x).latent_dist.mean * _LATENT_SCALE
+                encoded = vae.encode(x_device).latent_dist.mean * _LATENT_SCALE
 
                 # -----------------------------------------------------------------
                 # Reverse DDIM sampling conditioned on encoder latents
@@ -2205,11 +2375,11 @@ def process_split_irregular_with_checkpoint(
                 # -----------------------------------------------------------------
                 # Difference / binary maps
                 # -----------------------------------------------------------------
-                orig_dodrecon_diff_raw = _compute_abs_diff_max(x, image_samples)
+                orig_dodrecon_diff_raw = _compute_abs_diff_max(x_device, image_samples)
                 orig_dodrecon_diff = torch.clamp(orig_dodrecon_diff_raw, 0.0, 0.05) * 20
                 orig_dodrecon_binary = _binary_mask(orig_dodrecon_diff, anomaly_binary_threshold)
 
-                orig_encodedrecon_diff_raw = _compute_abs_diff_max(x, x0)
+                orig_encodedrecon_diff_raw = _compute_abs_diff_max(x_device, x0)
                 orig_encodedrecon_diff = torch.clamp(orig_encodedrecon_diff_raw, 0.0, 0.05) * 20
                 orig_encodedrecon_binary = _binary_mask(orig_encodedrecon_diff, anomaly_binary_threshold)
                 
@@ -2221,7 +2391,7 @@ def process_split_irregular_with_checkpoint(
 
                 # Resize encoded_latent_diff to match the spatial dimensions of encodedrecon_dodrecon_diff
                 # For irregular images, we want to use the patch size (128) as the target size
-                patch_size = x.shape[-1]  # Should be 128 for patches
+                patch_size = x_device.shape[-1]  # Should be 128 for patches
                 encoded_latent_diff_resized = F.interpolate(
                     encoded_latent_diff,
                     size=(patch_size, patch_size),
@@ -2255,9 +2425,12 @@ def process_split_irregular_with_checkpoint(
             # ---------------------------------------------------------------------
             # Per‑sample aggregation
             # ---------------------------------------------------------------------
-            batch_size = x.size(0)
+            batch_size = x.size(0)  # Use original x tensor for batch size
             
             for b in range(batch_size):
+                # Skip this patch if its image is already processed
+                if checkpoint_manager and checkpoint_manager.is_image_processed(image_paths[b]):
+                    continue
                 # Determine if this patch is defective
                 anomaly_max = int(round(anomaly_map_arithmetic[b].max().item() * 255))
                 anomaly_binary = anomaly_map_arithmetic_binary[b]
@@ -2267,6 +2440,7 @@ def process_split_irregular_with_checkpoint(
                 # Store patch result for original image marking
                 # patch_coords[b] is now a tensor [x, y]
                 patch_coord_tensor = patch_coords[b]
+                
                 if isinstance(patch_coord_tensor, torch.Tensor):
                     x_coord = int(patch_coord_tensor[0].item())
                     y_coord = int(patch_coord_tensor[1].item())
@@ -2284,6 +2458,7 @@ def process_split_irregular_with_checkpoint(
                          "FN" if (x_coord, y_coord) in ground_truth_defective else "TN"
                 
                 # Create required record (always included)
+                
                 required_rec = make_record(
                     split=("meta", split),
                     image_path=("meta", image_paths[b]),
@@ -2355,6 +2530,103 @@ def process_split_irregular_with_checkpoint(
 
                     add_metric_fields(optional_rec, device=device)
                     optional_results.append(optional_rec)
+                
+                # Save patch-level results immediately
+                if checkpoint_manager:
+                    # Create a single-patch record list for this patch
+                    patch_records = [required_rec]
+                    
+                    # Build predicted_defective_set for this single patch
+                    predicted_defective_set = set()
+                    patch_x, patch_y = required_rec["patch_coords"][1]
+                    anomaly_map = required_rec["anomaly_map_arithmetic_binary"][1]
+                    anomaly_pixels = np.sum(anomaly_map)
+                    if anomaly_pixels > 0:
+                        grid_row = patch_y // patch_size
+                        grid_col = patch_x // patch_size
+                        predicted_defective_set.add((grid_row, grid_col))
+                    
+                    # Get ground truth for this image
+                    ground_truth_defective = ground_truth_map.get(image_paths[b], set())
+                    overlapping = predicted_defective_set.intersection(ground_truth_defective)
+                    
+                    # Save patch-level results
+                    try:
+                        save_patch_results_from_records(
+                            checkpoint_manager,
+                            image_paths[b],
+                            patch_records,
+                            predicted_defective_set,
+                            ground_truth_defective,
+                            overlapping,
+                            enable_save_optional_image_results,
+                            patch_size,
+                            patch_x, patch_y  # patch coordinates
+                        )
+                    except Exception as e:
+                        print(f"Warning: Failed to save patch-level results for {image_paths[b]}: {e}")
+                        continue
+                    
+                    # Collect patch records for image-level evaluation JSON
+                    if image_paths[b] not in image_patch_records:
+                        image_patch_records[image_paths[b]] = []
+                    image_patch_records[image_paths[b]].append(required_rec)
+                    
+                    # Calculate total expected patches for this image if not already done
+                    if image_paths[b] not in image_patch_counts:
+                        # Load the image to get its dimensions
+                        try:
+                            original_img = np.array(PILImage.open(image_paths[b]).convert('RGB'))
+                            h, w, _ = original_img.shape
+                            # Calculate total patches for AnnotatedImageDataset
+                            # Uses grid-based patch extraction: grid_rows * grid_cols
+                            grid_rows = (h + patch_size - 1) // patch_size  # Ceiling division
+                            grid_cols = (w + patch_size - 1) // patch_size   # Ceiling division
+                            total_patches = grid_rows * grid_cols
+                            image_patch_counts[image_paths[b]] = total_patches
+                        except Exception as e:
+                            print(f"Warning: Could not calculate patch count for {image_paths[b]}: {e}")
+                            image_patch_counts[image_paths[b]] = 1  # fallback
+                    
+                    # Check if all patches for this image have been processed
+                    current_patches = len(image_patch_records[image_paths[b]])
+                    expected_patches = image_patch_counts[image_paths[b]]
+                    
+                    if current_patches >= expected_patches and image_paths[b] not in completed_images:
+                        # All patches for this image have been processed
+                        completed_images.add(image_paths[b])
+                        
+                        if checkpoint_manager:
+                            # Build predicted_defective_set for this image
+                            predicted_defective_set = set()
+                            for record in image_patch_records[image_paths[b]]:
+                                patch_x, patch_y = record["patch_coords"][1]
+                                anomaly_map = record["anomaly_map_arithmetic_binary"][1]
+                                anomaly_pixels = np.sum(anomaly_map)
+                                if anomaly_pixels > 0:
+                                    grid_row = patch_y // patch_size
+                                    grid_col = patch_x // patch_size
+                                    predicted_defective_set.add((grid_row, grid_col))
+                            
+                            # Get ground truth for this image
+                            ground_truth_defective = ground_truth_map.get(image_paths[b], set())
+                            overlapping = predicted_defective_set.intersection(ground_truth_defective)
+                            
+                            # Save image-level evaluation JSON and images only when image is complete
+                            try:
+                                save_image_results_from_records(
+                                    checkpoint_manager,
+                                    image_paths[b],
+                                    image_patch_records[image_paths[b]],
+                                    predicted_defective_set,
+                                    ground_truth_defective,
+                                    overlapping,
+                                    enable_save_optional_image_results,
+                                    patch_size
+                                )
+                                #print(f"Completed image-level analysis for {os.path.basename(image_paths[b])} ({current_patches} patches)")
+                            except Exception as e:
+                                print(f"Warning: Failed to save image-level results for {image_paths[b]}: {e}")
             
             # Memory optimization: Clear cache every 10 batches
             if idx % 10 == 0 and idx > 0:
@@ -2366,50 +2638,10 @@ def process_split_irregular_with_checkpoint(
                 # Save checkpoint periodically
                 if checkpoint_manager:
                     checkpoint_manager.save_checkpoint(idx, processed_images)
-        
-        image_results = defaultdict(list)
-        for record in results:
-            image_path = record["image_path"][1]  # Extract image_path from record
-            image_results[image_path].append(record)
+            
 
-        # After processing this batch, check for any images that have all their patches processed
-        completed_images = []
-        for image_path in list(image_results.keys()):
-            image_records = image_results[image_path]
-            # Build predicted_defective_set for this image
-            predicted_defective_set = set()
-            for record in image_records:
-                x, y = record["patch_coords"][1]
-                anomaly_map = record["anomaly_map_arithmetic_binary"][1]
-                anomaly_pixels = np.sum(anomaly_map)
-                if anomaly_pixels > 0:
-                    grid_row = y // patch_size
-                    grid_col = x // patch_size
-                    predicted_defective_set.add((grid_row, grid_col))
-            # Now you can safely do:
-            # Compute ground_truth_defective as before
-            # ...
-            overlapping = predicted_defective_set.intersection(ground_truth_defective)
-            if not checkpoint_manager or not checkpoint_manager.is_image_processed(image_path):
-                    # Load ground truth annotations for this image
-                    ground_truth_defective = ground_truth_map.get(image_path, set())
-                    save_image_results_from_records(
-                        checkpoint_manager,
-                        image_path,
-                        image_results[image_path],
-                        predicted_defective_set,
-                        ground_truth_defective,
-                        overlapping,
-                        enable_save_optional_image_results,
-                        patch_size
-                    )
-                    if checkpoint_manager:
-                        checkpoint_manager.mark_image_processed(image_path)
-                    # Mark for removal from dict
-                    completed_images.append(image_path)
-        # Remove completed images from dict
-        for image_path in completed_images:
-            del image_results[image_path]
+        
+
 
         # Memory optimization: Clear cache every 10 batches
         if idx % 10 == 0 and idx > 0:
@@ -2419,6 +2651,8 @@ def process_split_irregular_with_checkpoint(
             gc.collect()
             if checkpoint_manager:
                 checkpoint_manager.save_checkpoint(idx, processed_images)
+            
+
 
     except KeyboardInterrupt:
         print("\nProcess interrupted. Saving checkpoint...")
@@ -2436,6 +2670,42 @@ def process_split_irregular_with_checkpoint(
         metrics.print_epoch_stats()
     else:
         print("Skipping epoch statistics (disabled)")
+    
+    # Save any remaining image-level results that haven't been saved yet
+    if checkpoint_manager:
+        for image_path, patch_records in image_patch_records.items():
+            if image_path not in completed_images and len(patch_records) > 0:
+                print(f"Saving final image-level results for {os.path.basename(image_path)} ({len(patch_records)} patches)")
+                
+                # Build predicted_defective_set for this image
+                predicted_defective_set = set()
+                for record in patch_records:
+                    patch_x, patch_y = record["patch_coords"][1]
+                    anomaly_map = record["anomaly_map_arithmetic_binary"][1]
+                    anomaly_pixels = np.sum(anomaly_map)
+                    if anomaly_pixels > 0:
+                        grid_row = patch_y // patch_size
+                        grid_col = patch_x // patch_size
+                        predicted_defective_set.add((grid_row, grid_col))
+                
+                # Get ground truth for this image
+                ground_truth_defective = ground_truth_map.get(image_path, set())
+                overlapping = predicted_defective_set.intersection(ground_truth_defective)
+                
+                # Save image-level evaluation JSON and images
+                try:
+                    save_image_results_from_records(
+                        checkpoint_manager,
+                        image_path,
+                        patch_records,
+                        predicted_defective_set,
+                        ground_truth_defective,
+                        overlapping,
+                        enable_save_optional_image_results,
+                        patch_size
+                    )
+                except Exception as e:
+                    print(f"Warning: Failed to save final image-level results for {image_path}: {e}")
 
     return results, optional_results
 

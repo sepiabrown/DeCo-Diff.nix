@@ -128,7 +128,7 @@ class PCBDataset(Dataset):
         resume_dir: str = None,  # Directory to resume from (for loading existing crop annotations)
         resume_epoch: int = None,  # Epoch to resume from (for filtering crops)
         cumulative_crops: dict = None,  # Dictionary to store cumulative crops
-        annotation_dir: str = None,  # Directory for annotation JSONs for patch selection
+        fine_tuning_json: str = None,  # Path to fine-tuning JSON file for patch selection
     ):
         """
         Args:
@@ -182,72 +182,91 @@ class PCBDataset(Dataset):
         self.shift_y = shift_y
         self.blur = blur
         self.noise = noise
-        if split_csv_path is None:
-            df = pd.read_csv(os.path.join(".", "splits", "pcb-split.csv"))
-        else:
-            df = pd.read_csv(split_csv_path)
-        if num_datafile is not None:
-            # Ensure we don't sample more than available data
-            df = df.sample(n=num_datafile, replace=True)
-        if object_class == "all":
-            df = df.query(f'split=="{mode}"')
-        else:
-            df = df.query(f'split=="{mode}" and object=="{object_class}"')
-
-        if anomaly_class == "good":
-            df = df.query('category=="good"')
-        elif anomaly_class == "all":
-            pass
-        else:
-            df = df.query(f'category=="{anomaly_class}"')
-
-        if len(df) == 0:
-            raise Exception("No data found")
-
-        self.images = []
-        self.segs = []
-        self.object_classes = []
-        self.image_paths = []
-        self.anomaly_classes = []
-        for i, row in df.iterrows():
-            data_path = os.path.join(rootdir, str(row["image"]))
-            img = np.array(
-                Image.open(data_path).convert("RGB")
-                # .resize((self.image_size, self.image_size))
-            ).astype(np.uint8)
-            self.image_paths.append(data_path)
-            self.images.append(img)
-            self.object_classes.append(object_cls_dict[str(row["object"])])
-            self.anomaly_classes.append(str(row["category"]))
-            if str(row["category"]) != "good":
-                seg_path = os.path.join(rootdir, str(row["mask"]))
-                seg = (
-                    np.array(
-                        Image.open(seg_path).convert("L")
-                        # .resize((self.image_size, self.image_size))
-                    )
-                    > 0
-                ).astype(np.uint8)
-                self.segs.append((seg))
-            else:
-                seg_path = os.path.join(rootdir, str(row["image"]))
-                if os.path.exists(seg_path):
-                    seg_shape = np.array(Image.open(seg_path)).shape
-                else:
-                    seg_shape = (self.image_size, self.image_size)
-                self.segs.append(np.zeros(seg_shape))
+        self.fine_tuning_json = fine_tuning_json
+        self.false_positive_patches = {}  # {image_path: [patch_info, ...]}
+        self._current_patch_info = None  # Initialize patch info for fine-tuning
         
-        # First check if we're tracking crops
-        if self.track_crop:
+        # If fine-tuning JSON is provided, load images directly from it
+        if self.fine_tuning_json:
+            self._load_fine_tuning_data()
+        else:
+            # Use traditional CSV-based loading
+            self._load_csv_data(split_csv_path, rootdir, num_datafile, object_class, mode, anomaly_class)
+            # Set up augmentations for CSV-based loading
+            self._setup_augmentations()
+        
+        # Ensure we have images loaded
+        if not hasattr(self, 'images') or len(self.images) == 0:
+            raise Exception("No images were loaded. Check your data paths and fine-tuning JSON file.")
+
+    def _load_fine_tuning_data(self):
+        """Load image paths and masks directly from the fine-tuning JSON file."""
+        fp_review_file = self.fine_tuning_json
+        if os.path.exists(fp_review_file):
+            with open(fp_review_file, 'r') as f:
+                review_data = json.load(f)
+            
+            # Collect unique image paths from selected entries
+            unique_images = set()
+            for entry in review_data.get('entries', []):
+                if entry.get('selected', True):  # Only use selected entries
+                    image_path = entry.get('image_path')
+                    if image_path:
+                        unique_images.add(image_path)
+            
+            # Load images and set up dataset
+            self.images = []
+            self.segs = []
+            self.object_classes = []
+            self.image_paths = []
+            self.anomaly_classes = []
+            
+            object_cls_dict = {"pcb": 0}
+            
+            for image_path in unique_images:
+                if os.path.exists(image_path):
+                    img = np.array(Image.open(image_path).convert("RGB")).astype(np.uint8)
+                    self.image_paths.append(image_path)
+                    self.images.append(img)
+                    self.object_classes.append(object_cls_dict["pcb"])
+                    self.anomaly_classes.append("good")  # Default to good for fine-tuning
+                    
+                    # Create empty mask for good images
+                    seg_shape = (self.image_size, self.image_size)
+                    self.segs.append(np.zeros(seg_shape))
+                else:
+                    print(f"Warning: Image not found: {image_path}")
+            
+            print(f"Loaded {len(self.images)} unique images from fine-tuning JSON")
+            
+            # Load false positive patches
+            self._load_false_positive_patches()
+            
+            print(f"Loaded {sum(len(patches) for patches in self.false_positive_patches.values())} patches from {fp_review_file}")
+            
+            # Set up augmentations
+            self._setup_augmentations()
+            
+            # Force augmentation to be enabled for fine-tuning
+            self.augment = True
+            
+        else:
+            print(f"Warning: Fine-tuning JSON file not found: {fp_review_file}")
+            raise Exception("Fine-tuning JSON file not found")
+
+    def _setup_augmentations(self):
+        """Set up augmentation functions based on track_crop setting."""
+        if self.track_crop or self.fine_tuning_json:
             # Define tracking functions that will be used for both augmented and non-augmented cases
             def rotate_and_crop_func(img, **kwargs):
+                print(f"DEBUG: rotate_and_crop_func called with kwargs: {kwargs}")
                 # Apply brightness/contrast first
                 img, brightness_factor, contrast_factor, bc_applied = random_brightness_contrast(
                     img, brightness_limit=0.05, contrast_limit=0.05, p=0.5
                 )
                 h, w = img.shape[:2]
                 center = (w // 2, h // 2)
-                rotation_angle = 30
+                rotation_angle = np.random.uniform(-5, 5)
                 rotation_matrix = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
                 inverse_matrix = cv2.getRotationMatrix2D(center, -rotation_angle, 1.0)
                 rotated = cv2.warpAffine(img, rotation_matrix, (w, h),
@@ -257,10 +276,10 @@ class PCBDataset(Dataset):
                 crop_w = min(self.image_size, w)
                 max_h = h - crop_h
                 max_w = w - crop_w
-                # If annotation_dir is set and there are false positive patches for this image, use one
+                # If fine_tuning_json is set and there are false positive patches for this image, use one
                 use_fp_patch = False
                 crop_x = crop_y = None
-                if self.annotation_dir and hasattr(self, 'image_paths'):
+                if self.fine_tuning_json and hasattr(self, 'image_paths'):
                     # Find the original image path for this sample
                     # This function is called inside __getitem__, so self.image_paths[index] is available
                     # But we don't have index here, so we need to pass it in via kwargs
@@ -268,16 +287,31 @@ class PCBDataset(Dataset):
                     if index is not None:
                         img_path = self.image_paths[index]
                         fp_patches = self.false_positive_patches.get(img_path, [])
+                        print(f"DEBUG: Image {img_path} has {len(fp_patches)} patches available")
                         if fp_patches:
                             use_fp_patch = True
                             # Randomly select a false positive patch
                             patch = np.random.choice(fp_patches)
+                            print(f"DEBUG: Selected patch {patch} for image {img_path}")
                             # patch['pixel_coordinates'] = [x1, y1, x2, y2]
                             crop_x, crop_y, crop_x2, crop_y2 = patch['pixel_coordinates']
                             crop_x = int(crop_x)
                             crop_y = int(crop_y)
                             crop_w = int(crop_x2 - crop_x)
                             crop_h = int(crop_y2 - crop_y)
+                            print(f"DEBUG: Original patch coordinates: [{crop_x}, {crop_y}, {crop_x2}, {crop_y2}]")
+                            
+                            # Save the chosen patch for verification
+                            # Use original patch coordinates directly - no transformation needed
+                            # We want to extract the same patch from the original image (before rotation)
+                            transformed_patch = {
+                                'pixel_coordinates': [crop_x, crop_y, crop_x2, crop_y2],
+                                'anomaly_max': patch.get('anomaly_max', 0),
+                                'status': patch.get('status', 'FP')
+                            }
+                            print(f"DEBUG: Using original coordinates: [{crop_x}, {crop_y}, {crop_x2}, {crop_y2}] (patch size: {crop_x2-crop_x}x{crop_y2-crop_y})")
+                            # Store the patch info for later saving in __getitem__
+                            self._current_patch_info = transformed_patch
                 if not use_fp_patch:
                     if self.augment:
                         crop_y = np.random.randint(0, max_h + 1) if max_h > 0 else 0
@@ -332,23 +366,153 @@ class PCBDataset(Dataset):
             else:
                 self.aug = A.CenterCrop(p=1, height=self.image_size, width=self.image_size)
 
-        self.annotation_dir = annotation_dir
-        self.false_positive_patches = {}  # {image_path: [patch_info, ...]}
-        if self.annotation_dir:
-            self._load_false_positive_patches()
+    def _load_csv_data(self, split_csv_path, rootdir, num_datafile, object_class, mode, anomaly_class):
+        """Load image paths and masks from CSV file."""
+        if split_csv_path is None:
+            df = pd.read_csv(os.path.join(".", "splits", "pcb-split.csv"))
+        else:
+            df = pd.read_csv(split_csv_path)
+        if num_datafile is not None:
+            # Ensure we don't sample more than available data
+            df = df.sample(n=num_datafile, replace=True)
+        if object_class == "all":
+            df = df.query(f'split=="{mode}"')
+        else:
+            df = df.query(f'split=="{mode}" and object=="{object_class}"')
+
+        if anomaly_class == "good":
+            df = df.query('category=="good"')
+        elif anomaly_class == "all":
+            pass
+        else:
+            df = df.query(f'category=="{anomaly_class}"')
+
+        if len(df) == 0:
+            raise Exception("No data found")
+
+        # Define object class dictionary
+        object_cls_dict = {"pcb": 0}
+
+        self.images = []
+        self.segs = []
+        self.object_classes = []
+        self.image_paths = []
+        self.anomaly_classes = []
+        for i, row in df.iterrows():
+            data_path = os.path.join(rootdir, str(row["image"]))
+            img = np.array(
+                Image.open(data_path).convert("RGB")
+                # .resize((self.image_size, self.image_size))
+            ).astype(np.uint8)
+            self.image_paths.append(data_path)
+            self.images.append(img)
+            self.object_classes.append(object_cls_dict[str(row["object"])])
+            self.anomaly_classes.append(str(row["category"]))
+            if str(row["category"]) != "good":
+                seg_path = os.path.join(rootdir, str(row["mask"]))
+                seg = (
+                    np.array(
+                        Image.open(seg_path).convert("L")
+                        # .resize((self.image_size, self.image_size))
+                    )
+                    > 0
+                ).astype(np.uint8)
+                self.segs.append((seg))
+            else:
+                seg_path = os.path.join(rootdir, str(row["image"]))
+                if os.path.exists(seg_path):
+                    seg_shape = np.array(Image.open(seg_path)).shape
+                else:
+                    seg_shape = (self.image_size, self.image_size)
+                self.segs.append(np.zeros(seg_shape))
 
     def _load_false_positive_patches(self):
-        import glob
-        # Find all annotation JSONs
-        annotation_files = glob.glob(os.path.join(self.annotation_dir, '*__false_positives.json'))
-        for ann_file in annotation_files:
-            with open(ann_file, 'r') as f:
-                anno = json.load(f)
-            image_path = anno.get('image_path')
-            # Only consider if there are false positives
-            fp_patches = anno.get('false_positives', [])
-            if fp_patches:
-                self.false_positive_patches[image_path] = fp_patches
+        # Load fp_review_list.json file directly
+        fp_review_file = self.fine_tuning_json
+        if os.path.exists(fp_review_file):
+            with open(fp_review_file, 'r') as f:
+                review_data = json.load(f)
+            
+            print(f"DEBUG: Loading patches from {fp_review_file}")
+            print(f"DEBUG: Found {len(review_data.get('entries', []))} entries in review file")
+            
+            # Process entries from the review list
+            for entry in review_data.get('entries', []):
+                if entry.get('selected', True):  # Only use selected entries
+                    image_path = entry.get('image_path')
+                    if image_path:
+                        # Convert the entry to the expected patch format
+                        patch_info = {
+                            'pixel_coordinates': [
+                                entry.get('grid_col', 0) * 128,  # Convert grid coordinates to pixel coordinates
+                                entry.get('grid_row', 0) * 128,
+                                (entry.get('grid_col', 0) + 1) * 128,
+                                (entry.get('grid_row', 0) + 1) * 128
+                            ],
+                            'anomaly_max': entry.get('anomaly_max', 0),
+                            'status': entry.get('status', 'FP')
+                        }
+                        
+                        if image_path not in self.false_positive_patches:
+                            self.false_positive_patches[image_path] = []
+                        self.false_positive_patches[image_path].append(patch_info)
+            
+            print(f"Loaded {sum(len(patches) for patches in self.false_positive_patches.values())} patches from {fp_review_file}")
+            print(f"DEBUG: Patches per image:")
+            for img_path, patches in self.false_positive_patches.items():
+                print(f"  {img_path}: {len(patches)} patches")
+        else:
+            print(f"Warning: Fine-tuning JSON file not found: {fp_review_file}")
+
+    def _save_chosen_patch(self, original_img, patch_info, img_path, index):
+        """
+        Save the chosen patch as a PNG image for verification
+        
+        Args:
+            original_img: Original image array
+            patch_info: Dictionary containing patch information
+            img_path: Path to the original image
+            index: Index of the image in the dataset
+        """
+        try:
+            # Create tmp directory if it doesn't exist
+            os.makedirs("tmp", exist_ok=True)
+            
+            # Extract patch coordinates
+            x1, y1, x2, y2 = patch_info['pixel_coordinates']
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            
+            # Extract the patch from the original image
+            patch_img = original_img[y1:y2, x1:x2]
+            
+            # Create filename with patch information
+            img_basename = os.path.basename(img_path)
+            img_name = os.path.splitext(img_basename)[0]
+            
+            # Calculate grid coordinates from pixel coordinates (assuming 128x128 grid)
+            grid_row = y1 // 128 if y1 >= 0 else 'unknown'
+            grid_col = x1 // 128 if x1 >= 0 else 'unknown'
+            
+            # Include patch details in filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            patch_filename = f"patch_{img_name}_grid_{grid_row}_{grid_col}_anomaly_{patch_info.get('anomaly_max', 'unknown')}_status_{patch_info.get('status', 'unknown')}_index_{index}_{timestamp}.png"
+            
+            # Save the patch image
+            patch_path = os.path.join("tmp", patch_filename)
+            cv2.imwrite(patch_path, cv2.cvtColor(patch_img, cv2.COLOR_RGB2BGR))
+            
+            print(f"Saved chosen patch: {patch_path}")
+            print(f"  Original image: {img_path}")
+            print(f"  Patch coordinates: ({x1}, {y1}) to ({x2}, {y2})")
+            print(f"  Grid coordinates: row={grid_row}, col={grid_col}")
+            print(f"  Patch size: {patch_img.shape[1]}x{patch_img.shape[0]}")
+            print(f"  Anomaly score: {patch_info.get('anomaly_max', 'unknown')}")
+            print(f"  Status: {patch_info.get('status', 'unknown')}")
+            print(f"  Dataset index: {index}")
+            print(f"  Available patches for this image: {len(self.false_positive_patches.get(img_path, []))}")
+            
+        except Exception as e:
+            print(f"Warning: Could not save chosen patch: {e}")
 
     def load_crop_annotations(self, resume_epoch):
         """Load existing crop annotations from JSON file"""
@@ -564,7 +728,13 @@ class PCBDataset(Dataset):
         img = self.images[index].astype(np.uint8)
         seg = self.segs[index].astype(np.int32)
         anomaly_class = self.anomaly_classes[index]
-        
+
+        # Save patch from original image BEFORE any augmentation
+        if self.fine_tuning_json and hasattr(self, '_current_patch_info') and self._current_patch_info is not None:
+            self._save_chosen_patch(img, self._current_patch_info, self.image_paths[index], index)
+            # Clear the current patch info after saving
+            self._current_patch_info = None
+
         if self.augment:
             augmented = self.aug(image=img, mask=seg, index=index)
             img = augmented["image"]
