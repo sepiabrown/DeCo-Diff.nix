@@ -122,6 +122,7 @@ class PCBDataset(Dataset):
         noise: int = None,
         num_datafile: int = None,
         split_csv_path: str = None,
+        split_json_path: str = None,  # New parameter for JSON split file
         track_crop: bool = False,  # New parameter to enable crop tracking
         save_crop_visualizations: bool = False,  # New parameter to save crop visualizations
         crop_vis_dir: str = "./crop_visualizations",  # Directory to save crop visualizations
@@ -189,6 +190,11 @@ class PCBDataset(Dataset):
         # If fine-tuning JSON is provided, load images directly from it
         if self.fine_tuning_json:
             self._load_fine_tuning_data()
+        elif split_json_path:
+            # Use JSON-based loading
+            self._load_json_data(split_json_path, rootdir, num_datafile, object_class, mode, anomaly_class)
+            # Set up augmentations for JSON-based loading
+            self._setup_augmentations()
         else:
             # Use traditional CSV-based loading
             self._load_csv_data(split_csv_path, rootdir, num_datafile, object_class, mode, anomaly_class)
@@ -259,7 +265,7 @@ class PCBDataset(Dataset):
         if self.track_crop or self.fine_tuning_json:
             # Define tracking functions that will be used for both augmented and non-augmented cases
             def rotate_and_crop_func(img, **kwargs):
-                print(f"DEBUG: rotate_and_crop_func called with kwargs: {kwargs}")
+                #print(f"DEBUG: rotate_and_crop_func called with kwargs: {kwargs}")
                 # Apply brightness/contrast first
                 img, brightness_factor, contrast_factor, bc_applied = random_brightness_contrast(
                     img, brightness_limit=0.05, contrast_limit=0.05, p=0.5
@@ -426,6 +432,94 @@ class PCBDataset(Dataset):
                     seg_shape = (self.image_size, self.image_size)
                 self.segs.append(np.zeros(seg_shape))
 
+    def _load_json_data(self, split_json_path, rootdir, num_datafile, object_class, mode, anomaly_class):
+        """Load image paths and masks from JSON file.
+        
+        Expected JSON format:
+        {
+            "entries": [
+                {
+                    "image_path": "path/to/image.png",
+                    "selected": true
+                },
+                ...
+            ]
+        }
+        
+        Args:
+            split_json_path: Path to JSON file containing image entries
+            rootdir: Root directory for data (not used for JSON loading)
+            num_datafile: Maximum number of files to load
+            object_class: Object class filter (not used for JSON loading)
+            mode: Training mode (not used for JSON loading)
+            anomaly_class: Anomaly class filter (assumes "good" for JSON loading)
+        """
+        if split_json_path is None:
+            raise Exception("split_json_path is required for JSON-based loading")
+        
+        with open(split_json_path, 'r') as f:
+            json_data = json.load(f)
+        
+        # Extract entries from JSON
+        entries = json_data.get('entries', [])
+        
+        if num_datafile is not None:
+            # Ensure we don't sample more than available data
+            if len(entries) > num_datafile:
+                import random
+                entries = random.sample(entries, num_datafile)
+        
+        # Filter entries based on object_class and mode
+        # Note: JSON structure may not have explicit split/mode fields like CSV
+        # We'll assume all entries are for the specified mode
+        filtered_entries = []
+        for entry in entries:
+            # Check if entry has required fields
+            if 'image_path' in entry:
+                # For now, we'll include all entries since JSON structure may vary
+                # You can add specific filtering logic here based on your JSON structure
+                filtered_entries.append(entry)
+        
+        if len(filtered_entries) == 0:
+            raise Exception("No data found in JSON file")
+
+        # Define object class dictionary
+        object_cls_dict = {"pcb": 0}
+
+        self.images = []
+        self.segs = []
+        self.object_classes = []
+        self.image_paths = []
+        self.anomaly_classes = []
+        
+        for entry in filtered_entries:
+            image_path = entry.get('image_path')
+            if not image_path:
+                continue
+                
+            # Check if image exists
+            if not os.path.exists(image_path):
+                print(f"Warning: Image path not found: {image_path}")
+                continue
+            
+            try:
+                img = np.array(Image.open(image_path).convert("RGB")).astype(np.uint8)
+                self.image_paths.append(image_path)
+                self.images.append(img)
+                self.object_classes.append(object_cls_dict["pcb"])
+                
+                # For JSON-based loading, we'll assume all images are "good" (normal)
+                # You can modify this based on your JSON structure
+                self.anomaly_classes.append("good")
+                
+                # Create empty segmentation mask for normal images
+                img_shape = img.shape[:2]  # Get height and width
+                self.segs.append(np.zeros(img_shape))
+                
+            except Exception as e:
+                print(f"Warning: Could not load image {image_path}: {e}")
+                continue
+
     def _load_false_positive_patches(self):
         # Load fp_review_list.json file directly
         fp_review_file = self.fine_tuning_json
@@ -543,10 +637,10 @@ class PCBDataset(Dataset):
                         if self.resume_epoch is None or crop_epoch <= self.resume_epoch:
                             self.cumulative_crops[image_path].append(crop)
                             kept_crops += 1
-                            print(f"DEBUG: Keeping crop from epoch {crop_epoch} (resume_epoch={self.resume_epoch})")
+                            #print(f"DEBUG: Keeping crop from epoch {crop_epoch} (resume_epoch={self.resume_epoch})")
                         else:
                             removed_crops += 1
-                            print(f"DEBUG: Removing crop from epoch {crop_epoch} (resume_epoch={self.resume_epoch})")
+                            #print(f"DEBUG: Removing crop from epoch {crop_epoch} (resume_epoch={self.resume_epoch})")
                 
                 if self.resume_epoch is not None:
                     print(f"DEBUG: Loading crops for resume at epoch {self.resume_epoch}:")

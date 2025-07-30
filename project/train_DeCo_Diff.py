@@ -305,6 +305,7 @@ def _main(args):
             center_crop=args.center_crop,
             num_datafile=args.num_datafile,
             split_csv_path=args.split_csv_path,
+            split_json_path=args.split_json_path,  # Pass JSON split file path
             track_crop=args.track_crop,  # Enable crop tracking
             save_crop_visualizations=args.save_crop_visualizations,  # Save crop visualizations
             crop_vis_dir=f"./crop_visualizations_{args.object_class}",  # Directory for crop visualizations
@@ -452,6 +453,7 @@ def _main(args):
                         center_crop=args.center_crop,
                         num_datafile=args.num_datafile,
                         split_csv_path=args.split_csv_path,
+                        split_json_path=args.split_json_path,  # Pass JSON split file path
                         track_crop=args.track_crop,  # Enable crop tracking
                         save_crop_visualizations=args.save_crop_visualizations,  # Save crop visualizations
                         crop_vis_dir=f"./crop_visualizations_{args.object_class}",  # Directory for crop visualizations
@@ -771,6 +773,9 @@ def main():
     parser.add_argument("--num-datafile", type=int, default=None)
     parser.add_argument("--rep-datafile", type=int, default=None)
     parser.add_argument("--split-csv-path", type=str, default=None)
+    # JSON split file provides an alternative to CSV for defining training data splits
+    # Expected format: {"entries": [{"image_path": "path/to/image.png", "selected": true}, ...]}
+    parser.add_argument("--split-json-path", type=str, default=None, help="Path to JSON file containing split information (alternative to CSV)")
     parser.add_argument(
         "--input-json",
         type=str,
@@ -833,7 +838,7 @@ def main():
                         value = float(value)
                     elif key in ['center_crop', 'mask_random_ratio', 'from_scratch', 'augmentation', 'track_crop', 'save_crop_visualizations']:
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
-                    elif key in ['data_dir', 'resume_dir', 'split_csv_path', 'fine_tuning_json']:
+                    elif key in ['data_dir', 'resume_dir', 'split_csv_path', 'split_json_path', 'fine_tuning_json']:
                         if value:  # Only expand if not None/empty
                             value = os.path.expanduser(value)
                     elif key in ['global_batch_size']:
