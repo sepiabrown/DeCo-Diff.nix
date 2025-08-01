@@ -130,6 +130,7 @@ class PCBDataset(Dataset):
         resume_epoch: int = None,  # Epoch to resume from (for filtering crops)
         cumulative_crops: dict = None,  # Dictionary to store cumulative crops
         fine_tuning_json: str = None,  # Path to fine-tuning JSON file for patch selection
+        fine_tuning_csv: str = None,  # Path to fine-tuning CSV file for patch selection
     ):
         """
         Args:
@@ -184,12 +185,15 @@ class PCBDataset(Dataset):
         self.blur = blur
         self.noise = noise
         self.fine_tuning_json = fine_tuning_json
+        self.fine_tuning_csv = fine_tuning_csv
         self.false_positive_patches = {}  # {image_path: [patch_info, ...]}
         self._current_patch_info = None  # Initialize patch info for fine-tuning
         
-        # If fine-tuning JSON is provided, load images directly from it
+        # If fine-tuning JSON or CSV is provided, load images directly from it
         if self.fine_tuning_json:
             self._load_fine_tuning_data()
+        elif self.fine_tuning_csv:
+            self._load_fine_tuning_csv_data()
         elif split_json_path:
             # Use JSON-based loading
             self._load_json_data(split_json_path, rootdir, num_datafile, object_class, mode, anomaly_class)
@@ -260,9 +264,77 @@ class PCBDataset(Dataset):
             print(f"Warning: Fine-tuning JSON file not found: {fp_review_file}")
             raise Exception("Fine-tuning JSON file not found")
 
+    def _load_fine_tuning_csv_data(self):
+        """Load image paths and masks directly from the fine-tuning CSV file."""
+        fp_review_file = self.fine_tuning_csv
+        if os.path.exists(fp_review_file):
+            # Read CSV file using pandas
+            df = pd.read_csv(fp_review_file)
+            
+            print(f"DEBUG: Loading fine-tuning data from CSV: {fp_review_file}")
+            print(f"DEBUG: CSV columns: {list(df.columns)}")
+            print(f"DEBUG: Found {len(df)} entries in CSV file")
+            
+            # Filter entries based on split and category (similar to _load_csv_data)
+            if 'split' in df.columns:
+                df = df.query(f'split=="train"')  # Use train split for fine-tuning
+            
+            if 'category' in df.columns:
+                df = df.query('category=="good"')  # Use good images for fine-tuning
+            
+            if len(df) == 0:
+                raise Exception("No data found in CSV file after filtering")
+            
+            # Load images and set up dataset
+            self.images = []
+            self.segs = []
+            self.object_classes = []
+            self.image_paths = []
+            self.anomaly_classes = []
+            
+            object_cls_dict = {"pcb": 0}
+            
+            for i, row in df.iterrows():
+                image_path = row.get('image')
+                if not image_path:
+                    continue
+                    
+                if os.path.exists(image_path):
+                    img = np.array(Image.open(image_path).convert("RGB")).astype(np.uint8)
+                    self.image_paths.append(image_path)
+                    self.images.append(img)
+                    self.object_classes.append(object_cls_dict["pcb"])
+                    self.anomaly_classes.append("good")  # Default to good for fine-tuning
+                    
+                    # Create empty mask for good images
+                    seg_shape = (self.image_size, self.image_size)
+                    self.segs.append(np.zeros(seg_shape))
+                else:
+                    print(f"Warning: Image not found: {image_path}")
+            
+            print(f"Loaded {len(self.images)} images from fine-tuning CSV")
+            
+            # For CSV fine-tuning, we don't load specific patches - we use the full images
+            # and let the standard augmentation process handle cropping
+            self.false_positive_patches = {}  # Empty for CSV fine-tuning
+            
+            # Set up augmentations
+            self._setup_augmentations()
+            
+            # Force augmentation to be enabled for fine-tuning
+            self.augment = True
+            
+        else:
+            print(f"Warning: Fine-tuning CSV file not found: {fp_review_file}")
+            raise Exception("Fine-tuning CSV file not found")
+
     def _setup_augmentations(self):
-        """Set up augmentation functions based on track_crop setting."""
-        if self.track_crop or self.fine_tuning_json:
+        """Set up augmentation functions based on track_crop and fine-tuning settings."""
+        
+        # Check if fine-tuning is enabled
+        fine_tuning_enabled = self.fine_tuning_json is not None or self.fine_tuning_csv is not None
+        
+        if self.track_crop:
             # Define tracking functions that will be used for both augmented and non-augmented cases
             def rotate_and_crop_func(img, **kwargs):
                 #print(f"DEBUG: rotate_and_crop_func called with kwargs: {kwargs}")
@@ -282,49 +354,15 @@ class PCBDataset(Dataset):
                 crop_w = min(self.image_size, w)
                 max_h = h - crop_h
                 max_w = w - crop_w
-                # If fine_tuning_json is set and there are false positive patches for this image, use one
-                use_fp_patch = False
-                crop_x = crop_y = None
-                if self.fine_tuning_json and hasattr(self, 'image_paths'):
-                    # Find the original image path for this sample
-                    # This function is called inside __getitem__, so self.image_paths[index] is available
-                    # But we don't have index here, so we need to pass it in via kwargs
-                    index = kwargs.get('index', None)
-                    if index is not None:
-                        img_path = self.image_paths[index]
-                        fp_patches = self.false_positive_patches.get(img_path, [])
-                        print(f"DEBUG: Image {img_path} has {len(fp_patches)} patches available")
-                        if fp_patches:
-                            use_fp_patch = True
-                            # Randomly select a false positive patch
-                            patch = np.random.choice(fp_patches)
-                            print(f"DEBUG: Selected patch {patch} for image {img_path}")
-                            # patch['pixel_coordinates'] = [x1, y1, x2, y2]
-                            crop_x, crop_y, crop_x2, crop_y2 = patch['pixel_coordinates']
-                            crop_x = int(crop_x)
-                            crop_y = int(crop_y)
-                            crop_w = int(crop_x2 - crop_x)
-                            crop_h = int(crop_y2 - crop_y)
-                            print(f"DEBUG: Original patch coordinates: [{crop_x}, {crop_y}, {crop_x2}, {crop_y2}]")
-                            
-                            # Save the chosen patch for verification
-                            # Use original patch coordinates directly - no transformation needed
-                            # We want to extract the same patch from the original image (before rotation)
-                            transformed_patch = {
-                                'pixel_coordinates': [crop_x, crop_y, crop_x2, crop_y2],
-                                'anomaly_max': patch.get('anomaly_max', 0),
-                                'status': patch.get('status', 'FP')
-                            }
-                            print(f"DEBUG: Using original coordinates: [{crop_x}, {crop_y}, {crop_x2}, {crop_y2}] (patch size: {crop_x2-crop_x}x{crop_y2-crop_y})")
-                            # Store the patch info for later saving in __getitem__
-                            self._current_patch_info = transformed_patch
-                if not use_fp_patch:
-                    if self.augment:
-                        crop_y = np.random.randint(0, max_h + 1) if max_h > 0 else 0
-                        crop_x = np.random.randint(0, max_w + 1) if max_w > 0 else 0
-                    else:
-                        crop_y = (h - crop_h) // 2
-                        crop_x = (w - crop_w) // 2
+                
+                # Standard crop selection (no fine-tuning logic here)
+                if self.augment:
+                    crop_y = np.random.randint(0, max_h + 1) if max_h > 0 else 0
+                    crop_x = np.random.randint(0, max_w + 1) if max_w > 0 else 0
+                else:
+                    crop_y = (h - crop_h) // 2
+                    crop_x = (w - crop_w) // 2
+                
                 cropped_rotated = rotated[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
                 crop_corners_rot = np.array([
                     [crop_x, crop_y],
@@ -440,7 +478,11 @@ class PCBDataset(Dataset):
             "entries": [
                 {
                     "image_path": "path/to/image.png",
-                    "selected": true
+                    "selected": true,
+                    "grid_row": 0,  # Optional: specific grid row
+                    "grid_col": 12,  # Optional: specific grid column
+                    "anomaly_max": 255,  # Optional: anomaly score
+                    "status": "FP"  # Optional: status
                 },
                 ...
             ]
@@ -491,6 +533,7 @@ class PCBDataset(Dataset):
         self.object_classes = []
         self.image_paths = []
         self.anomaly_classes = []
+        self.patch_info_list = []  # Store patch information for each entry
         
         for entry in filtered_entries:
             image_path = entry.get('image_path')
@@ -504,17 +547,85 @@ class PCBDataset(Dataset):
             
             try:
                 img = np.array(Image.open(image_path).convert("RGB")).astype(np.uint8)
-                self.image_paths.append(image_path)
-                self.images.append(img)
-                self.object_classes.append(object_cls_dict["pcb"])
                 
-                # For JSON-based loading, we'll assume all images are "good" (normal)
-                # You can modify this based on your JSON structure
-                self.anomaly_classes.append("good")
+                # Check if this entry has grid coordinates (patch-specific)
+                grid_row = entry.get('grid_row')
+                grid_col = entry.get('grid_col')
                 
-                # Create empty segmentation mask for normal images
-                img_shape = img.shape[:2]  # Get height and width
-                self.segs.append(np.zeros(img_shape))
+                if grid_row is not None and grid_col is not None:
+                    # This is a patch-specific entry
+                    grid_size = json_data.get('metadata', {}).get('grid_size', 128)  # Default to 128
+                    
+                    # Calculate patch coordinates
+                    x1 = grid_col * grid_size
+                    y1 = grid_row * grid_size
+                    x2 = (grid_col + 1) * grid_size
+                    y2 = (grid_row + 1) * grid_size
+                    
+                    # Ensure patch coordinates are within image bounds
+                    img_height, img_width = img.shape[:2]
+                    x1 = max(0, min(x1, img_width))
+                    y1 = max(0, min(y1, img_height))
+                    x2 = max(x1, min(x2, img_width))
+                    y2 = max(y1, min(y2, img_height))
+                    
+                    # Extract the specific patch
+                    patch_img = img[y1:y2, x1:x2]
+                    
+                    # Ensure patch has the expected size by padding if necessary
+                    expected_height = grid_size
+                    expected_width = grid_size
+                    patch_height, patch_width = patch_img.shape[:2]
+                    
+                    if patch_height != expected_height or patch_width != expected_width:
+                        # Create a padded patch with the expected size
+                        padded_patch = np.zeros((expected_height, expected_width, 3), dtype=patch_img.dtype)
+                        # Copy the actual patch data to the top-left corner
+                        padded_patch[:patch_height, :patch_width] = patch_img
+                        patch_img = padded_patch
+                        print(f"Padded patch from {patch_height}x{patch_width} to {expected_height}x{expected_width}")
+                    
+                    # Store patch information
+                    patch_info = {
+                        'pixel_coordinates': [x1, y1, x2, y2],
+                        'grid_row': grid_row,
+                        'grid_col': grid_col,
+                        'anomaly_max': entry.get('anomaly_max', 0),
+                        'status': entry.get('status', 'FP')
+                    }
+                    
+                    self.images.append(patch_img)
+                    self.image_paths.append(image_path)  # Keep original path for reference
+                    self.object_classes.append(object_cls_dict["pcb"])
+                    self.anomaly_classes.append("good")  # Assume good for training
+                    self.patch_info_list.append(patch_info)
+                    
+                    # Create empty segmentation mask for the patch (same size as patch_img)
+                    patch_shape = patch_img.shape[:2]
+                    self.segs.append(np.zeros(patch_shape))
+                    
+                    print(f"Loaded patch from {image_path}: grid({grid_row},{grid_col}) -> pixels({x1},{y1},{x2},{y2}) -> size{patch_shape}")
+                    
+                else:
+                    # This is a full image entry (no grid coordinates)
+                    # Ensure full images are resized to a consistent size
+                    if img.shape[:2] != (self.image_size, self.image_size):
+                        # Resize the image to the expected size
+                        img_resized = cv2.resize(img, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
+                        print(f"Resized full image from {img.shape[:2]} to {img_resized.shape[:2]}")
+                        img = img_resized
+                    
+                    self.images.append(img)
+                    self.image_paths.append(image_path)
+                    self.object_classes.append(object_cls_dict["pcb"])
+                    self.anomaly_classes.append("good")
+                    self.patch_info_list.append(None)  # No patch info for full images
+                    
+                    # Create empty segmentation mask for normal images
+                    img_shape = img.shape[:2]  # Get height and width
+                    self.segs.append(np.zeros(img_shape))
+                    
+                    print(f"Loaded full image: {image_path} -> size{img_shape}")
                 
             except Exception as e:
                 print(f"Warning: Could not load image {image_path}: {e}")
@@ -557,6 +668,66 @@ class PCBDataset(Dataset):
                 print(f"  {img_path}: {len(patches)} patches")
         else:
             print(f"Warning: Fine-tuning JSON file not found: {fp_review_file}")
+
+    def _load_false_positive_patches_csv(self):
+        """Load false positive patches from CSV file.
+        
+        For CSV fine-tuning, we don't load specific patches since the CSV format
+        is the same as the standard split CSV (pcb-split.csv). Instead, we use
+        the full images and let the standard augmentation process handle cropping.
+        """
+        # For CSV fine-tuning, we don't load specific patches
+        # The CSV format is the same as pcb-split.csv, so we use full images
+        self.false_positive_patches = {}
+        print("DEBUG: CSV fine-tuning uses full images, no specific patches loaded")
+
+    def _select_fine_tuning_patch(self, img_path, index):
+        """
+        Select a patch for fine-tuning from the available false positive patches.
+        
+        Args:
+            img_path: Path to the original image
+            index: Index of the image in the dataset
+            
+        Returns:
+            tuple: (use_fp_patch, crop_x, crop_y, crop_w, crop_h, patch_info) or (False, None, None, None, None, None)
+        """
+        if not (self.fine_tuning_json or self.fine_tuning_csv) or not hasattr(self, 'image_paths'):
+            return False, None, None, None, None, None
+        
+        # For CSV fine-tuning, we don't have specific patches - use full images
+        if self.fine_tuning_csv:
+            print(f"DEBUG: CSV fine-tuning - using full image for {img_path}")
+            return False, None, None, None, None, None
+            
+        # For JSON fine-tuning, select from available patches
+        fp_patches = self.false_positive_patches.get(img_path, [])
+        if not fp_patches:
+            return False, None, None, None, None, None
+            
+        # Randomly select a false positive patch
+        patch = np.random.choice(fp_patches)
+        print(f"DEBUG: Selected patch {patch} for image {img_path}")
+        
+        # patch['pixel_coordinates'] = [x1, y1, x2, y2]
+        crop_x, crop_y, crop_x2, crop_y2 = patch['pixel_coordinates']
+        crop_x = int(crop_x)
+        crop_y = int(crop_y)
+        crop_w = int(crop_x2 - crop_x)
+        crop_h = int(crop_y2 - crop_y)
+        
+        print(f"DEBUG: Original patch coordinates: [{crop_x}, {crop_y}, {crop_x2}, {crop_y2}]")
+        
+        # Create patch info for later saving
+        patch_info = {
+            'pixel_coordinates': [crop_x, crop_y, crop_x2, crop_y2],
+            'anomaly_max': patch.get('anomaly_max', 0),
+            'status': patch.get('status', 'FP')
+        }
+        
+        print(f"DEBUG: Using original coordinates: [{crop_x}, {crop_y}, {crop_x2}, {crop_y2}] (patch size: {crop_x2-crop_x}x{crop_y2-crop_y})")
+        
+        return True, crop_x, crop_y, crop_w, crop_h, patch_info
 
     def _save_chosen_patch(self, original_img, patch_info, img_path, index):
         """
@@ -823,17 +994,67 @@ class PCBDataset(Dataset):
         seg = self.segs[index].astype(np.int32)
         anomaly_class = self.anomaly_classes[index]
 
-        # Save patch from original image BEFORE any augmentation
-        if self.fine_tuning_json and hasattr(self, '_current_patch_info') and self._current_patch_info is not None:
-            self._save_chosen_patch(img, self._current_patch_info, self.image_paths[index], index)
-            # Clear the current patch info after saving
-            self._current_patch_info = None
+        # Handle patch-specific data from JSON loading
+        patch_info = None
+        if hasattr(self, 'patch_info_list') and index < len(self.patch_info_list):
+            patch_info = self.patch_info_list[index]
+
+        # Fine-tuning patch selection (independent of augmentation)
+        fine_tuning_patch_info = None
+        if self.fine_tuning_json or self.fine_tuning_csv:
+            img_path = self.image_paths[index]
+            use_fp_patch, crop_x, crop_y, crop_w, crop_h, patch_info_ft = self._select_fine_tuning_patch(img_path, index)
+            if use_fp_patch:
+                # Extract the patch from the original image (JSON fine-tuning)
+                img = img[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+                seg = seg[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+                fine_tuning_patch_info = patch_info_ft
+                
+                # Save the chosen patch for verification
+                self._save_chosen_patch(self.images[index], patch_info_ft, img_path, index)
+            # For CSV fine-tuning, we use the full image and let standard augmentation handle cropping
 
         if self.augment:
-            augmented = self.aug(image=img, mask=seg, index=index)
-            img = augmented["image"]
-            seg = augmented["mask"]
-            transform_info = augmented["transform_info"]
+            # If we have patch info from JSON loading, we already have a specific patch
+            # and shouldn't apply additional cropping, just apply other augmentations
+            if patch_info is not None:
+                # Apply only non-cropping augmentations (brightness, contrast, rotation)
+                # but keep the original patch coordinates
+                # Create a simple augmentation that doesn't crop
+                img, brightness_factor, contrast_factor, bc_applied = random_brightness_contrast(
+                    img, brightness_limit=0.05, contrast_limit=0.05, p=0.5
+                )
+                
+                # Apply rotation without cropping
+                h, w = img.shape[:2]
+                center = (w // 2, h // 2)
+                rotation_angle = np.random.uniform(-5, 5)
+                rotation_matrix = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
+                img = cv2.warpAffine(img, rotation_matrix, (w, h),
+                                   flags=cv2.INTER_NEAREST,
+                                   borderMode=cv2.BORDER_REPLICATE)
+                seg = cv2.warpAffine(seg, rotation_matrix, (w, h),
+                                   flags=cv2.INTER_NEAREST,
+                                   borderMode=cv2.BORDER_REPLICATE)
+                
+                # Create transform info that preserves the original patch coordinates
+                transform_info = {
+                    'crop_coords': patch_info['pixel_coordinates'],
+                    'rotation_angle': rotation_angle,
+                    'brightness_factor': brightness_factor,
+                    'contrast_factor': contrast_factor,
+                    'brightness_contrast_applied': bc_applied,
+                    'original_shape': self.images[index].shape[:2],
+                    'patch_info': patch_info  # Include original patch info
+                }
+                
+                print(f"Using pre-defined patch from JSON: grid({patch_info['grid_row']},{patch_info['grid_col']}) -> pixels{patch_info['pixel_coordinates']}")
+            else:
+                # Standard augmentation with random cropping
+                augmented = self.aug(image=img, mask=seg, index=index)
+                img = augmented["image"]
+                seg = augmented["mask"]
+                transform_info = augmented["transform_info"]
 
             if self.track_crop:
                 os.makedirs("tmp", exist_ok=True)

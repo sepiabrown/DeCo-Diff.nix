@@ -21,6 +21,7 @@ from diffusers.models import AutoencoderKL
 from MVTECDataLoader import MVTECDataset
 from VISADataLoader import VISADataset
 from PCBDataLoader import PCBDataset
+from MixedFineTuningDataset import MixedFineTuningDataset
 from scipy.ndimage import gaussian_filter
 from transformers import get_cosine_schedule_with_warmup
 
@@ -294,25 +295,50 @@ def _main(args):
             center_crop=args.center_crop,
         )
     elif args.dataset == "pcb":
-        dataset = PCBDataset(
-            "train",
-            object_class=args.object_class,
-            rootdir=args.data_dir,
-            transform=transform,
-            image_size=args.image_size,
-            center_size=args.center_size,
-            augment=args.augmentation,
-            center_crop=args.center_crop,
-            num_datafile=args.num_datafile,
-            split_csv_path=args.split_csv_path,
-            split_json_path=args.split_json_path,  # Pass JSON split file path
-            track_crop=args.track_crop,  # Enable crop tracking
-            save_crop_visualizations=args.save_crop_visualizations,  # Save crop visualizations
-            crop_vis_dir=f"./crop_visualizations_{args.object_class}",  # Directory for crop visualizations
-            resume_dir=args.resume_dir,  # Pass resume directory for crop annotation persistence
-            resume_epoch=args.resume_epoch,  # Pass resume epoch for filtering crops
-            fine_tuning_json=args.fine_tuning_json,  # Pass fine-tuning JSON file for patch selection
-        )
+        # Check if we're in fine-tuning mode
+        if args.fine_tuning_csv and args.fine_tuning_mode == "mixed":
+            # Use mixed fine-tuning dataset
+            dataset = MixedFineTuningDataset(
+                "train",
+                object_class=args.object_class,
+                rootdir=args.data_dir,
+                transform=transform,
+                image_size=args.image_size,
+                center_size=args.center_size,
+                augment=args.augmentation,
+                center_crop=args.center_crop,
+                fine_tuning_csv=args.fine_tuning_csv,
+                existing_data_csv=args.existing_data_csv,
+                mixed_split_ratio=args.mixed_split_ratio,
+                track_crop=args.track_crop,
+                save_crop_visualizations=args.save_crop_visualizations,
+                crop_vis_dir=f"./crop_visualizations_{args.object_class}",
+                resume_dir=args.resume_dir,
+                resume_epoch=args.resume_epoch,
+                debug=args.debug,
+            )
+        else:
+            # Use standard PCB dataset
+            dataset = PCBDataset(
+                "train",
+                object_class=args.object_class,
+                rootdir=args.data_dir,
+                transform=transform,
+                image_size=args.image_size,
+                center_size=args.center_size,
+                augment=args.augmentation,
+                center_crop=args.center_crop,
+                num_datafile=args.num_datafile,
+                split_csv_path=args.split_csv_path,
+                split_json_path=args.split_json_path,  # Pass JSON split file path
+                track_crop=args.track_crop,  # Enable crop tracking
+                save_crop_visualizations=args.save_crop_visualizations,  # Save crop visualizations
+                crop_vis_dir=f"./crop_visualizations_{args.object_class}",  # Directory for crop visualizations
+                resume_dir=args.resume_dir,  # Pass resume directory for crop annotation persistence
+                resume_epoch=args.resume_epoch,  # Pass resume epoch for filtering crops
+                fine_tuning_json=args.fine_tuning_json,  # Pass fine-tuning JSON file for patch selection
+                fine_tuning_csv=args.fine_tuning_csv,  # Pass fine-tuning CSV file for patch selection
+            )
 
     batch_size = args.global_batch_size // dist.get_world_size()
     loader = DataLoader(
@@ -442,25 +468,49 @@ def _main(args):
                 
                 # Recreate dataset with new data files
                 if args.dataset == "pcb":
-                    dataset = PCBDataset(
-                        "train",
-                        object_class=args.object_class,
-                        rootdir=args.data_dir,
-                        transform=transform,
-                        image_size=args.image_size,
-                        center_size=args.center_size,
-                        augment=args.augmentation,
-                        center_crop=args.center_crop,
-                        num_datafile=args.num_datafile,
-                        split_csv_path=args.split_csv_path,
-                        split_json_path=args.split_json_path,  # Pass JSON split file path
-                        track_crop=args.track_crop,  # Enable crop tracking
-                        save_crop_visualizations=args.save_crop_visualizations,  # Save crop visualizations
-                        crop_vis_dir=f"./crop_visualizations_{args.object_class}",  # Directory for crop visualizations
-                        resume_dir=args.resume_dir,  # Pass resume directory
-                        resume_epoch=epoch,  # Pass resume epoch for filtering crops
-                        cumulative_crops=dataset.cumulative_crops
-                    )
+                    if args.fine_tuning_csv and args.fine_tuning_mode == "mixed":
+                        # Recreate mixed fine-tuning dataset
+                        dataset = MixedFineTuningDataset(
+                            "train",
+                            object_class=args.object_class,
+                            rootdir=args.data_dir,
+                            transform=transform,
+                            image_size=args.image_size,
+                            center_size=args.center_size,
+                            augment=args.augmentation,
+                            center_crop=args.center_crop,
+                            fine_tuning_csv=args.fine_tuning_csv,
+                            existing_data_csv=args.existing_data_csv,
+                            mixed_split_ratio=args.mixed_split_ratio,
+                            track_crop=args.track_crop,
+                            save_crop_visualizations=args.save_crop_visualizations,
+                            crop_vis_dir=f"./crop_visualizations_{args.object_class}",
+                            resume_dir=args.resume_dir,
+                            resume_epoch=epoch,
+                            cumulative_crops=dataset.cumulative_crops if hasattr(dataset, 'cumulative_crops') else None,
+                            debug=args.debug,
+                        )
+                    else:
+                        # Recreate standard PCB dataset
+                        dataset = PCBDataset(
+                            "train",
+                            object_class=args.object_class,
+                            rootdir=args.data_dir,
+                            transform=transform,
+                            image_size=args.image_size,
+                            center_size=args.center_size,
+                            augment=args.augmentation,
+                            center_crop=args.center_crop,
+                            num_datafile=args.num_datafile,
+                            split_csv_path=args.split_csv_path,
+                            split_json_path=args.split_json_path,  # Pass JSON split file path
+                            track_crop=args.track_crop,  # Enable crop tracking
+                            save_crop_visualizations=args.save_crop_visualizations,  # Save crop visualizations
+                            crop_vis_dir=f"./crop_visualizations_{args.object_class}",  # Directory for crop visualizations
+                            resume_dir=args.resume_dir,  # Pass resume directory
+                            resume_epoch=epoch,  # Pass resume epoch for filtering crops
+                            cumulative_crops=dataset.cumulative_crops if hasattr(dataset, 'cumulative_crops') else None
+                        )
                     
                     # Set the current epoch IMMEDIATELY after dataset recreation
                     dataset.current_epoch = epoch
@@ -479,6 +529,8 @@ def _main(args):
         if args.dataset == "pcb" and hasattr(dataset, 'track_crop') and dataset.track_crop:
             dataset.current_epoch = epoch
             #print(f"DEBUG: Setting dataset.current_epoch to {epoch}")
+        elif args.dataset == "pcb" and hasattr(dataset, 'current_epoch'):
+            dataset.current_epoch = epoch
             
         for batch_idx, batch in enumerate(loader):
             x, _, y, _, _, crop_info = batch
@@ -802,6 +854,37 @@ def main():
         default=None,
         help="Path to fp_review_list.json file for fine-tuning. The script will randomly select patches from the review list for training.",
     )
+    parser.add_argument(
+        "--fine-tuning-csv",
+        type=str,
+        default=None,
+        help="Path to CSV file for fine-tuning. The script will randomly select patches from the CSV list for training.",
+    )
+    parser.add_argument(
+        "--fine-tuning-mode",
+        type=str,
+        choices=["csv_only", "mixed"],
+        default="mixed",
+        help="Fine-tuning mode: 'csv_only' uses only CSV images, 'mixed' uses 50/50 split between CSV and existing images",
+    )
+    parser.add_argument(
+        "--existing-data-csv",
+        type=str,
+        default=None,
+        help="Path to CSV file containing existing large images for mixed fine-tuning mode",
+    )
+    parser.add_argument(
+        "--mixed-split-ratio",
+        type=float,
+        default=0.5,
+        help="Ratio of CSV images vs existing images in mixed mode (default: 0.5 for 50/50 split)",
+    )
+    parser.add_argument(
+        "--debug",
+        type=lambda v: True if v.lower() in ("yes", "true", "t", "y", "1") else False,
+        default=False,
+        help="Enable debug mode for saving crop patches to tmp directory and printing debug messages",
+    )
 
     args = parser.parse_args()
     print(f'args: {args}')
@@ -834,11 +917,11 @@ def main():
                               'global_seed', 'num_workers', 'log_every', 'ckpt_every', 
                               'local_rank', 'resume_epoch']:
                         value = int(value) if value is not None else None
-                    elif key in ['lr', 'mask_ratio', 'patch_shuffle_ratio']:
+                    elif key in ['lr', 'mask_ratio', 'patch_shuffle_ratio', 'mixed_split_ratio']:
                         value = float(value)
-                    elif key in ['center_crop', 'mask_random_ratio', 'from_scratch', 'augmentation', 'track_crop', 'save_crop_visualizations']:
+                    elif key in ['center_crop', 'mask_random_ratio', 'from_scratch', 'augmentation', 'track_crop', 'save_crop_visualizations', 'debug']:
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
-                    elif key in ['data_dir', 'resume_dir', 'split_csv_path', 'split_json_path', 'fine_tuning_json']:
+                    elif key in ['data_dir', 'resume_dir', 'split_csv_path', 'split_json_path', 'fine_tuning_json', 'fine_tuning_csv', 'existing_data_csv']:
                         if value:  # Only expand if not None/empty
                             value = os.path.expanduser(value)
                     elif key in ['global_batch_size']:

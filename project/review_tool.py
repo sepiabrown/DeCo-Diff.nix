@@ -163,12 +163,12 @@ class FPReviewTool:
             os.makedirs(fn_images_dir, exist_ok=True)
             os.makedirs(tn_images_dir, exist_ok=True)
         
-        # Track copied images for each type
-        copied_images = {
-            'FP': set(),
-            'TP': set(),
-            'FN': set(),
-            'TN': set()
+        # Track copied patches for each type
+        copied_patches = {
+            'FP': 0,
+            'TP': 0,
+            'FN': 0,
+            'TN': 0
         }
         
         # Create separate JSON files for each type
@@ -212,16 +212,76 @@ class FPReviewTool:
             "entries": []
         }
         
+        def extract_and_save_patch(image_path, grid_row, grid_col, output_dir, patch_type, anomaly_max):
+            """Extract patch from image and save it as a separate file"""
+            try:
+                if not os.path.exists(image_path):
+                    print(f"Warning: Image not found: {image_path}")
+                    return None
+                
+                # Load the image
+                from PIL import Image
+                import numpy as np
+                
+                img = np.array(Image.open(image_path).convert("RGB"))
+                
+                # Calculate patch coordinates
+                x1 = grid_col * self.grid_size
+                y1 = grid_row * self.grid_size
+                x2 = (grid_col + 1) * self.grid_size
+                y2 = (grid_row + 1) * self.grid_size
+                
+                # Ensure coordinates are within image bounds
+                img_height, img_width = img.shape[:2]
+                x1 = max(0, min(x1, img_width))
+                y1 = max(0, min(y1, img_height))
+                x2 = max(x1, min(x2, img_width))
+                y2 = max(y1, min(y2, img_height))
+                
+                # Extract the patch
+                patch_img = img[y1:y2, x1:x2]
+                
+                # Ensure patch has the expected size by padding if necessary
+                expected_height = self.grid_size
+                expected_width = self.grid_size
+                patch_height, patch_width = patch_img.shape[:2]
+                
+                if patch_height != expected_height or patch_width != expected_width:
+                    # Create a padded patch with the expected size
+                    padded_patch = np.zeros((expected_height, expected_width, 3), dtype=patch_img.dtype)
+                    # Copy the actual patch data to the top-left corner
+                    padded_patch[:patch_height, :patch_width] = patch_img
+                    patch_img = padded_patch
+                
+                # Create filename for the patch
+                img_basename = os.path.basename(image_path)
+                img_name = os.path.splitext(img_basename)[0]
+                patch_filename = f"{img_name}_grid_{grid_row}_{grid_col}_anomaly_{anomaly_max}_{patch_type}.png"
+                patch_path = os.path.join(output_dir, patch_filename)
+                
+                # Save the patch
+                Image.fromarray(patch_img).save(patch_path)
+                
+                return patch_path
+                
+            except Exception as e:
+                print(f"Warning: Could not extract patch from {image_path}: {e}")
+                return None
+        
         # Process FP entries
         for entry in self.fp_entries[:1000]:  # Only the first 1000 FP entries
-            # Copy image to FP directory
-            if copy_images_dir and entry['image_path'] not in copied_images['FP']:
-                try:
-                    if os.path.exists(entry['image_path']):
-                        shutil.copy2(entry['image_path'], fp_images_dir)
-                        copied_images['FP'].add(entry['image_path'])
-                except Exception as e:
-                    print(f"Warning: Could not copy {entry['image_path']}: {e}")
+            # Extract and save patch to FP directory
+            if copy_images_dir:
+                patch_path = extract_and_save_patch(
+                    entry['image_path'], 
+                    entry['grid_row'], 
+                    entry['grid_col'], 
+                    fp_images_dir, 
+                    'FP', 
+                    entry['anomaly_max']
+                )
+                if patch_path:
+                    copied_patches['FP'] += 1
             
             # Add entry to FP JSON
             review_entry = {
@@ -236,14 +296,18 @@ class FPReviewTool:
         
         # Process TP entries
         for entry in self.tp_entries:
-            # Copy image to TP directory
-            if copy_images_dir and entry['image_path'] not in copied_images['TP']:
-                try:
-                    if os.path.exists(entry['image_path']):
-                        shutil.copy2(entry['image_path'], tp_images_dir)
-                        copied_images['TP'].add(entry['image_path'])
-                except Exception as e:
-                    print(f"Warning: Could not copy {entry['image_path']}: {e}")
+            # Extract and save patch to TP directory
+            if copy_images_dir:
+                patch_path = extract_and_save_patch(
+                    entry['image_path'], 
+                    entry['grid_row'], 
+                    entry['grid_col'], 
+                    tp_images_dir, 
+                    'TP', 
+                    entry['anomaly_max']
+                )
+                if patch_path:
+                    copied_patches['TP'] += 1
             
             # Add entry to TP JSON
             review_entry = {
@@ -258,14 +322,18 @@ class FPReviewTool:
         
         # Process FN entries
         for entry in self.fn_entries:
-            # Copy image to FN directory
-            if copy_images_dir and entry['image_path'] not in copied_images['FN']:
-                try:
-                    if os.path.exists(entry['image_path']):
-                        shutil.copy2(entry['image_path'], fn_images_dir)
-                        copied_images['FN'].add(entry['image_path'])
-                except Exception as e:
-                    print(f"Warning: Could not copy {entry['image_path']}: {e}")
+            # Extract and save patch to FN directory
+            if copy_images_dir:
+                patch_path = extract_and_save_patch(
+                    entry['image_path'], 
+                    entry['grid_row'], 
+                    entry['grid_col'], 
+                    fn_images_dir, 
+                    'FN', 
+                    entry['anomaly_max']
+                )
+                if patch_path:
+                    copied_patches['FN'] += 1
             
             # Add entry to FN JSON
             review_entry = {
@@ -280,14 +348,18 @@ class FPReviewTool:
         
         # Process TN entries
         for entry in self.tn_entries:
-            # Copy image to TN directory
-            if copy_images_dir and entry['image_path'] not in copied_images['TN']:
-                try:
-                    if os.path.exists(entry['image_path']):
-                        shutil.copy2(entry['image_path'], tn_images_dir)
-                        copied_images['TN'].add(entry['image_path'])
-                except Exception as e:
-                    print(f"Warning: Could not copy {entry['image_path']}: {e}")
+            # Extract and save patch to TN directory
+            if copy_images_dir:
+                patch_path = extract_and_save_patch(
+                    entry['image_path'], 
+                    entry['grid_row'], 
+                    entry['grid_col'], 
+                    tn_images_dir, 
+                    'TN', 
+                    entry['anomaly_max']
+                )
+                if patch_path:
+                    copied_patches['TN'] += 1
             
             # Add entry to TN JSON
             review_entry = {
@@ -316,11 +388,11 @@ class FPReviewTool:
             json.dump(tn_review_data, f, indent=2)
         
         if copy_images_dir:
-            print(f"Created organized structure:")
-            print(f"  FP: {len(copied_images['FP'])} images -> {fp_dir}/images/")
-            print(f"  TP: {len(copied_images['TP'])} images -> {tp_dir}/images/")
-            print(f"  FN: {len(copied_images['FN'])} images -> {fn_dir}/images/")
-            print(f"  TN: {len(copied_images['TN'])} images -> {tn_dir}/images/")
+            print(f"Created organized structure with individual patches:")
+            print(f"  FP: {copied_patches['FP']} patches -> {fp_dir}/images/")
+            print(f"  TP: {copied_patches['TP']} patches -> {tp_dir}/images/")
+            print(f"  FN: {copied_patches['FN']} patches -> {fn_dir}/images/")
+            print(f"  TN: {copied_patches['TN']} patches -> {tn_dir}/images/")
             print(f"  JSON files created in respective directories")
         
         print(f"Review JSON files created:")

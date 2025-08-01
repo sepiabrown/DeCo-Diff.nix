@@ -1,0 +1,704 @@
+import torch
+import pandas as pd
+import numpy as np
+from torch.utils.data import Dataset
+from PIL import Image
+import os
+import cv2
+import albumentations as A
+from PCBDataLoader import PCBDataset, random_brightness_contrast, path_to_safe_filename
+import json
+from collections import defaultdict
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+class MixedFineTuningDataset(Dataset):
+    """
+    Dataset for mixed fine-tuning that combines:
+    1. Small images from CSV (no augmentation)
+    2. Existing large images with augmentation
+    """
+    
+    def __init__(
+        self,
+        mode: str,
+        object_class: str,
+        rootdir="./pcb-dataset/",
+        transform=None,
+        anomaly_class="good",
+        image_size=288,
+        center_size=256,
+        augment=False,
+        center_crop=False,
+        fine_tuning_csv: str = None,
+        existing_data_csv: str = None,
+        mixed_split_ratio: float = 0.5,
+        track_crop: bool = False,
+        save_crop_visualizations: bool = False,
+        crop_vis_dir: str = "./crop_visualizations",
+        resume_dir: str = None,
+        resume_epoch: int = None,
+        cumulative_crops: dict = None,
+        debug: bool = False,
+    ):
+        """
+        Args:
+            fine_tuning_csv: Path to CSV with small images (no augmentation)
+            existing_data_csv: Path to CSV with existing large images (with augmentation)
+            mixed_split_ratio: Ratio of CSV images vs existing images (default: 0.5)
+        """
+        self.mode = mode
+        self.center_size = center_size
+        self.augment = augment
+        self.center_crop = center_crop
+        self.track_crop = track_crop
+        self.save_crop_visualizations = save_crop_visualizations
+        self.crop_vis_dir = crop_vis_dir
+        self.resume_dir = resume_dir
+        self.resume_epoch = resume_epoch
+        self.current_epoch = 0
+        self.mixed_split_ratio = mixed_split_ratio
+        self.debug = debug
+        
+        # Create crop visualization directory if needed
+        if self.save_crop_visualizations:
+            os.makedirs(self.crop_vis_dir, exist_ok=True)
+            
+        # Dictionary to store cumulative crop information per original image
+        if cumulative_crops is not None:
+            self.cumulative_crops = cumulative_crops
+        else:
+            self.cumulative_crops = defaultdict(list)
+            # Only load from JSON if not provided
+            if self.resume_dir and self.track_crop:
+                self.load_crop_annotations(resume_epoch)
+        
+        self.transform = transform
+        self.object_class = object_class
+        self.image_size = image_size
+        
+        # Load both datasets
+        self.csv_images = []  # Small images from CSV (no augmentation)
+        self.existing_images = []  # Large images from existing data (with augmentation)
+        
+        # Load CSV images (small images, no augmentation)
+        if fine_tuning_csv and os.path.exists(fine_tuning_csv):
+            self._load_csv_images(fine_tuning_csv, rootdir)
+            print(f"Loaded {len(self.csv_images)} CSV images for fine-tuning")
+        else:
+            print(f"Warning: Fine-tuning CSV file not found: {fine_tuning_csv}")
+            
+        # Load existing images (large images, with augmentation)
+        if existing_data_csv and os.path.exists(existing_data_csv):
+            self._load_existing_images(existing_data_csv, rootdir)
+            print(f"Loaded {len(self.existing_images)} existing images for fine-tuning")
+        else:
+            print(f"Warning: Existing data CSV file not found: {existing_data_csv}")
+            
+        # Set up augmentations for existing images
+        self._setup_augmentations()
+        
+        # Calculate total dataset size
+        self.total_size = len(self.csv_images) + len(self.existing_images)
+        print(f"Total dataset size: {self.total_size} (CSV: {len(self.csv_images)}, Existing: {len(self.existing_images)})")
+        
+        if self.total_size == 0:
+            raise Exception("No images loaded from either CSV file")
+
+    def _load_csv_images(self, csv_path, rootdir):
+        """Load small images from CSV file (no augmentation)"""
+        df = pd.read_csv(csv_path)
+        
+        # Filter for train split and good category
+        if 'split' in df.columns:
+            df = df.query(f'split=="train"')
+        
+        if 'category' in df.columns:
+            df = df.query('category=="good"')
+            
+        if len(df) == 0:
+            print("Warning: No data found in CSV file after filtering")
+            return
+            
+        object_cls_dict = {"pcb": 0}
+        
+        for i, row in df.iterrows():
+            image_path = row.get('image')
+            if not image_path:
+                continue
+                
+            if os.path.exists(image_path):
+                img = np.array(Image.open(image_path).convert("RGB")).astype(np.uint8)
+                
+                # Debug: Check actual image size
+                if img.shape[:2] != (self.image_size, self.image_size):
+                    print(f"ERROR: CSV image size mismatch! Expected {self.image_size}x{self.image_size}, got {img.shape[:2]} for {image_path}")
+                    print(f"  - Aborting training due to CSV image size mismatch")
+                    import sys
+                    sys.exit(1)
+                
+                self.csv_images.append({
+                    'image': img,
+                    'path': image_path,
+                    'object_class': object_cls_dict["pcb"],
+                    'anomaly_class': "good",
+                    'seg': np.zeros((self.image_size, self.image_size)),
+                    'is_csv': True  # Flag to identify CSV images
+                })
+            else:
+                print(f"Warning: Image not found: {image_path}")
+
+    def _load_existing_images(self, csv_path, rootdir):
+        """Load existing large images from CSV file (with augmentation)"""
+        df = pd.read_csv(csv_path)
+        
+        # Filter for train split and good category
+        if 'split' in df.columns:
+            df = df.query(f'split=="train"')
+        
+        if 'category' in df.columns:
+            df = df.query('category=="good"')
+            
+        if len(df) == 0:
+            print("Warning: No data found in existing CSV file after filtering")
+            return
+            
+        object_cls_dict = {"pcb": 0}
+        
+        for i, row in df.iterrows():
+            image_path = row.get('image')
+            if not image_path:
+                continue
+                
+            if os.path.exists(image_path):
+                img = np.array(Image.open(image_path).convert("RGB")).astype(np.uint8)
+                
+
+                
+                # For existing images, we keep them large for augmentation
+                self.existing_images.append({
+                    'image': img,
+                    'path': image_path,
+                    'object_class': object_cls_dict["pcb"],
+                    'anomaly_class': "good",
+                    'seg': np.zeros(img.shape[:2]),  # Empty mask
+                    'is_csv': False  # Flag to identify existing images
+                })
+            else:
+                print(f"Warning: Image not found: {image_path}")
+
+    def _setup_augmentations(self):
+        """Set up augmentation functions for existing images"""
+        if self.track_crop:
+            # Define tracking functions for existing images
+            def rotate_and_crop_func(img, **kwargs):
+                # Apply brightness/contrast first
+                img, brightness_factor, contrast_factor, bc_applied = random_brightness_contrast(
+                    img, brightness_limit=0.05, contrast_limit=0.05, p=0.5
+                )
+                h, w = img.shape[:2]
+                center = (w // 2, h // 2)
+                rotation_angle = np.random.uniform(-5, 5)
+                rotation_matrix = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
+                inverse_matrix = cv2.getRotationMatrix2D(center, -rotation_angle, 1.0)
+                rotated = cv2.warpAffine(img, rotation_matrix, (w, h),
+                                       flags=cv2.INTER_NEAREST,
+                                       borderMode=cv2.BORDER_REPLICATE)
+                crop_h = min(self.image_size, h)
+                crop_w = min(self.image_size, w)
+                max_h = h - crop_h
+                max_w = w - crop_w
+                
+                # Random crop for existing images
+                crop_y = np.random.randint(0, max_h + 1) if max_h > 0 else 0
+                crop_x = np.random.randint(0, max_w + 1) if max_w > 0 else 0
+                
+                cropped_rotated = rotated[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+                
+                crop_corners_rot = np.array([
+                    [crop_x, crop_y],
+                    [crop_x + crop_w, crop_y],
+                    [crop_x + crop_w, crop_y + crop_h],
+                    [crop_x, crop_y + crop_h]
+                ], dtype=np.float32)
+                crop_corners_orig = cv2.transform(crop_corners_rot.reshape(-1, 1, 2), inverse_matrix).reshape(-1, 2)
+                crop_corners_orig_flat = [float(x) for x in np.array(crop_corners_orig).flatten()]
+                return (cropped_rotated, 
+                       {
+                           'crop_coords': crop_corners_orig_flat,  # Use the rotated polygon coordinates for tracking
+                           'rotation_angle': rotation_angle,
+                           'brightness_factor': brightness_factor,
+                           'contrast_factor': contrast_factor,
+                           'brightness_contrast_applied': bc_applied,
+                           'original_shape': img.shape[:2],
+                           'is_csv_image': False,
+                           'augmentation_applied': True
+                       })
+            
+            # Create wrapper function for existing images
+            def transform_with_tracking(image, mask, index=None):
+                cropped_img, transform_info = rotate_and_crop_func(image, index=index)
+                # Apply the same transformations to mask
+                mask, _ = rotate_and_crop_func(mask, index=index)
+                # Add missing keys to ensure consistency
+                transform_info['epoch'] = self.current_epoch
+                return {'image': cropped_img, 'mask': mask, 'transform_info': transform_info}
+            
+            self.aug = transform_with_tracking
+        else:
+            # No crop tracking - use standard augmentations with size enforcement
+            def transform_without_tracking(image, mask, index=None):
+                # Apply brightness/contrast first
+                img, brightness_factor, contrast_factor, bc_applied = random_brightness_contrast(
+                    image, brightness_limit=0.05, contrast_limit=0.05, p=0.5
+                )
+                
+                # Apply rotation
+                h, w = img.shape[:2]
+                center = (w // 2, h // 2)
+                rotation_angle = np.random.uniform(-5, 5)
+                rotation_matrix = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
+                rotated = cv2.warpAffine(img, rotation_matrix, (w, h),
+                                       flags=cv2.INTER_NEAREST,
+                                       borderMode=cv2.BORDER_REPLICATE)
+                rotated_mask = cv2.warpAffine(mask, rotation_matrix, (w, h),
+                                            flags=cv2.INTER_NEAREST,
+                                            borderMode=cv2.BORDER_REPLICATE)
+                
+                # Random crop to exact size
+                crop_h = min(self.image_size, h)
+                crop_w = min(self.image_size, w)
+                max_h = h - crop_h
+                max_w = w - crop_w
+                
+                # Random crop for existing images
+                crop_y = np.random.randint(0, max_h + 1) if max_h > 0 else 0
+                crop_x = np.random.randint(0, max_w + 1) if max_w > 0 else 0
+                
+                cropped_img = rotated[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+                cropped_mask = rotated_mask[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+                
+                # Ensure exact size (in case the crop is smaller than target)
+                #if cropped_img.shape[:2] != (self.image_size, self.image_size):
+                #    cropped_img = cv2.resize(cropped_img, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
+                #    cropped_mask = cv2.resize(cropped_mask, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
+                
+                # Convert rectangle to 8-value format for consistency
+                x1, y1, x2, y2 = crop_x, crop_y, crop_x + crop_w, crop_y + crop_h
+                transform_info = {
+                    'crop_coords': [x1, y1, x2, y1, x2, y2, x1, y2],  # 8 values for consistency
+                    'rotation_angle': rotation_angle,
+                    'brightness_factor': brightness_factor,
+                    'contrast_factor': contrast_factor,
+                    'brightness_contrast_applied': bc_applied,
+                    'original_shape': image.shape[:2],
+                    'is_csv_image': False,
+                    'augmentation_applied': True
+                }
+                
+                return {'image': cropped_img, 'mask': cropped_mask, 'transform_info': transform_info}
+            
+            self.aug = transform_without_tracking
+
+    def load_crop_annotations(self, resume_epoch):
+        """Load existing crop annotations from JSON file"""
+        if not self.resume_dir:
+            return
+            
+        crop_annotations_file = os.path.join(self.resume_dir, "crop_annotations.json")
+        if os.path.exists(crop_annotations_file):
+            try:
+                with open(crop_annotations_file, 'r') as f:
+                    loaded_crops = json.load(f)
+                
+                # Clear existing crops and initialize new storage
+                self.cumulative_crops.clear()
+                
+                # Track statistics for debug output
+                kept_crops = 0
+                removed_crops = 0
+                epochs_seen = set()
+                
+                # Process each image's crops
+                for image_path, crops in loaded_crops.items():
+                    self.cumulative_crops[image_path] = []
+                    for crop in crops:
+                        crop_epoch = crop.get("epoch", 0)
+                        epochs_seen.add(crop_epoch)
+                        # Keep crops up to and including resume_epoch
+                        if self.resume_epoch is None or crop_epoch <= self.resume_epoch:
+                            self.cumulative_crops[image_path].append(crop)
+                            kept_crops += 1
+                        else:
+                            removed_crops += 1
+                
+                if self.resume_epoch is not None:
+                    print(f"DEBUG: Loading crops for resume at epoch {self.resume_epoch}:")
+                    print(f"  - Epochs seen in file: {sorted(list(epochs_seen))}")
+                    print(f"  - Kept {kept_crops} crops from epochs up to {self.resume_epoch}")
+                    print(f"  - Removed {removed_crops} crops from epochs after {self.resume_epoch}")
+                else:
+                    print(f"DEBUG: Loaded all {kept_crops} crops (no resume epoch specified)")
+                    
+            except Exception as e:
+                print(f"Warning: Could not load crop annotations: {e}")
+                self.cumulative_crops.clear()
+        else:
+            print("No existing crop annotations found.")
+
+    def save_crop_annotations(self):
+        """Save crop annotations to JSON file"""
+        if not self.resume_dir or not self.track_crop:
+            return
+        crop_annotations_file = os.path.join(self.resume_dir, "crop_annotations.json")
+        try:
+            # Save to file
+            with open(crop_annotations_file, 'w') as f:
+                json.dump(self.cumulative_crops, f, indent=2)
+                
+        except Exception as e:
+            print(f"Error saving crop annotations: {e}")
+
+    def add_crop_to_cumulative_map(self, original_image_path, crop_info, current_epoch=None):
+        """Add crop information to the cumulative map"""
+        if crop_info is None or 'crop_coords' not in crop_info:
+            return
+            
+        # Add epoch information to crop_info
+        if current_epoch is not None:
+            crop_info['epoch'] = current_epoch
+        
+        # Initialize list for this image if not exists
+        if original_image_path not in self.cumulative_crops:
+            self.cumulative_crops[original_image_path] = []
+        
+        self.cumulative_crops[original_image_path].append(crop_info)
+        
+        # Update visualization
+        if self.save_crop_visualizations:
+            self.save_crop_annotations()
+            # Create the cumulative crop visualization
+            self.create_cumulative_crop_visualization(original_image_path)
+            
+            # Save individual crop patches to tmp directory for testing (only in debug mode)
+            if self.debug:
+                self.save_crop_patch_to_tmp(original_image_path, crop_info)
+
+    def __len__(self):
+        return self.total_size
+
+    def __getitem__(self, index):
+        # Simple alternating logic based on mixed_split_ratio
+        csv_count = len(self.csv_images)
+        existing_count = len(self.existing_images)
+        
+        # Ensure mixed_split_ratio is a float
+        if not isinstance(self.mixed_split_ratio, (int, float)):
+            self.mixed_split_ratio = float(self.mixed_split_ratio)
+        
+        # Calculate how many CSV images to use before switching to existing images
+        # For ratio 0.5: use 1 CSV, then 1 existing, repeat
+        # For ratio 0.7: use 7 CSV, then 3 existing, repeat
+        csv_per_cycle = int(10 * self.mixed_split_ratio)  # Convert to integers (e.g., 0.5 -> 5, 0.7 -> 7)
+        existing_per_cycle = 10 - csv_per_cycle  # Remaining images in cycle
+        
+        # Calculate which cycle we're in and position within cycle
+        cycle = index // 10
+        position_in_cycle = index % 10
+        
+        if position_in_cycle < csv_per_cycle and csv_count > 0:
+            # Use CSV image (small, no augmentation)
+            # Ensure all CSV images are used by cycling through them properly
+            csv_index = (cycle * csv_per_cycle + position_in_cycle) % csv_count
+            if self.debug:
+                print(f"DEBUG: Using CSV image {csv_index} (cycle {cycle}, position {position_in_cycle})")
+            data = self.csv_images[csv_index]
+            img = data['image'].astype(np.uint8)
+            seg = data['seg'].astype(np.int32)
+            anomaly_class = data['anomaly_class']
+            img_path = data['path']
+            
+            # No augmentation for CSV images
+            # Convert rectangle to 8-value format for consistency
+            x1, y1, x2, y2 = 0, 0, img.shape[1], img.shape[0]
+            transform_info = {
+                'crop_coords': [x1, y1, x2, y1, x2, y2, x1, y2],  # 8 values for consistency
+                'rotation_angle': 0,
+                'brightness_factor': 0,
+                'contrast_factor': 0,
+                'brightness_contrast_applied': False,
+                'original_shape': img.shape[:2],
+                'is_csv_image': True,
+                'epoch': self.current_epoch,  # Always include epoch
+                'augmentation_applied': False  # Ensure consistent keys
+            }
+            
+        else:
+            
+            # Use existing image (large, with augmentation)
+            if existing_count > 0:
+                existing_index = (cycle * existing_per_cycle + (position_in_cycle - csv_per_cycle)) % existing_count
+                if self.debug:
+                    print(f"DEBUG: Using existing image {existing_index} (cycle {cycle}, position {position_in_cycle})")
+                data = self.existing_images[existing_index]
+                img = data['image'].astype(np.uint8)
+                seg = data['seg'].astype(np.int32)
+                anomaly_class = data['anomaly_class']
+                img_path = data['path']
+                
+                # Apply augmentation for existing images
+                if self.augment:
+                    augmented = self.aug(image=img, mask=seg, index=index)
+                    img = augmented["image"]
+                    seg = augmented["mask"]
+                    transform_info = augmented["transform_info"]
+                    transform_info['is_csv_image'] = False
+
+                else:
+                    # Center crop if no augmentation
+                    h, w = img.shape[:2]
+                    crop_h = min(self.image_size, h)
+                    crop_w = min(self.image_size, w)
+                    crop_y = (h - crop_h) // 2
+                    crop_x = (w - crop_w) // 2
+                    img = img[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+                    seg = seg[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+                    # Convert rectangle to 8-value format for consistency
+                    x1, y1, x2, y2 = crop_x, crop_y, crop_x + crop_w, crop_y + crop_h
+                    transform_info = {
+                        'crop_coords': [x1, y1, x2, y1, x2, y2, x1, y2],  # 8 values for consistency
+                        'rotation_angle': 0,
+                        'brightness_factor': 0,
+                        'contrast_factor': 0,
+                        'brightness_contrast_applied': False,
+                        'original_shape': data['image'].shape[:2],
+                        'is_csv_image': False,
+                        'epoch': self.current_epoch,  # Always include epoch
+                        'augmentation_applied': False
+                    }
+            else:
+                # Fallback if no existing images
+                csv_index = index % csv_count if csv_count > 0 else 0
+                data = self.csv_images[csv_index]
+                img = data['image'].astype(np.uint8)
+                seg = data['seg'].astype(np.int32)
+                anomaly_class = data['anomaly_class']
+                img_path = data['path']
+                
+                # Convert rectangle to 8-value format for consistency
+                x1, y1, x2, y2 = 0, 0, img.shape[1], img.shape[0]
+                transform_info = {
+                    'crop_coords': [x1, y1, x2, y1, x2, y2, x1, y2],  # 8 values for consistency
+                    'rotation_angle': 0,
+                    'brightness_factor': 0,
+                    'contrast_factor': 0,
+                    'brightness_contrast_applied': False,
+                    'original_shape': img.shape[:2],
+                    'is_csv_image': True,
+                    'epoch': self.current_epoch,
+                    'augmentation_applied': False
+                }
+
+
+        # Save crop annotations if tracking (only for existing images, not CSV images)
+        if self.save_crop_visualizations and self.track_crop and not transform_info.get('is_csv_image', False):
+            self.add_crop_to_cumulative_map(img_path, transform_info, self.current_epoch)
+
+        # Debug: Check image sizes
+        if img.shape[:2] != (self.image_size, self.image_size):
+            print(f"ERROR: Image size mismatch! Expected {self.image_size}x{self.image_size}, got {img.shape[:2]}")
+            print(f"  - Image path: {img_path}")
+            print(f"  - Is CSV image: {transform_info.get('is_csv_image', 'unknown')}")
+            print(f"  - Aborting training due to image size mismatch")
+            import sys
+            sys.exit(1)
+        
+        # Convert to tensor format
+        img = img.astype(np.float32) / 255.0
+        y = data['object_class']
+        
+        if self.transform:
+            img = self.transform(img)
+        else:
+            img = torch.from_numpy(img.transpose((-1, 0, 1)))
+            img = (img - 0.5) / 0.5
+        
+
+        
+        return (
+            img,
+            seg.astype(np.float32),
+            int(y),
+            img_path,
+            anomaly_class,
+            transform_info,
+        )
+
+    def create_cumulative_crop_visualization(self, original_image_path, save_path=None):
+        """
+        Create a cumulative visualization showing all crops for a specific original image
+        
+        Args:
+            original_image_path: Path to the original image
+            save_path: Optional path to save the visualization
+        """
+        # Check if we have crops for this image
+        if original_image_path not in self.cumulative_crops:
+            return None
+            
+        all_crops = self.cumulative_crops[original_image_path]
+        if not all_crops:
+            return None
+            
+        # Load the original image
+        if not os.path.exists(original_image_path):
+            print(f"Warning: Original image not found: {original_image_path}")
+            return None
+            
+        original_image = np.array(Image.open(original_image_path).convert("RGB"))
+        original_image_basename = os.path.basename(original_image_path)
+        original_filename = path_to_safe_filename(original_image_path)
+        
+        # Create figure and axis
+        fig, ax = plt.subplots(1, 1, figsize=(15, 10))
+        
+        # Display the original image
+        ax.imshow(original_image)
+        
+        # Draw rectangles/polygons for all crops
+        for i, crop_info in enumerate(all_crops):
+            corners = crop_info['crop_coords']  # Could be 4 values [x1, y1, x2, y2] or 8 values [x1, y1, x2, y2, x3, y3, x4, y4]
+            
+            # Color scheme: green for latest, red for all others
+            if i == len(all_crops) - 1:  # Latest crop
+                color = 'green'
+                linewidth = 3  # Make latest crop more prominent
+            else:  # Previous crops
+                color = 'red'
+                linewidth = 2
+            
+            # Check if we have 4 values (rectangle) or 8 values (rotated polygon)
+            if len(corners) == 4:
+                # Create rectangle from the 4 corner points
+                # Format: [x1, y1, x2, y2] -> width = x2-x1, height = y2-y1
+                x1, y1, x2, y2 = corners
+                width = x2 - x1
+                height = y2 - y1
+                
+                # Create rectangle patch
+                rect = patches.Rectangle((x1, y1), width, height, 
+                                       linewidth=linewidth, edgecolor=color, facecolor='none')
+                ax.add_patch(rect)
+            elif len(corners) == 8:
+                # Create polygon from the 8 corner points (rotated crop)
+                # Format: [x1, y1, x2, y2, x3, y3, x4, y4] -> polygon with 4 vertices
+                polygon_points = [(corners[j], corners[j+1]) for j in range(0, 8, 2)]
+                polygon = patches.Polygon(polygon_points, 
+                                        linewidth=linewidth, edgecolor=color, facecolor='none')
+                ax.add_patch(polygon)
+            else:
+                print(f"Warning: Unexpected crop_coords format with {len(corners)} values: {corners}")
+        
+        # Set title with all the information including epoch info
+        title_text = f'Cumulative Crop Map - {original_image_basename}\nTotal Crops: {len(all_crops)} | Green: Latest | Red: Previous'
+        ax.set_title(title_text, fontsize=14, weight='bold', pad=20)
+        ax.axis('off')
+        
+        # Save the visualization with original filename
+        if save_path is None:
+            save_path = os.path.join(self.crop_vis_dir, f"{original_filename}.png")
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        return save_path
+
+    def save_crop_patch_to_tmp(self, original_image_path, crop_info):
+        """
+        TEMPORARY: Save individual crop patches to tmp directory for testing
+        """
+        try:
+            # Create tmp directory if it doesn't exist
+            tmp_dir = "./tmp"
+            os.makedirs(tmp_dir, exist_ok=True)
+            
+            # Load the original image
+            if not os.path.exists(original_image_path):
+                print(f"Warning: Original image not found for tmp save: {original_image_path}")
+                return
+                
+            original_image = np.array(Image.open(original_image_path).convert("RGB"))
+            
+            # Extract crop coordinates
+            crop_coords = crop_info['crop_coords']  # Could be 4 values [x1, y1, x2, y2] or 8 values [x1, y1, x2, y2, x3, y3, x4, y4]
+            
+            # Handle different coordinate formats
+            if len(crop_coords) == 4:
+                # Rectangle format: [x1, y1, x2, y2]
+                x1, y1, x2, y2 = crop_coords
+                # Extract the crop patch
+                crop_patch = original_image[y1:y2, x1:x2]
+            elif len(crop_coords) == 8:
+                # Rotated polygon format: [x1, y1, x2, y2, x3, y3, x4, y4]
+                # Extract the exact rotated patch using perspective transformation
+                import cv2
+                
+                # Convert coordinates to numpy array for cv2
+                src_points = np.array([
+                    [crop_coords[0], crop_coords[1]],  # x1, y1
+                    [crop_coords[2], crop_coords[3]],  # x2, y2
+                    [crop_coords[4], crop_coords[5]],  # x3, y3
+                    [crop_coords[6], crop_coords[7]]   # x4, y4
+                ], dtype=np.float32)
+                
+                # Calculate the dimensions of the rotated crop
+                # Use the width and height of the original crop before rotation
+                # We'll use the distance between opposite corners to estimate the crop size
+                width = int(np.sqrt((crop_coords[2] - crop_coords[0])**2 + (crop_coords[3] - crop_coords[1])**2))
+                height = int(np.sqrt((crop_coords[4] - crop_coords[2])**2 + (crop_coords[5] - crop_coords[3])**2))
+                
+                # Ensure minimum dimensions
+                width = max(width, 1)
+                height = max(height, 1)
+                
+                # Define destination points for a straight rectangle
+                dst_points = np.array([
+                    [0, 0],
+                    [width, 0],
+                    [width, height],
+                    [0, height]
+                ], dtype=np.float32)
+                
+                # Calculate perspective transform matrix
+                transform_matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+                
+                # Apply perspective transform to extract the exact rotated patch
+                crop_patch = cv2.warpPerspective(original_image, transform_matrix, (width, height))
+            else:
+                print(f"Warning: Unexpected crop_coords format with {len(crop_coords)} values: {crop_coords}")
+                return
+            
+            # Create filename with epoch and crop info
+            original_basename = os.path.basename(original_image_path)
+            epoch = crop_info.get('epoch', 'unknown')
+            is_csv = crop_info.get('is_csv_image', False)
+            
+            # Create descriptive filename
+            filename = f"epoch_{epoch}_csv_{is_csv}_{original_basename}_{crop_coords}"
+            safe_filename = path_to_safe_filename(filename)
+            
+            # Save the crop patch
+            save_path = os.path.join(tmp_dir, f"{safe_filename}.png")
+            Image.fromarray(crop_patch).save(save_path)
+            
+            # Only print debug messages if debug mode is enabled
+            if self.debug:
+                print(f"DEBUG: Saved crop patch to {save_path}")
+                print(f"  - Original: {original_image_path}")
+                print(f"  - Crop coords: {crop_coords}")
+                print(f"  - Is CSV image: {is_csv}")
+                print(f"  - Epoch: {epoch}")
+            
+        except Exception as e:
+            print(f"Error saving crop patch to tmp: {e}") 
