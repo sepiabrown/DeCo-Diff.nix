@@ -20,7 +20,6 @@ from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 from MVTECDataLoader import MVTECDataset
 from VISADataLoader import VISADataset
-from PCBDataLoader import PCBDataset
 from MixedFineTuningDataset import MixedFineTuningDataset
 from scipy.ndimage import gaussian_filter
 from transformers import get_cosine_schedule_with_warmup
@@ -308,7 +307,6 @@ def _main(args):
                 augment=args.augmentation,
                 center_crop=args.center_crop,
                 fine_tuning_csv=args.fine_tuning_csv,
-                existing_data_csv=args.existing_data_csv,
                 mixed_split_ratio=args.mixed_split_ratio,
                 track_crop=args.track_crop,
                 save_crop_visualizations=args.save_crop_visualizations,
@@ -319,7 +317,7 @@ def _main(args):
             )
         else:
             # Use standard PCB dataset
-            dataset = PCBDataset(
+            dataset = MixedFineTuningDataset(
                 "train",
                 object_class=args.object_class,
                 rootdir=args.data_dir,
@@ -480,7 +478,6 @@ def _main(args):
                             augment=args.augmentation,
                             center_crop=args.center_crop,
                             fine_tuning_csv=args.fine_tuning_csv,
-                            existing_data_csv=args.existing_data_csv,
                             mixed_split_ratio=args.mixed_split_ratio,
                             track_crop=args.track_crop,
                             save_crop_visualizations=args.save_crop_visualizations,
@@ -492,7 +489,7 @@ def _main(args):
                         )
                     else:
                         # Recreate standard PCB dataset
-                        dataset = PCBDataset(
+                        dataset = MixedFineTuningDataset(
                             "train",
                             object_class=args.object_class,
                             rootdir=args.data_dir,
@@ -861,23 +858,17 @@ def main():
         help="Path to CSV file for fine-tuning. The script will randomly select patches from the CSV list for training.",
     )
     parser.add_argument(
+        "--mixed-split-ratio",
+        type=float,
+        default=0.5,
+        help="Ratio of CSV images vs existing images in mixed mode (default: 0.5 for 50/50 split)",
+    )
+    parser.add_argument(
         "--fine-tuning-mode",
         type=str,
         choices=["csv_only", "mixed"],
         default="mixed",
         help="Fine-tuning mode: 'csv_only' uses only CSV images, 'mixed' uses 50/50 split between CSV and existing images",
-    )
-    parser.add_argument(
-        "--existing-data-csv",
-        type=str,
-        default=None,
-        help="Path to CSV file containing existing large images for mixed fine-tuning mode",
-    )
-    parser.add_argument(
-        "--mixed-split-ratio",
-        type=float,
-        default=0.5,
-        help="Ratio of CSV images vs existing images in mixed mode (default: 0.5 for 50/50 split)",
     )
     parser.add_argument(
         "--debug",
@@ -921,7 +912,7 @@ def main():
                         value = float(value)
                     elif key in ['center_crop', 'mask_random_ratio', 'from_scratch', 'augmentation', 'track_crop', 'save_crop_visualizations', 'debug']:
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
-                    elif key in ['data_dir', 'resume_dir', 'split_csv_path', 'split_json_path', 'fine_tuning_json', 'fine_tuning_csv', 'existing_data_csv']:
+                    elif key in ['data_dir', 'resume_dir', 'split_csv_path', 'split_json_path', 'fine_tuning_json', 'fine_tuning_csv']:
                         if value:  # Only expand if not None/empty
                             value = os.path.expanduser(value)
                     elif key in ['global_batch_size']:
