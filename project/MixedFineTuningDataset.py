@@ -20,6 +20,48 @@ except ImportError:
     SYNTHETIC_SCRATCH_AVAILABLE = False
     print("Warning: synthetic_scratch module not found, scratch generation will be disabled")
 
+def albumentations_brightness_contrast(img, brightness_limit=0.05, contrast_limit=0.05, p=0.5):
+    """
+    Fast Albumentations-based brightness/contrast adjustment that tracks applied values.
+    
+    Args:
+        img: Input image (numpy array)
+        brightness_limit: Brightness adjustment limit
+        contrast_limit: Contrast adjustment limit  
+        p: Probability of applying the transform
+        
+    Returns:
+        tuple: (transformed_img, brightness_factor, contrast_factor, applied)
+    """
+    # Initialize return values
+    brightness_factor = 0.0
+    contrast_factor = 0.0
+    applied = False
+    
+    if np.random.rand() < p:
+        # Create Albumentations transform
+        transform = A.RandomBrightnessContrast(
+            brightness_limit=brightness_limit,
+            contrast_limit=contrast_limit,
+            p=1.0  # Always apply if we reach this point
+        )
+        
+        # Apply transform
+        transformed = transform(image=img)
+        transformed_img = transformed['image']
+        
+        # Extract the applied parameters from the transform
+        # Albumentations uses alpha (contrast) and beta (brightness)
+        if hasattr(transform, 'params'):
+            # alpha is the contrast factor, beta is the brightness factor
+            contrast_factor = transform.params.get('alpha', 1.0) - 1.0  # Convert to our format
+            brightness_factor = transform.params.get('beta', 0.0)  # This is already in our format
+            
+        applied = True
+        return transformed_img, brightness_factor, contrast_factor, applied
+    
+    return img, brightness_factor, contrast_factor, applied
+
 class MixedFineTuningDataset(Dataset):
     """
     Dataset for mixed fine-tuning that combines:
@@ -160,7 +202,7 @@ class MixedFineTuningDataset(Dataset):
         if fine_tuning_csv and split_csv_path:
             print("Using mixed fine-tuning loading strategy")
             self._load_csv_image_paths(fine_tuning_csv, rootdir)
-            self._load_existing_image_paths(split_csv_path, rootdir)
+            self._load_existing_image_paths(split_csv_path, num_datafile, rootdir)
             
         # Strategy 2: Fine-tuning JSON mode (PCBDataset compatibility)
         elif fine_tuning_json:
@@ -488,7 +530,7 @@ class MixedFineTuningDataset(Dataset):
             else:
                 print(f"Warning: Image not found: {normalized_path}")
 
-    def _load_existing_image_paths(self, csv_path, rootdir):
+    def _load_existing_image_paths(self, csv_path, num_datafile, rootdir):
         """Load existing large image paths from CSV file (with augmentation)"""
         df = pd.read_csv(csv_path)
         
@@ -498,7 +540,11 @@ class MixedFineTuningDataset(Dataset):
         
         if 'category' in df.columns:
             df = df.query('category=="good"')
-            
+
+        if num_datafile is not None:
+            # Ensure we don't sample more than available data
+            df = df.sample(n=num_datafile, replace=True)
+
         if len(df) == 0:
             print("Warning: No data found in existing CSV file after filtering")
             return
@@ -529,7 +575,7 @@ class MixedFineTuningDataset(Dataset):
             # Define tracking functions for existing images
             def rotate_and_crop_func(img, **kwargs):
                 # Apply brightness/contrast first
-                img, brightness_factor, contrast_factor, bc_applied = random_brightness_contrast(
+                img, brightness_factor, contrast_factor, bc_applied = albumentations_brightness_contrast(
                     img, brightness_limit=0.05, contrast_limit=0.05, p=0.5
                 )
                 h, w = img.shape[:2]
@@ -567,6 +613,7 @@ class MixedFineTuningDataset(Dataset):
                            'brightness_contrast_applied': bc_applied,
                            'original_shape': img.shape[:2],
                            'is_csv_image': False,
+                           'epoch': self.current_epoch,  # Add missing epoch key
                            'augmentation_applied': True
                        })
             
@@ -583,10 +630,20 @@ class MixedFineTuningDataset(Dataset):
         else:
             # No crop tracking - use standard augmentations with size enforcement
             def transform_without_tracking(image, mask, index=None):
-                # Apply brightness/contrast first
-                img, brightness_factor, contrast_factor, bc_applied = random_brightness_contrast(
-                    image, brightness_limit=0.05, contrast_limit=0.05, p=0.5
-                )
+                # Apply brightness/contrast using Albumentations for speed, but don't track parameters
+                if np.random.rand() < 0.5:
+                    # Use Albumentations for fast transformation without parameter tracking
+                    transform = A.RandomBrightnessContrast(
+                        brightness_limit=0.05,
+                        contrast_limit=0.05,
+                        p=1.0
+                    )
+                    transformed = transform(image=image)
+                    img = transformed['image']
+                    bc_applied = True
+                else:
+                    img = image
+                    bc_applied = False
                 
                 # Apply rotation
                 h, w = img.shape[:2]
@@ -623,11 +680,12 @@ class MixedFineTuningDataset(Dataset):
                 transform_info = {
                     'crop_coords': [x1, y1, x2, y1, x2, y2, x1, y2],  # 8 values for consistency
                     'rotation_angle': rotation_angle,
-                    'brightness_factor': brightness_factor,
-                    'contrast_factor': contrast_factor,
+                    'brightness_factor': 0.0,  # Emit 0 as requested
+                    'contrast_factor': 0.0,    # Emit 0 as requested
                     'brightness_contrast_applied': bc_applied,
                     'original_shape': image.shape[:2],
                     'is_csv_image': False,
+                    'epoch': self.current_epoch,  # Add missing epoch key
                     'augmentation_applied': True
                 }
                 
@@ -837,7 +895,7 @@ class MixedFineTuningDataset(Dataset):
                         # Apply only non-cropping augmentations (brightness, contrast, rotation)
                         # but keep the original patch coordinates
                         # Create a simple augmentation that doesn't crop
-                        img, brightness_factor, contrast_factor, bc_applied = random_brightness_contrast(
+                        img, brightness_factor, contrast_factor, bc_applied = albumentations_brightness_contrast(
                             img, brightness_limit=0.05, contrast_limit=0.05, p=0.5
                         )
                         

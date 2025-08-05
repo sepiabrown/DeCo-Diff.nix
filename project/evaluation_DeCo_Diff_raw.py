@@ -781,18 +781,7 @@ def process_split_irregular_minimal_diff(
                 encodedrecon_raw = encodedrecon_raw.squeeze()
                 latent_raw = latent_raw.squeeze()
                 anomaly_map_arithmetic_raw = anomaly_map_arithmetic_raw.squeeze()
-                
-                # Ensure 2D shape
-                if len(encodedrecon_raw.shape) == 1:
-                    size = int(np.sqrt(encodedrecon_raw.shape[0]))
-                    encodedrecon_raw = encodedrecon_raw.reshape(size, size)
-                if len(latent_raw.shape) == 1:
-                    size = int(np.sqrt(latent_raw.shape[0]))
-                    latent_raw = latent_raw.reshape(size, size)
-                if len(anomaly_map_arithmetic_raw.shape) == 1:
-                    size = int(np.sqrt(anomaly_map_arithmetic_raw.shape[0]))
-                    anomaly_map_arithmetic_raw = anomaly_map_arithmetic_raw.reshape(size, size)
-                
+
                 # Save raw values efficiently as numpy arrays (preserves [0,1] range)
                 np.save(os.path.join(save_dir, f"{base_filename}_encodedrecon.npy"), encodedrecon_raw)
                 np.save(os.path.join(save_dir, f"{base_filename}_latent.npy"), latent_raw)

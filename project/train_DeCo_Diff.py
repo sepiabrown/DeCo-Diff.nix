@@ -294,49 +294,27 @@ def _main(args):
             center_crop=args.center_crop,
         )
     elif args.dataset == "pcb":
-        # Check if we're in fine-tuning mode
-        if args.fine_tuning_csv and args.fine_tuning_mode == "mixed":
-            # Use mixed fine-tuning dataset
-            dataset = MixedFineTuningDataset(
-                "train",
-                object_class=args.object_class,
-                rootdir=args.data_dir,
-                transform=transform,
-                image_size=args.image_size,
-                center_size=args.center_size,
-                augment=args.augmentation,
-                center_crop=args.center_crop,
-                fine_tuning_csv=args.fine_tuning_csv,
-                mixed_split_ratio=args.mixed_split_ratio,
-                track_crop=args.track_crop,
-                save_crop_visualizations=args.save_crop_visualizations,
-                crop_vis_dir=f"./crop_visualizations_{args.object_class}",
-                resume_dir=args.resume_dir,
-                resume_epoch=args.resume_epoch,
-                debug=args.debug,
-            )
-        else:
-            # Use standard PCB dataset
-            dataset = MixedFineTuningDataset(
-                "train",
-                object_class=args.object_class,
-                rootdir=args.data_dir,
-                transform=transform,
-                image_size=args.image_size,
-                center_size=args.center_size,
-                augment=args.augmentation,
-                center_crop=args.center_crop,
-                num_datafile=args.num_datafile,
-                split_csv_path=args.split_csv_path,
-                split_json_path=args.split_json_path,  # Pass JSON split file path
-                track_crop=args.track_crop,  # Enable crop tracking
-                save_crop_visualizations=args.save_crop_visualizations,  # Save crop visualizations
-                crop_vis_dir=f"./crop_visualizations_{args.object_class}",  # Directory for crop visualizations
-                resume_dir=args.resume_dir,  # Pass resume directory for crop annotation persistence
-                resume_epoch=args.resume_epoch,  # Pass resume epoch for filtering crops
-                fine_tuning_json=args.fine_tuning_json,  # Pass fine-tuning JSON file for patch selection
-                fine_tuning_csv=args.fine_tuning_csv,  # Pass fine-tuning CSV file for patch selection
-            )
+        dataset = MixedFineTuningDataset(
+            "train",
+            object_class=args.object_class,
+            rootdir=args.data_dir,
+            transform=transform,
+            image_size=args.image_size,
+            center_size=args.center_size,
+            augment=args.augmentation,
+            center_crop=args.center_crop,
+            num_datafile=args.num_datafile,
+            split_csv_path=args.split_csv_path,
+            fine_tuning_csv=args.fine_tuning_csv,
+            mixed_split_ratio=args.mixed_split_ratio,
+            track_crop=args.track_crop,
+            save_crop_visualizations=args.save_crop_visualizations,
+            crop_vis_dir=f"./crop_visualizations_{args.object_class}",
+            resume_dir=args.resume_dir,
+            resume_epoch=args.resume_epoch,
+            debug=args.debug,
+        )
+        
 
     batch_size = args.global_batch_size // dist.get_world_size()
     loader = DataLoader(
@@ -463,54 +441,32 @@ def _main(args):
         logger.info(f"Beginning epoch {epoch}...")
         if args.num_datafile is not None and args.rep_datafile is not None:
             if epoch % args.rep_datafile == 0:
-                
                 # Recreate dataset with new data files
                 if args.dataset == "pcb":
-                    if args.fine_tuning_csv and args.fine_tuning_mode == "mixed":
-                        # Recreate mixed fine-tuning dataset
-                        dataset = MixedFineTuningDataset(
-                            "train",
-                            object_class=args.object_class,
-                            rootdir=args.data_dir,
-                            transform=transform,
-                            image_size=args.image_size,
-                            center_size=args.center_size,
-                            augment=args.augmentation,
-                            center_crop=args.center_crop,
-                            fine_tuning_csv=args.fine_tuning_csv,
-                            mixed_split_ratio=args.mixed_split_ratio,
-                            track_crop=args.track_crop,
-                            save_crop_visualizations=args.save_crop_visualizations,
-                            crop_vis_dir=f"./crop_visualizations_{args.object_class}",
-                            resume_dir=args.resume_dir,
-                            resume_epoch=epoch,
-                            cumulative_crops=dataset.cumulative_crops if hasattr(dataset, 'cumulative_crops') else None,
-                            debug=args.debug,
-                        )
-                    else:
-                        # Recreate standard PCB dataset
-                        dataset = MixedFineTuningDataset(
-                            "train",
-                            object_class=args.object_class,
-                            rootdir=args.data_dir,
-                            transform=transform,
-                            image_size=args.image_size,
-                            center_size=args.center_size,
-                            augment=args.augmentation,
-                            center_crop=args.center_crop,
-                            num_datafile=args.num_datafile,
-                            split_csv_path=args.split_csv_path,
-                            split_json_path=args.split_json_path,  # Pass JSON split file path
-                            track_crop=args.track_crop,  # Enable crop tracking
-                            save_crop_visualizations=args.save_crop_visualizations,  # Save crop visualizations
-                            crop_vis_dir=f"./crop_visualizations_{args.object_class}",  # Directory for crop visualizations
-                            resume_dir=args.resume_dir,  # Pass resume directory
-                            resume_epoch=epoch,  # Pass resume epoch for filtering crops
-                            cumulative_crops=dataset.cumulative_crops if hasattr(dataset, 'cumulative_crops') else None
-                        )
-                    
-                    # Set the current epoch IMMEDIATELY after dataset recreation
-                    dataset.current_epoch = epoch
+                    dataset = MixedFineTuningDataset(
+                    "train",
+                    object_class=args.object_class,
+                    rootdir=args.data_dir,
+                    transform=transform,
+                    image_size=args.image_size,
+                    center_size=args.center_size,
+                    augment=args.augmentation,
+                    center_crop=args.center_crop,
+                    num_datafile=args.num_datafile,
+                    split_csv_path=args.split_csv_path,
+                    fine_tuning_csv=args.fine_tuning_csv,
+                    mixed_split_ratio=args.mixed_split_ratio,
+                    track_crop=args.track_crop,
+                    save_crop_visualizations=args.save_crop_visualizations,
+                    crop_vis_dir=f"./crop_visualizations_{args.object_class}",
+                    resume_dir=args.resume_dir,
+                    resume_epoch=epoch,
+                    cumulative_crops=dataset.cumulative_crops if hasattr(dataset, 'cumulative_crops') else None,
+                    debug=args.debug,
+                )
+                
+                # Set the current epoch IMMEDIATELY after dataset recreation
+                dataset.current_epoch = epoch
                 
                 # Recreate dataloader
                 loader = DataLoader(

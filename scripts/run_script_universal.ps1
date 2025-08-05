@@ -1,16 +1,52 @@
 # Universal PowerShell script to run training or evaluation scripts
-# Usage: .\run_script_universal.ps1 [ScriptType] [ScriptPath] [InputJson] [Loop]
+# Usage (positional): .\run_script_universal.ps1 [ScriptType] [ScriptPath] [InputJson] [Loop] [SleepMinutes]
+# Usage (named): .\run_script_universal.ps1 -ScriptType "train" -ScriptPath "..\project\train_DeCo_Diff.py" -InputJson "..\input_json\train_input.json" -Loop $true -SleepMinutes 30
 # Examples: 
-#   .\run_script_universal.ps1 "train" "..\project\train_DeCo_Diff.py" "..\input_json\train_input.json" $true
-#   .\run_script_universal.ps1 "eval" "..\project\evaluation_DeCo_Diff2.py" "..\input_json\eval_input.json" $false
+#   .\run_script_universal.ps1 "train" "..\project\train_DeCo_Diff.py" "..\input_json\train_input.json" $true 30
+#   .\run_script_universal.ps1 -ScriptType "train" -ScriptPath "..\project\train_DeCo_Diff.py" -InputJson "..\input_json\train_input.json" -Loop $true -SleepMinutes 30
+#   .\run_script_universal.ps1 -ScriptType "eval" -InputJson "..\input_json\eval_input.json" -SleepMinutes 15
+#   .\run_script_universal.ps1 -ScriptType "eval" -Loop $false
 
 # Parse command line arguments
 param(
+    [Parameter(Position=0)]
     [string]$ScriptType = "eval",  # "train" or "eval"
+    
+    [Parameter(Position=1)]
     [string]$ScriptPath = "..\project\evaluation_DeCo_Diff2.py",
+    
+    [Parameter(Position=2)]
     [string]$InputJson = "..\input_json\eval_input.json",
-    [bool]$Loop = $false
+    
+    [Parameter(Position=3)]
+    [bool]$Loop = $false,
+    
+    [Parameter(Position=4)]
+    [int]$SleepMinutes = 0,  # Sleep duration in minutes
+    
+    [Alias("Type")]
+    [Parameter()]
+    [ValidateSet("train", "eval")]
+    [string]$ScriptTypeNamed = $null,
+    
+    [Alias("Path")]
+    [Parameter()]
+    [string]$ScriptPathNamed = $null,
+    
+    [Alias("Json")]
+    [Parameter()]
+    [string]$InputJsonNamed = $null,
+    
+    [Alias("Sleep")]
+    [Parameter()]
+    [int]$SleepMinutesNamed = $null
 )
+
+# Override positional parameters with named parameters if provided
+if ($ScriptTypeNamed) { $ScriptType = $ScriptTypeNamed }
+if ($ScriptPathNamed) { $ScriptPath = $ScriptPathNamed }
+if ($InputJsonNamed) { $InputJson = $InputJsonNamed }
+if ($SleepMinutesNamed) { $SleepMinutes = $SleepMinutesNamed }
 
 # Start timing
 $StartTime = Get-Date
@@ -20,6 +56,7 @@ Write-Host "Script Type: $ScriptType" -ForegroundColor Yellow
 Write-Host "Input JSON: $InputJson" -ForegroundColor Yellow
 Write-Host "Script Path: $ScriptPath" -ForegroundColor Yellow
 Write-Host "Loop Mode: $Loop" -ForegroundColor Yellow
+Write-Host "Sleep Duration: $SleepMinutes minutes" -ForegroundColor Yellow
 Write-Host ""
 
 # Function to show elapsed time
@@ -29,6 +66,41 @@ function Show-ElapsedTime {
     $Seconds = $Elapsed.Seconds
     Write-Host ""
     Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Elapsed: ${Minutes}m ${Seconds}s" -ForegroundColor Magenta
+}
+
+# Function to sleep with countdown display
+function Start-SleepWithCountdown {
+    param([int]$Minutes)
+    
+    if ($Minutes -le 0) {
+        return
+    }
+    
+    Write-Host ""
+    Write-Host "=== SLEEP MODE ===" -ForegroundColor Cyan
+    Write-Host "Sleeping for $Minutes minutes..." -ForegroundColor Yellow
+    
+    $SleepSeconds = $Minutes * 60
+    $StartSleepTime = Get-Date
+    
+    for ($i = $SleepSeconds; $i -gt 0; $i--) {
+        $RemainingMinutes = [math]::Floor($i / 60)
+        $RemainingSeconds = $i % 60
+        
+        # Clear line and show countdown
+        Write-Host "`rSleeping: ${RemainingMinutes}m ${RemainingSeconds}s remaining..." -NoNewline -ForegroundColor Green
+        
+        Start-Sleep -Seconds 1
+    }
+    
+    $EndSleepTime = Get-Date
+    $ActualSleepTime = $EndSleepTime - $StartSleepTime
+    $ActualMinutes = [math]::Floor($ActualSleepTime.TotalMinutes)
+    $ActualSeconds = $ActualSleepTime.Seconds
+    
+    Write-Host ""
+    Write-Host "Sleep completed! Actual sleep time: ${ActualMinutes}m ${ActualSeconds}s" -ForegroundColor Green
+    Write-Host ""
 }
 
 # Check if files exist
@@ -122,12 +194,23 @@ if ($Loop) {
         
         # Check if we should continue
         if ($ExitCode -eq 0) {
-            Write-Host "✓ Iteration completed successfully. Restarting..." -ForegroundColor Green
-            Start-Sleep -Seconds 5  # Brief pause before restart
+            Write-Host "✓ Iteration completed successfully." -ForegroundColor Green
+            if ($SleepMinutes -gt 0) {
+                Write-Host "Sleeping before next iteration..." -ForegroundColor Yellow
+                Start-SleepWithCountdown -Minutes $SleepMinutes
+            } else {
+                Write-Host "Restarting immediately..." -ForegroundColor Green
+                Start-Sleep -Seconds 5  # Brief pause before restart
+            }
         } else {
             Write-Host "✗ Iteration failed with exit code $ExitCode" -ForegroundColor Red
             Write-Host "Restarting anyway due to loop mode..." -ForegroundColor Yellow
-            Start-Sleep -Seconds 10  # Longer pause after failure
+            if ($SleepMinutes -gt 0) {
+                Write-Host "Sleeping before retry..." -ForegroundColor Yellow
+                Start-SleepWithCountdown -Minutes $SleepMinutes
+            } else {
+                Start-Sleep -Seconds 10  # Longer pause after failure
+            }
         }
         
         $Iteration++
@@ -158,5 +241,12 @@ if ($Loop) {
         Write-Host "Note: Exit code $ExitCode may indicate warnings but not failure" -ForegroundColor Yellow
     } else {
         Write-Host "✗ $ScriptType failed with exit code $ExitCode" -ForegroundColor Red
+    }
+    
+    # Sleep after completion if specified
+    if ($SleepMinutes -gt 0) {
+        Write-Host ""
+        Write-Host "Sleeping after completion..." -ForegroundColor Yellow
+        Start-SleepWithCountdown -Minutes $SleepMinutes
     }
 } 
