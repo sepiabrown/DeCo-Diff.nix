@@ -532,7 +532,14 @@ class MixedFineTuningDataset(Dataset):
 
     def _load_existing_image_paths(self, csv_path, num_datafile, rootdir):
         """Load existing large image paths from CSV file (with augmentation)"""
-        df = pd.read_csv(csv_path)
+        if csv_path is None:
+            df = pd.read_csv(os.path.join(".", "splits", "pcb-split.csv"))
+        else:
+            df = pd.read_csv(csv_path)
+        
+        if num_datafile is not None:
+            # Ensure we don't sample more than available data
+            df = df.sample(n=num_datafile, replace=True)
         
         # Filter for train split and good category
         if 'split' in df.columns:
@@ -541,33 +548,37 @@ class MixedFineTuningDataset(Dataset):
         if 'category' in df.columns:
             df = df.query('category=="good"')
 
-        if num_datafile is not None:
-            # Ensure we don't sample more than available data
-            df = df.sample(n=num_datafile, replace=True)
-
         if len(df) == 0:
             print("Warning: No data found in existing CSV file after filtering")
             return
             
+        # Define object class dictionary
         object_cls_dict = {"pcb": 0}
         
         for i, row in df.iterrows():
-            image_path = row.get('image')
-            if not image_path:
+            # Fix path handling to ensure consistent separators
+            image_filename = str(row["image"]).strip()
+            # Normalize the path to handle mixed separators
+            data_path = os.path.normpath(os.path.join(rootdir, image_filename))
+            
+            # Check if file exists before trying to load it
+            if not os.path.exists(data_path):
+                print(f"Warning: Image file not found: {data_path}")
+                print(f"  - rootdir: {rootdir}")
+                print(f"  - image filename: {image_filename}")
                 continue
                 
-            # Normalize the path to handle mixed separators
-            normalized_path = os.path.normpath(str(image_path).strip())
-            if os.path.exists(normalized_path):
-                # Store only the path, not the image
+            try:
+                # Store only the path, not the image (for existing images)
                 self.existing_image_paths.append({
-                    'path': normalized_path,
-                    'object_class': object_cls_dict["pcb"],
-                    'anomaly_class': "good",
+                    'path': data_path,
+                    'object_class': object_cls_dict[str(row["object"])],
+                    'anomaly_class': str(row["category"]),
                     'is_csv': False  # Flag to identify existing images
                 })
-            else:
-                print(f"Warning: Image not found: {normalized_path}")
+            except Exception as e:
+                print(f"Error processing image {data_path}: {e}")
+                continue
 
     def _setup_augmentations(self):
         """Set up augmentation functions for existing images"""

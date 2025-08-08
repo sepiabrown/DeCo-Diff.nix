@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Script to create annotation JSON files for normal images.
-This creates JSON files with empty defective_patches arrays for images that are normal (non-defective).
+Script to create annotation JSON files for images in the original path.
+If the image is normal (non-defective), the defective_patches array is set to [].
 """
 
 import os
@@ -13,14 +13,15 @@ from typing import Optional, List
 from utils import path_to_safe_filename
 
 
-def create_normal_annotation(image_path: str, output_dir: str, grid_size: int = 128) -> str:
+def create_annotation(image_path: str, output_dir: str, grid_size: int = 128, is_defective: bool = False) -> str:
     """
-    Create an annotation JSON file for a normal image with empty defective_patches.
+    Create an annotation JSON file for a image with defective_patches.
     
     Args:
         image_path: Path to the image file
         output_dir: Directory to save the annotation JSON
         grid_size: Size of the grid patches (default: 128)
+        is_defective: Whether the image is defective (default: False)
     
     Returns:
         Path to the created annotation file
@@ -31,7 +32,7 @@ def create_normal_annotation(image_path: str, output_dir: str, grid_size: int = 
     # Create annotation data
     annotation = {
         "image_path": os.path.abspath(image_path),
-        "defective_patches": [],  # Empty array for normal images
+        "defective_patches": [[0, 0]] if is_defective else [],  # [0,0] for defective
         "grid_size": grid_size
     }
     
@@ -48,15 +49,16 @@ def create_normal_annotation(image_path: str, output_dir: str, grid_size: int = 
 
 
 def process_directory(input_dir: str, output_dir: str, grid_size: int = 128, 
-                     image_extensions: Optional[List[str]] = None) -> List[str]:
+                     image_extensions: Optional[List[str]] = None, is_defective: bool = False) -> List[str]:
     """
-    Process all images in a directory and create annotation files for normal images.
+    Process all images in a directory and create annotation files.
     
     Args:
         input_dir: Directory containing images
         output_dir: Directory to save annotation files
         grid_size: Size of the grid patches
         image_extensions: List of image file extensions to process
+        is_defective: Whether the images are defective (default: False)
     
     Returns:
         List of created annotation file paths
@@ -81,7 +83,7 @@ def process_directory(input_dir: str, output_dir: str, grid_size: int = 128,
     # Create annotations for each image
     for image_path in image_files:
         try:
-            annotation_path = create_normal_annotation(image_path, output_dir, grid_size)
+            annotation_path = create_annotation(image_path, output_dir, grid_size, is_defective)
             created_files.append(annotation_path)
             print(f"Created annotation: {os.path.basename(annotation_path)}")
         except Exception as e:
@@ -91,7 +93,7 @@ def process_directory(input_dir: str, output_dir: str, grid_size: int = 128,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Create annotation JSON files for normal images")
+    parser = argparse.ArgumentParser(description="Create annotation JSON files for images in the original path")
     parser.add_argument("--input-dir", "-i", required=True,
                        help="Directory containing images to annotate")
     parser.add_argument("--output-dir", "-o", required=True,
@@ -103,6 +105,8 @@ def main():
                        help="Image file extensions to process")
     parser.add_argument("--single-image", "-s",
                        help="Process a single image instead of a directory")
+    parser.add_argument("--is-defective", action="store_true", default=False,
+                       help="Mark images as defective (default: False)")
     
     args = parser.parse_args()
     
@@ -117,7 +121,7 @@ def main():
         print(f"Output directory (absolute): {output_dir_abs}")
         
         try:
-            annotation_path = create_normal_annotation(args.single_image, args.output_dir, args.grid_size)
+            annotation_path = create_annotation(args.single_image, args.output_dir, args.grid_size, args.is_defective)
             print(f"Created annotation: {annotation_path}")
         except Exception as e:
             print(f"Error creating annotation: {e}")
@@ -128,7 +132,7 @@ def main():
             return
         
         created_files = process_directory(args.input_dir, args.output_dir, 
-                                        args.grid_size, args.extensions)
+                                        args.grid_size, args.extensions, args.is_defective)
         print(f"\nCreated {len(created_files)} annotation files in {args.output_dir}")
 
 

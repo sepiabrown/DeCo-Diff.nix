@@ -640,7 +640,7 @@ def process_split_irregular_minimal_diff(
                     patch_coord_tensor = patch_coords[-1] if patch_coords else [0, 0]
                 
                 # Debug print to see what we're getting
-                print(f"Debug - patch_coord_tensor type: {type(patch_coord_tensor)}, value: {patch_coord_tensor}")
+                #print(f"Debug - patch_coord_tensor type: {type(patch_coord_tensor)}, value: {patch_coord_tensor}")
                 
                 if isinstance(patch_coord_tensor, torch.Tensor):
                     # If it's a single tensor with 2 elements [x, y]
@@ -676,7 +676,7 @@ def process_split_irregular_minimal_diff(
                     print(f"Warning: unexpected patch_coord format, using default coordinates")
                     x_coord, y_coord = 0, 0
                 
-                print(f"Debug - extracted coordinates: x_coord={x_coord}, y_coord={y_coord}")
+                #print(f"Debug - extracted coordinates: x_coord={x_coord}, y_coord={y_coord}")
                 
                 # Get all 4 corner coordinates for irregular patches
                 # Don't assume rectangular shape - capture all corners
