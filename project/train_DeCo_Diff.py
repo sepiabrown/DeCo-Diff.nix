@@ -444,26 +444,26 @@ def _main(args):
                 # Recreate dataset with new data files
                 if args.dataset == "pcb":
                     dataset = MixedFineTuningDataset(
-                    "train",
-                    object_class=args.object_class,
-                    rootdir=args.data_dir,
-                    transform=transform,
-                    image_size=args.image_size,
-                    center_size=args.center_size,
-                    augment=args.augmentation,
-                    center_crop=args.center_crop,
-                    num_datafile=args.num_datafile,
-                    split_csv_path=args.split_csv_path,
-                    fine_tuning_csv=args.fine_tuning_csv,
-                    mixed_split_ratio=args.mixed_split_ratio,
-                    track_crop=args.track_crop,
-                    save_crop_visualizations=args.save_crop_visualizations,
-                    crop_vis_dir=f"./crop_visualizations_{args.object_class}",
-                    resume_dir=args.resume_dir,
-                    resume_epoch=epoch,
-                    cumulative_crops=dataset.cumulative_crops if hasattr(dataset, 'cumulative_crops') else None,
-                    debug=args.debug,
-                )
+                        "train",
+                        object_class=args.object_class,
+                        rootdir=args.data_dir,
+                        transform=transform,
+                        image_size=args.image_size,
+                        center_size=args.center_size,
+                        augment=args.augmentation,
+                        center_crop=args.center_crop,
+                        num_datafile=args.num_datafile,
+                        split_csv_path=args.split_csv_path,
+                        fine_tuning_csv=args.fine_tuning_csv,
+                        mixed_split_ratio=args.mixed_split_ratio,
+                        track_crop=args.track_crop,
+                        save_crop_visualizations=args.save_crop_visualizations,
+                        crop_vis_dir=f"./crop_visualizations_{args.object_class}",
+                        resume_dir=args.resume_dir,
+                        resume_epoch=epoch,
+                        cumulative_crops=dataset.cumulative_crops if hasattr(dataset, 'cumulative_crops') else None,
+                        debug=args.debug,
+                    )
                 
                 # Set the current epoch IMMEDIATELY after dataset recreation
                 dataset.current_epoch = epoch

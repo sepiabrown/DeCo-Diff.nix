@@ -194,9 +194,19 @@ class MixedFineTuningDataset(Dataset):
         """
         Determine which loading strategy to use based on available parameters
         """
-        # Load image paths instead of loading all images into memory
-        self.csv_image_paths = []  # Small images from CSV (no augmentation)
-        self.existing_image_paths = []  # Large images from existing data (with augmentation)
+        # Initialize CSV data structures (similar to PCBDataLoader.py)
+        self.csv_images = []
+        self.csv_segs = []
+        self.csv_object_classes = []
+        self.csv_image_paths = []
+        self.csv_anomaly_classes = []
+        
+        # Initialize existing image data structures (similar to PCBDataLoader.py)
+        self.existing_images = []
+        self.existing_segs = []
+        self.existing_object_classes = []
+        self.existing_image_paths = []
+        self.existing_anomaly_classes = []
         
         # Strategy 1: Mixed fine-tuning mode (fine_tuning_csv + split_csv_path)
         if fine_tuning_csv and split_csv_path:
@@ -496,7 +506,7 @@ class MixedFineTuningDataset(Dataset):
         return True, crop_x, crop_y, crop_w, crop_h, patch_info
 
     def _load_csv_image_paths(self, csv_path, rootdir):
-        """Load small image paths from CSV file (no augmentation)"""
+        """Load small images from CSV file (no augmentation) - similar to _load_csv_data in PCBDataLoader.py"""
         df = pd.read_csv(csv_path)
         
         # Filter for train split and good category
@@ -510,28 +520,49 @@ class MixedFineTuningDataset(Dataset):
             print("Warning: No data found in CSV file after filtering")
             return
             
+        # Define object class dictionary
         object_cls_dict = {"pcb": 0}
         
+        # Initialize lists to store loaded data (similar to PCBDataLoader.py)
+        self.csv_images = []
+        self.csv_segs = []
+        self.csv_object_classes = []
+        self.csv_image_paths = []
+        self.csv_anomaly_classes = []
+        
         for i, row in df.iterrows():
-            image_path = row.get('image')
-            if not image_path:
+            # Fix path handling to ensure consistent separators
+            image_filename = str(row["image"]).strip()
+            # Normalize the path to handle mixed separators
+            data_path = os.path.normpath(os.path.join(rootdir, image_filename))
+            
+            # Check if file exists before trying to load it
+            if not os.path.exists(data_path):
+                print(f"Warning: Image file not found: {data_path}")
+                print(f"  - rootdir: {rootdir}")
+                print(f"  - image filename: {image_filename}")
                 continue
                 
-            # Normalize the path to handle mixed separators
-            normalized_path = os.path.normpath(str(image_path).strip())
-            if os.path.exists(normalized_path):
-                # Store only the path, not the image
-                self.csv_image_paths.append({
-                    'path': normalized_path,
-                    'object_class': object_cls_dict["pcb"],
-                    'anomaly_class': "good",
-                    'is_csv': True  # Flag to identify CSV images
-                })
-            else:
-                print(f"Warning: Image not found: {normalized_path}")
+            try:
+                img = np.array(
+                    Image.open(data_path).convert("RGB")
+                    # .resize((self.image_size, self.image_size))
+                ).astype(np.uint8)
+                self.csv_image_paths.append(data_path)
+                self.csv_images.append(img)
+                self.csv_object_classes.append(object_cls_dict[str(row["object"])])
+                self.csv_anomaly_classes.append(str(row["category"]))
+                
+                # For CSV images, we assume they are good images (no masks)
+                #seg_shape = (self.image_size, self.image_size)
+                #self.csv_segs.append(np.zeros(seg_shape))
+                
+            except Exception as e:
+                print(f"Error loading image {data_path}: {e}")
+                continue
 
     def _load_existing_image_paths(self, csv_path, num_datafile, rootdir):
-        """Load existing large image paths from CSV file (with augmentation)"""
+        """Load existing large images from CSV file (with augmentation) - similar to _load_csv_data in PCBDataLoader.py"""
         if csv_path is None:
             df = pd.read_csv(os.path.join(".", "splits", "pcb-split.csv"))
         else:
@@ -555,6 +586,13 @@ class MixedFineTuningDataset(Dataset):
         # Define object class dictionary
         object_cls_dict = {"pcb": 0}
         
+        # Initialize lists to store loaded data (similar to PCBDataLoader.py)
+        self.existing_images = []
+        self.existing_segs = []
+        self.existing_object_classes = []
+        self.existing_image_paths = []
+        self.existing_anomaly_classes = []
+        
         for i, row in df.iterrows():
             # Fix path handling to ensure consistent separators
             image_filename = str(row["image"]).strip()
@@ -569,15 +607,21 @@ class MixedFineTuningDataset(Dataset):
                 continue
                 
             try:
-                # Store only the path, not the image (for existing images)
-                self.existing_image_paths.append({
-                    'path': data_path,
-                    'object_class': object_cls_dict[str(row["object"])],
-                    'anomaly_class': str(row["category"]),
-                    'is_csv': False  # Flag to identify existing images
-                })
+                img = np.array(
+                    Image.open(data_path).convert("RGB")
+                    # .resize((self.image_size, self.image_size))
+                ).astype(np.uint8)
+                self.existing_image_paths.append(data_path)
+                self.existing_images.append(img)
+                self.existing_object_classes.append(object_cls_dict[str(row["object"])])
+                self.existing_anomaly_classes.append(str(row["category"]))
+                
+                # For existing images, we assume they are good images (no masks)
+                #seg_shape = img.shape[:2]  # Use actual image shape
+                #self.existing_segs.append(np.zeros(seg_shape))
+                
             except Exception as e:
-                print(f"Error processing image {data_path}: {e}")
+                print(f"Error loading image {data_path}: {e}")
                 continue
 
     def _setup_augmentations(self):
@@ -629,18 +673,21 @@ class MixedFineTuningDataset(Dataset):
                        })
             
             # Create wrapper function for existing images
-            def transform_with_tracking(image, mask, index=None):
+            #def transform_with_tracking(image, mask, index=None):
+            def transform_with_tracking(image, index=None):
                 cropped_img, transform_info = rotate_and_crop_func(image, index=index)
                 # Apply the same transformations to mask
-                mask, _ = rotate_and_crop_func(mask, index=index)
+                #mask, _ = rotate_and_crop_func(mask, index=index)
                 # Add missing keys to ensure consistency
                 transform_info['epoch'] = self.current_epoch
-                return {'image': cropped_img, 'mask': mask, 'transform_info': transform_info}
+                #return {'image': cropped_img, 'mask': mask, 'transform_info': transform_info}
+                return {'image': cropped_img, 'transform_info': transform_info}
             
             self.aug = transform_with_tracking
         else:
             # No crop tracking - use standard augmentations with size enforcement
-            def transform_without_tracking(image, mask, index=None):
+            #def transform_without_tracking(image, mask, index=None):
+            def transform_without_tracking(image, index=None):
                 # Apply brightness/contrast using Albumentations for speed, but don't track parameters
                 if np.random.rand() < 0.5:
                     # Use Albumentations for fast transformation without parameter tracking
@@ -664,9 +711,9 @@ class MixedFineTuningDataset(Dataset):
                 rotated = cv2.warpAffine(img, rotation_matrix, (w, h),
                                        flags=cv2.INTER_NEAREST,
                                        borderMode=cv2.BORDER_REPLICATE)
-                rotated_mask = cv2.warpAffine(mask, rotation_matrix, (w, h),
-                                            flags=cv2.INTER_NEAREST,
-                                            borderMode=cv2.BORDER_REPLICATE)
+                #rotated_mask = cv2.warpAffine(mask, rotation_matrix, (w, h),
+                #                            flags=cv2.INTER_NEAREST,
+                #                            borderMode=cv2.BORDER_REPLICATE)
                 
                 # Random crop to exact size
                 crop_h = min(self.image_size, h)
@@ -679,7 +726,7 @@ class MixedFineTuningDataset(Dataset):
                 crop_x = np.random.randint(0, max_w + 1) if max_w > 0 else 0
                 
                 cropped_img = rotated[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
-                cropped_mask = rotated_mask[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+                #cropped_mask = rotated_mask[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
                 
                 # Ensure exact size (in case the crop is smaller than target)
                 #if cropped_img.shape[:2] != (self.image_size, self.image_size):
@@ -700,7 +747,8 @@ class MixedFineTuningDataset(Dataset):
                     'augmentation_applied': True
                 }
                 
-                return {'image': cropped_img, 'mask': cropped_mask, 'transform_info': transform_info}
+                #return {'image': cropped_img, 'mask': cropped_mask, 'transform_info': transform_info}
+                return {'image': cropped_img, 'transform_info': transform_info}
             
             self.aug = transform_without_tracking
 
@@ -816,29 +864,20 @@ class MixedFineTuningDataset(Dataset):
             csv_index = (cycle * csv_per_cycle + position_in_cycle) % csv_count
             if self.debug:
                 print(f"DEBUG: Using CSV image {csv_index} (cycle {cycle}, position {position_in_cycle})")
-            data = self.csv_image_paths[csv_index]
-            img_path = data['path']
             
-            # Load image on-demand with error handling
-            try:
-                img = np.array(Image.open(img_path).convert("RGB")).astype(np.uint8)
-            except Exception as e:
-                print(f"Error loading CSV image {img_path}: {e}")
-                # Fallback to a different image if available
-                if csv_count > 1:
-                    fallback_index = (csv_index + 1) % csv_count
-                    data = self.csv_image_paths[fallback_index]
-                    img_path = data['path']
-                    try:
-                        img = np.array(Image.open(img_path).convert("RGB")).astype(np.uint8)
-                    except Exception as e2:
-                        print(f"Error loading fallback CSV image {img_path}: {e2}")
-                        raise e2
-                else:
-                    raise e
-                    
-            seg = np.zeros((self.image_size, self.image_size))
-            anomaly_class = data['anomaly_class']
+            # Use pre-loaded images (similar to PCBDataLoader.py)
+            img = self.csv_images[csv_index]
+            #seg = self.csv_segs[csv_index]
+            anomaly_class = self.csv_anomaly_classes[csv_index]
+            img_path = self.csv_image_paths[csv_index]
+            
+            # Create data structure for consistency with existing image handling
+            data = {
+                'path': img_path,
+                'object_class': self.csv_object_classes[csv_index],
+                'anomaly_class': anomaly_class,
+                'is_csv': True
+            }
             
             # No augmentation for CSV images
             # Convert rectangle to 8-value format for consistency
@@ -861,29 +900,20 @@ class MixedFineTuningDataset(Dataset):
                 existing_index = (cycle * existing_per_cycle + (position_in_cycle - csv_per_cycle)) % existing_count
                 if self.debug:
                     print(f"DEBUG: Using existing image {existing_index} (cycle {cycle}, position {position_in_cycle})")
-                data = self.existing_image_paths[existing_index]
-                img_path = data['path']
                 
-                # Load image on-demand with error handling
-                try:
-                    img = np.array(Image.open(img_path).convert("RGB")).astype(np.uint8)
-                except Exception as e:
-                    print(f"Error loading existing image {img_path}: {e}")
-                    # Fallback to a different image if available
-                    if existing_count > 1:
-                        fallback_index = (existing_index + 1) % existing_count
-                        data = self.existing_image_paths[fallback_index]
-                        img_path = data['path']
-                        try:
-                            img = np.array(Image.open(img_path).convert("RGB")).astype(np.uint8)
-                        except Exception as e2:
-                            print(f"Error loading fallback existing image {img_path}: {e2}")
-                            raise e2
-                    else:
-                        raise e
-                        
-                seg = np.zeros(img.shape[:2])  # Empty mask
-                anomaly_class = data['anomaly_class']
+                # Use pre-loaded images (similar to PCBDataLoader.py)
+                img = self.existing_images[existing_index]
+                #seg = self.existing_segs[existing_index]
+                anomaly_class = self.existing_anomaly_classes[existing_index]
+                img_path = self.existing_image_paths[existing_index]
+                
+                # Create data structure for consistency
+                data = {
+                    'path': img_path,
+                    'object_class': self.existing_object_classes[existing_index],
+                    'anomaly_class': anomaly_class,
+                    'is_csv': False
+                }
                 
                 # Handle patch-specific data from JSON loading (PCBDataset compatibility)
                 patch_info = data.get('patch_info')
@@ -895,7 +925,7 @@ class MixedFineTuningDataset(Dataset):
                     if use_fp_patch:
                         # Extract the patch from the original image (JSON fine-tuning)
                         img = img[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
-                        seg = seg[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+                        #seg = seg[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
                         fine_tuning_patch_info = patch_info_ft
                 
                 # Apply augmentation for existing images
@@ -918,9 +948,9 @@ class MixedFineTuningDataset(Dataset):
                         img = cv2.warpAffine(img, rotation_matrix, (w, h),
                                            flags=cv2.INTER_NEAREST,
                                            borderMode=cv2.BORDER_REPLICATE)
-                        seg = cv2.warpAffine(seg, rotation_matrix, (w, h),
-                                           flags=cv2.INTER_NEAREST,
-                                           borderMode=cv2.BORDER_REPLICATE)
+                        #seg = cv2.warpAffine(seg, rotation_matrix, (w, h),
+                        #                   flags=cv2.INTER_NEAREST,
+                        #                   borderMode=cv2.BORDER_REPLICATE)
                         
                         # Create transform info that preserves the original patch coordinates
                         transform_info = {
@@ -935,9 +965,10 @@ class MixedFineTuningDataset(Dataset):
                         
                     else:
                         # Standard augmentation with random cropping
-                        augmented = self.aug(image=img, mask=seg, index=index)
+                        #augmented = self.aug(image=img, mask=seg, index=index)
+                        augmented = self.aug(image=img, index=index)
                         img = augmented["image"]
-                        seg = augmented["mask"]
+                        #seg = augmented["mask"]
                         transform_info = augmented["transform_info"]
 
                 else:
@@ -948,7 +979,7 @@ class MixedFineTuningDataset(Dataset):
                     crop_y = (h - crop_h) // 2
                     crop_x = (w - crop_w) // 2
                     img = img[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
-                    seg = seg[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+                    #seg = seg[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
                     # Convert rectangle to 8-value format for consistency
                     x1, y1, x2, y2 = crop_x, crop_y, crop_x + crop_w, crop_y + crop_h
                     transform_info = {
@@ -975,7 +1006,7 @@ class MixedFineTuningDataset(Dataset):
                     print(f"Error loading fallback CSV image {img_path}: {e}")
                     raise e
                     
-                seg = np.zeros((self.image_size, self.image_size))
+                #seg = np.zeros((self.image_size, self.image_size))
                 anomaly_class = data['anomaly_class']
                 
                 # Convert rectangle to 8-value format for consistency
@@ -1056,7 +1087,7 @@ class MixedFineTuningDataset(Dataset):
         
         return (
             img,
-            seg.astype(np.float32),
+            0,#seg.astype(np.float32),
             int(y),
             img_path,
             anomaly_class,
