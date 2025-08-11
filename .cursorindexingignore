@@ -1,0 +1,15 @@
+# Add directories or file patterns to ignore during indexing (e.g. foo/ or *.csv)
+**/*.csv
+**/*.json
+**/*.png
+**/*.npy
+**/*.pt
+**/*.pth
+**/*.pkl
+**/*.pth.tar
+**/*.pth.tar.gz
+**/*.pth.tar.bz2
+**/*.pth.tar.xz
+**/*.pth.tar.lzma
+**/*.pth.tar.lz
+**/*.whl

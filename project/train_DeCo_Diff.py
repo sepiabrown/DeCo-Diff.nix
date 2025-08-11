@@ -15,6 +15,7 @@ import logging
 import os
 import torch.nn.functional as F
 from models import UNET_models
+import gc
 
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
@@ -439,43 +440,6 @@ def _main(args):
     logger.info(f"Training for {adjusted_epochs} epochs...")
     for epoch in range(start_epoch, adjusted_epochs):
         logger.info(f"Beginning epoch {epoch}...")
-        if args.num_datafile is not None and args.rep_datafile is not None:
-            if epoch % args.rep_datafile == 0:
-                # Recreate dataset with new data files
-                if args.dataset == "pcb":
-                    dataset = MixedFineTuningDataset(
-                        "train",
-                        object_class=args.object_class,
-                        rootdir=args.data_dir,
-                        transform=transform,
-                        image_size=args.image_size,
-                        center_size=args.center_size,
-                        augment=args.augmentation,
-                        center_crop=args.center_crop,
-                        num_datafile=args.num_datafile,
-                        split_csv_path=args.split_csv_path,
-                        fine_tuning_csv=args.fine_tuning_csv,
-                        mixed_split_ratio=args.mixed_split_ratio,
-                        track_crop=args.track_crop,
-                        save_crop_visualizations=args.save_crop_visualizations,
-                        crop_vis_dir=f"./crop_visualizations_{args.object_class}",
-                        resume_dir=args.resume_dir,
-                        resume_epoch=epoch,
-                        cumulative_crops=dataset.cumulative_crops if hasattr(dataset, 'cumulative_crops') else None,
-                        debug=args.debug,
-                    )
-                
-                # Set the current epoch IMMEDIATELY after dataset recreation
-                dataset.current_epoch = epoch
-                
-                # Recreate dataloader
-                loader = DataLoader(
-                    dataset,
-                    batch_size=batch_size,
-                    shuffle=True,
-                    num_workers=0,
-                    drop_last=False,
-                )
 
         # Training loop
         # Set the current epoch BEFORE starting the batch loop (regardless of dataset recreation)
@@ -705,6 +669,51 @@ def _main(args):
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
 
         dist.barrier()
+
+        if args.num_datafile is not None and args.rep_datafile is not None and epoch < adjusted_epochs - 1:
+            if epoch % args.rep_datafile == 0:
+                # Explicitly delete the old loader to free memory before creating a new dataset/loader
+                if 'loader' in locals() and loader is not None:
+                    del loader
+                    gc.collect()  # Encourage garbage collection
+                    if rank == 0:
+                        logger.info("Freed memory of old DataLoader before dataset renewal.")
+                
+                # Recreate dataset with new data files
+                if args.dataset == "pcb":
+                    dataset = MixedFineTuningDataset(
+                        "train",
+                        object_class=args.object_class,
+                        rootdir=args.data_dir,
+                        transform=transform,
+                        image_size=args.image_size,
+                        center_size=args.center_size,
+                        augment=args.augmentation,
+                        center_crop=args.center_crop,
+                        num_datafile=args.num_datafile,
+                        split_csv_path=args.split_csv_path,
+                        fine_tuning_csv=args.fine_tuning_csv,
+                        mixed_split_ratio=args.mixed_split_ratio,
+                        track_crop=args.track_crop,
+                        save_crop_visualizations=args.save_crop_visualizations,
+                        crop_vis_dir=f"./crop_visualizations_{args.object_class}",
+                        resume_dir=args.resume_dir,
+                        resume_epoch=epoch,
+                        cumulative_crops=dataset.cumulative_crops if hasattr(dataset, 'cumulative_crops') else None,
+                        debug=args.debug,
+                    )
+                
+                # Set the current epoch IMMEDIATELY after dataset recreation
+                dataset.current_epoch = epoch
+                
+                # Recreate dataloader
+                loader = DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=True,
+                    num_workers=0,
+                    drop_last=False,
+                )
 
     logger.info("Done!")
     

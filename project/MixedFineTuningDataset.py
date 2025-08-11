@@ -181,9 +181,30 @@ class MixedFineTuningDataset(Dataset):
         # Set up augmentations
         self._setup_augmentations()
         
-        # Calculate total dataset size
-        self.total_size = len(self.csv_image_paths) + len(self.existing_image_paths)
-        print(f"Total dataset size: {self.total_size} (CSV: {len(self.csv_image_paths)}, Existing: {len(self.existing_image_paths)})")
+        # Calculate total dataset size to ensure all CSV images are used
+        csv_count = len(self.csv_image_paths)
+        existing_count = len(self.existing_image_paths)
+        
+        if csv_count > 0:
+            # Calculate cycles needed to use all CSV images
+            csv_per_cycle = int(10 * self.mixed_split_ratio)
+            cycles_needed = (csv_count + csv_per_cycle - 1) // csv_per_cycle  # Ceiling division
+            
+            # Total size should be enough cycles to cover all CSV images
+            self.total_size = cycles_needed * 10  # 10 images per cycle
+            
+            print(f"CSV images: {csv_count}, Existing images: {existing_count}")
+            print(f"CSV per cycle: {csv_per_cycle}, Cycles needed: {cycles_needed}")
+            print(f"Total dataset size: {self.total_size} (ensures all CSV images are used)")
+            
+            # Alternative approach: You could also modify the indexing logic to:
+            # 1. Use all CSV images in one epoch
+            # 2. Cycle through existing images multiple times to balance the dataset
+            # 3. This would require changing the existing_index calculation in __getitem__
+        else:
+            # Fallback if no CSV images
+            self.total_size = existing_count
+            print(f"Total dataset size: {self.total_size} (Existing: {existing_count})")
         
         if self.total_size == 0:
             raise Exception("No images loaded from any source")
