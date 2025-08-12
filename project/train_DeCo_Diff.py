@@ -16,6 +16,7 @@ import os
 import torch.nn.functional as F
 from models import UNET_models
 import gc
+import psutil
 
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
@@ -190,6 +191,62 @@ def random_mask(x: torch.Tensor, mask_ratios, mask_patch_size=1):
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
+
+
+def get_memory_info():
+    """Get current memory usage information"""
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    
+    # Get GPU memory if available
+    gpu_memory = "N/A"
+    if torch.cuda.is_available():
+        gpu_memory = f"{torch.cuda.memory_allocated() / 1024**3:.2f} GB"
+    
+    return {
+        'rss_mb': memory_info.rss / 1024**2,  # Resident Set Size in MB
+        'vms_mb': memory_info.vms / 1024**2,  # Virtual Memory Size in MB
+        'gpu_memory': gpu_memory,
+        'available_ram_mb': psutil.virtual_memory().available / 1024**2
+    }
+
+def log_memory_usage(logger, rank, stage="", force_log=False):
+    """Log memory usage information"""
+    if rank == 0:  # Only log from main process
+        memory_info = get_memory_info()
+        logger.info(f"{stage} Memory Usage - RAM: {memory_info['rss_mb']:.1f}MB, "
+                   f"GPU: {memory_info['gpu_memory']}, "
+                   f"Available RAM: {memory_info['available_ram_mb']:.1f}MB")
+        
+        # Force garbage collection if memory usage is high
+        if force_log or memory_info['rss_mb'] > 8000:  # Log if > 8GB
+            logger.warning(f"High memory usage detected! {stage}")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+def inspect_variables(local_vars, logger, rank, stage=""):
+    """Inspect variables in current scope and their memory usage"""
+    if rank == 0:
+        logger.info(f"=== Variable Inspection at {stage} ===")
+        
+        # Check for large objects
+        large_objects = []
+        for name, obj in local_vars.items():
+            if hasattr(obj, '__sizeof__'):
+                try:
+                    size = obj.__sizeof__()
+                    if size > 1024 * 1024:  # > 1MB
+                        large_objects.append((name, size / 1024**2, type(obj).__name__))
+                except:
+                    pass
+        
+        if large_objects:
+            logger.info("Large objects found:")
+            for name, size_mb, obj_type in sorted(large_objects, key=lambda x: x[1], reverse=True):
+                logger.info(f"  {name}: {size_mb:.2f} MB ({obj_type})")
+        else:
+            logger.info("No large objects found in current scope")
 
 
 def _main(args):
@@ -437,11 +494,18 @@ def _main(args):
     best_loss = float("inf")
     start_time = time()
 
+    # Log initial memory usage
+    log_memory_usage(logger, rank, "Before training loop starts", force_log=True)
+    inspect_variables(locals(), logger, rank, "Before training loop starts")
+    
     logger.info(f"Training for {adjusted_epochs} epochs...")
     for epoch in range(start_epoch, adjusted_epochs):
         logger.info(f"Beginning epoch {epoch}...")
 
         # Training loop
+        # Log memory usage at the start of each epoch
+        log_memory_usage(logger, rank, f"Start of epoch {epoch}")
+        
         # Set the current epoch BEFORE starting the batch loop (regardless of dataset recreation)
         if args.dataset == "pcb" and hasattr(dataset, 'track_crop') and dataset.track_crop:
             dataset.current_epoch = epoch
@@ -668,6 +732,9 @@ def _main(args):
                 torch.save(checkpoint, checkpoint_path)
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
 
+        # Log memory usage at the end of each epoch
+        log_memory_usage(logger, rank, f"End of epoch {epoch}")
+        
         dist.barrier()
 
         if args.num_datafile is not None and args.rep_datafile is not None and epoch < adjusted_epochs - 1:
@@ -714,7 +781,15 @@ def _main(args):
                     num_workers=0,
                     drop_last=False,
                 )
+                
+                # Log memory usage after dataset renewal
+                log_memory_usage(logger, rank, f"After dataset renewal (epoch {epoch})", force_log=True)
+                inspect_variables(locals(), logger, rank, f"After dataset renewal (epoch {epoch})")
 
+    # Log final memory usage
+    log_memory_usage(logger, rank, "After training loop ends", force_log=True)
+    inspect_variables(locals(), logger, rank, "After training loop ends")
+    
     logger.info("Done!")
     
     # Note: Crop visualizations are now saved in real-time during training

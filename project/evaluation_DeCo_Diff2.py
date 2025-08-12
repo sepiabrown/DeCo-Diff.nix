@@ -1999,9 +1999,15 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
             'geometric_binary_style3': np.zeros((h, w), dtype=np.float32),
         }
     
+    def _get_xy_from_patch_coords(rec) -> tuple:
+        coords = rec.get("patch_coords", (None, []))[1]
+        if isinstance(coords, (list, tuple)) and len(coords) == 8:
+            return int(coords[0]), int(coords[1])  # top-left from 8-value
+        raise ValueError(f"Expected 8-value patch_coords, got: {coords}")
+
     for record in image_records:
-        # Extract coordinates from record
-        x_coord, y_coord = record["patch_coords"][1]
+        # Extract coordinates from record (supports 8- or 2-value formats)
+        x_coord, y_coord = _get_xy_from_patch_coords(record)
         
         # Calculate actual patch dimensions for this position
         patch_width = min(patch_size, w - x_coord)
@@ -2096,7 +2102,7 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
     # Save evaluation results
     patch_analysis = []
     for record in image_records:
-        x, y = record["patch_coords"][1]
+        x, y = _get_xy_from_patch_coords(record)
         anomaly_map = record["anomaly_map_arithmetic_binary"][1]
         anomaly_pixels = int(np.sum(anomaly_map))
         grid_row = y // patch_size
@@ -2538,7 +2544,11 @@ def process_split_irregular_with_checkpoint(
                     
                     # Build predicted_defective_set for this single patch
                     predicted_defective_set = set()
-                    patch_x, patch_y = required_rec["patch_coords"][1]
+                    # Support 8-value patch_coords in downstream processing
+                    coords = required_rec.get("patch_coords", (None, []))[1]
+                    if not (isinstance(coords, (list, tuple)) and len(coords) == 8):
+                        raise ValueError(f"Expected 8-value patch_coords, got: {coords}")
+                    patch_x, patch_y = int(coords[0]), int(coords[1])
                     anomaly_map = required_rec["anomaly_map_arithmetic_binary"][1]
                     anomaly_pixels = np.sum(anomaly_map)
                     if anomaly_pixels > 0:
@@ -2600,7 +2610,10 @@ def process_split_irregular_with_checkpoint(
                             # Build predicted_defective_set for this image
                             predicted_defective_set = set()
                             for record in image_patch_records[image_paths[b]]:
-                                patch_x, patch_y = record["patch_coords"][1]
+                                coords = record.get("patch_coords", (None, []))[1]
+                                if not (isinstance(coords, (list, tuple)) and len(coords) == 8):
+                                    raise ValueError(f"Expected 8-value patch_coords, got: {coords}")
+                                patch_x, patch_y = int(coords[0]), int(coords[1])
                                 anomaly_map = record["anomaly_map_arithmetic_binary"][1]
                                 anomaly_pixels = np.sum(anomaly_map)
                                 if anomaly_pixels > 0:
@@ -2680,7 +2693,10 @@ def process_split_irregular_with_checkpoint(
                 # Build predicted_defective_set for this image
                 predicted_defective_set = set()
                 for record in patch_records:
-                    patch_x, patch_y = record["patch_coords"][1]
+                    coords = record.get("patch_coords", (None, []))[1]
+                    if not (isinstance(coords, (list, tuple)) and len(coords) == 8):
+                        raise ValueError(f"Expected 8-value patch_coords, got: {coords}")
+                    patch_x, patch_y = int(coords[0]), int(coords[1])
                     anomaly_map = record["anomaly_map_arithmetic_binary"][1]
                     anomaly_pixels = np.sum(anomaly_map)
                     if anomaly_pixels > 0:

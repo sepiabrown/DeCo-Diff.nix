@@ -190,18 +190,64 @@ class AnnotatedImageDataset(Dataset):
             raise ValueError(f"No patches extracted from image: {image_path}")
     
     def _extract_patches(self, img):
-        """Extract patches from image with overlap."""
+        """Extract patches from image without overlap, including edge patches."""
         patches = []
         coords = []
         
         height, width = img.shape[:2]
-        stride = self.patch_size // 2  # 50% overlap
+        stride = self.patch_size  # No overlap - patches are adjacent
         
-        for y in range(0, height - self.patch_size + 1, stride):
-            for x in range(0, width - self.patch_size + 1, stride):
-                patch = img[y:y + self.patch_size, x:x + self.patch_size]
+        # Calculate the range of patch positions
+        y_positions = list(range(0, height, stride))
+        x_positions = list(range(0, width, stride))
+        
+        # Ensure we include edge patches if they don't perfectly fit
+        if y_positions and height - y_positions[-1] >= self.patch_size:
+            # Last position already fits, no need to add edge patch
+            pass
+        elif y_positions and height - y_positions[-1] > 0:
+            # Add edge patch that starts at the position to capture the far-bottom
+            y_positions.append(max(0, height - self.patch_size))
+        
+        if x_positions and width - x_positions[-1] >= self.patch_size:
+            # Last position already fits, no need to add edge patch
+            pass
+        elif x_positions and width - x_positions[-1] > 0:
+            # Add edge patch that starts at the position to capture the far-right
+            x_positions.append(max(0, width - self.patch_size))
+        
+        # Remove duplicates while preserving order
+        y_positions = list(dict.fromkeys(y_positions))
+        x_positions = list(dict.fromkeys(x_positions))
+        
+        for y in y_positions:
+            for x in x_positions:
+                # Calculate actual patch dimensions
+                patch_width = min(self.patch_size, width - x)
+                patch_height = min(self.patch_size, height - y)
+                
+                # Extract patch
+                patch = img[y:y + patch_height, x:x + patch_width]
+                
+                # Pad patch to full size if necessary
+                if patch.shape[:2] != (self.patch_size, self.patch_size):
+                    padded_patch = np.zeros((self.patch_size, self.patch_size, 3), dtype=patch.dtype)
+                    padded_patch[:patch_height, :patch_width] = patch
+                    patch = padded_patch
+                
                 patches.append(patch)
                 coords.append((x, y))
+        
+        # Handle edge cases if image is smaller than patch_size
+        if height < self.patch_size or width < self.patch_size:
+            # Pad the entire image to patch_size and return as single patch
+            if not patches:  # Only if no patches were extracted
+                padded_img = np.zeros((self.patch_size, self.patch_size, 3), dtype=img.dtype)
+                actual_height = min(height, self.patch_size)
+                actual_width = min(width, self.patch_size)
+                padded_img[:actual_height, :actual_width] = img[:actual_height, :actual_width]
+                patches.append(padded_img)
+                coords.append((0, 0))
         
         return patches, coords
 
@@ -276,8 +322,19 @@ class CheckpointManager:
         self.evaluation_results_dir = os.path.join(results_dir, "evaluation_results")
         os.makedirs(self.evaluation_results_dir, exist_ok=True)
         
+        # Create checkpoint directory: <results_dir_without_timestamp>_checkpoints
+        results_dir_without_timestamp = self._remove_timestamp_from_path(results_dir)
+        self.checkpoint_dir = f"{results_dir_without_timestamp}_checkpoints"
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        
         if force_rerun:
             self.clear_checkpoint_files()
+    
+    def _remove_timestamp_from_path(self, path: str) -> str:
+        """Remove timestamp pattern from the full path."""
+        import re
+        # Remove timestamp patterns (YYMMDD_HHMMSS) from the end of the path
+        return re.sub(r'_\d{6}_\d{6}$', '', path)
     
     def _extract_base_name(self, results_dir: str) -> str:
         """Extract base name from results directory path."""
@@ -291,17 +348,14 @@ class CheckpointManager:
         return base_name
     
     def find_latest_checkpoint(self) -> str:
-        """Find the latest checkpoint file."""
+        """Find the checkpoint file."""
         base_name = self._extract_base_name(self.results_dir)
-        checkpoint_pattern = os.path.join(self.results_dir, f"{base_name}_checkpoint_*.json")
-        checkpoint_files = glob.glob(checkpoint_pattern)
+        checkpoint_file = os.path.join(self.checkpoint_dir, f"{base_name}_checkpoint.json")
         
-        if not checkpoint_files:
+        if os.path.exists(checkpoint_file):
+            return checkpoint_file
+        else:
             return None
-        
-        # Sort by modification time and return the latest
-        latest_checkpoint = max(checkpoint_files, key=os.path.getmtime)
-        return latest_checkpoint
     
     def get_checkpoint_data(self) -> dict:
         """Get checkpoint data from the latest checkpoint file."""
@@ -320,12 +374,12 @@ class CheckpointManager:
     def save_checkpoint(self, current_image_index: int, processed_images: list):
         """Save checkpoint data."""
         base_name = self._extract_base_name(self.results_dir)
-        timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
         checkpoint_file = os.path.join(
-            self.results_dir, 
-            f"{base_name}_checkpoint_{timestamp}.json"
+            self.checkpoint_dir, 
+            f"{base_name}_checkpoint.json"
         )
         
+        timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
         checkpoint_data = {
             'current_image_index': current_image_index,
             'processed_images': processed_images,
@@ -350,10 +404,10 @@ class CheckpointManager:
         checkpoint_data = self.get_checkpoint_data()
         checkpoint_data['processed_images'] = list(processed_images)
         
-        # Save to latest checkpoint file
-        latest_checkpoint = self.find_latest_checkpoint()
-        if latest_checkpoint:
-            with open(latest_checkpoint, 'w') as f:
+        # Save to checkpoint file
+        checkpoint_file = self.find_latest_checkpoint()
+        if checkpoint_file:
+            with open(checkpoint_file, 'w') as f:
                 json.dump(checkpoint_data, f, indent=2)
     
     def is_image_processed(self, image_path: str) -> bool:
@@ -377,25 +431,15 @@ class CheckpointManager:
     
     def cleanup_checkpoint(self):
         """Clean up old checkpoint files, keeping only the latest."""
-        base_name = self._extract_base_name(self.results_dir)
-        checkpoint_pattern = os.path.join(self.results_dir, f"{base_name}_checkpoint_*.json")
-        checkpoint_files = glob.glob(checkpoint_pattern)
-        
-        if len(checkpoint_files) > 1:
-            # Keep only the latest checkpoint
-            latest_checkpoint = max(checkpoint_files, key=os.path.getmtime)
-            for checkpoint_file in checkpoint_files:
-                if checkpoint_file != latest_checkpoint:
-                    os.remove(checkpoint_file)
-                    print(f"Removed old checkpoint: {checkpoint_file}")
+        # Since we now use a single checkpoint file, no cleanup is needed
+        pass
     
     def clear_checkpoint_files(self):
         """Clear all checkpoint files."""
         base_name = self._extract_base_name(self.results_dir)
-        checkpoint_pattern = os.path.join(self.results_dir, f"{base_name}_checkpoint_*.json")
-        checkpoint_files = glob.glob(checkpoint_pattern)
+        checkpoint_file = os.path.join(self.checkpoint_dir, f"{base_name}_checkpoint.json")
         
-        for checkpoint_file in checkpoint_files:
+        if os.path.exists(checkpoint_file):
             os.remove(checkpoint_file)
             print(f"Removed checkpoint: {checkpoint_file}")
     
@@ -408,10 +452,10 @@ class CheckpointManager:
         checkpoint_data = self.get_checkpoint_data()
         checkpoint_data['processed_images'] = list(processed_images)
         
-        # Save to latest checkpoint file
-        latest_checkpoint = self.find_latest_checkpoint()
-        if latest_checkpoint:
-            with open(latest_checkpoint, 'w') as f:
+        # Save to checkpoint file
+        checkpoint_file = self.find_latest_checkpoint()
+        if checkpoint_file:
+            with open(checkpoint_file, 'w') as f:
                 json.dump(checkpoint_data, f, indent=2)
     
     def print_checkpoint_status(self):
@@ -513,7 +557,8 @@ def evaluation_annotated_images(args, diffusion, model, vae):
         args.batch_num,
         device,
         checkpoint_manager.evaluation_results_dir,
-        args.patch_size
+        args.patch_size,
+        checkpoint_manager=checkpoint_manager
     )
 
 def process_split_irregular_minimal_diff(
@@ -527,7 +572,8 @@ def process_split_irregular_minimal_diff(
     batch_num: int,
     device: torch.device = torch.device("cpu"),
     save_dir: str = "minimal_diff_results",
-    patch_size: int = 256
+    patch_size: int = 256,
+    checkpoint_manager: "CheckpointManager" | None = None
 ) -> None:
     """
     Minimal function that only saves encodedrecon_dodrecon_diff and encoded_latent_diff_resized.
@@ -797,6 +843,32 @@ def process_split_irregular_minimal_diff(
                 PILImage.fromarray(latent_img).save(os.path.join(save_dir, f"{base_filename}_latent.png"))
                 PILImage.fromarray(anomaly_map_arithmetic_img).save(os.path.join(save_dir, f"{base_filename}_anomaly_map_arithmetic.png"))
             
+            # After finishing all patches for this image, update checkpoint
+            if checkpoint_manager is not None:
+                try:
+                    # Collect valid image paths (deduplicated)
+                    processed_image_paths = []
+                    for p in image_paths:
+                        if isinstance(p, str) and p:
+                            processed_image_paths.append(p)
+                        elif isinstance(p, (list, tuple)) and len(p) > 0:
+                            first = p[0]
+                            if isinstance(first, str) and first:
+                                processed_image_paths.append(first)
+                    unique_processed = sorted(set(processed_image_paths))
+
+                    # Merge with previously processed images (from latest checkpoint)
+                    previously_processed = checkpoint_manager.get_processed_images()
+                    merged = list(set(previously_processed).union(set(unique_processed)))
+
+                    # Save a new checkpoint reflecting progress up to current image index
+                    checkpoint_manager.save_checkpoint(
+                        current_image_index=idx + 1,
+                        processed_images=merged,
+                    )
+                except Exception as e:
+                    print(f"Warning: failed to save checkpoint after image {idx}: {e}")
+
             # Memory optimization: Clear cache every 10 batches
             if idx % 10 == 0 and idx > 0:
                 if torch.cuda.is_available():
@@ -902,6 +974,12 @@ def main():
         default=False,
         help="Force rerun evaluation even if checkpoint exists"
     )
+    parser.add_argument(
+        "--no-timestamp",
+        action="store_true",
+        default=False,
+        help="Do not append current time to results directory names (applies to --input-json batch mode)"
+    )
     args = parser.parse_args()
     
     # Handle input JSON if provided
@@ -926,7 +1004,7 @@ def main():
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
                     elif key in ['pretrained', 'data_dir', 'annotation_dir']:
                         value = os.path.expanduser(value)
-                    elif key in ['irregular_images', 'force_rerun']:
+                    elif key in ['irregular_images', 'force_rerun', 'no_timestamp']:
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
                     setattr(args, key, value)
             
@@ -937,8 +1015,11 @@ def main():
                 args.num_classes = 12
             elif args.dataset == "pcb":
                 args.num_classes = 1
-            current_time = datetime.now().strftime("%y%m%d_%H%M%S")
-            args.results_dir = f"results/{test_name}_{current_time}"
+            if getattr(args, 'no_timestamp', False):
+                args.results_dir = f"results/{test_name}"
+            else:
+                current_time = datetime.now().strftime("%y%m%d_%H%M%S")
+                args.results_dir = f"results/{test_name}_{current_time}"
             os.makedirs(args.results_dir, exist_ok=True)
             # INSERT_YOUR_CODE
             # Save the current test_args (key-value pairs) into the results_dir as a JSON file

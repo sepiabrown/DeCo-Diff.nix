@@ -25,16 +25,38 @@ import matplotlib.pyplot as plt
 
 # Import necessary functions from evaluation_DeCo_Diff2.py
 from evaluation_DeCo_Diff2 import (
-    make_record, _to_numpy, add_metric_fields, _binary_mask,
-    _get_largest_connected_component_pixels, _create_contour_based_binary_mask_single,
-    CheckpointManager, save_image_results_from_records, save_patch_results_from_records,
-    determine_image_status, compute_y_true_y_score, compute_metrics_from_y_true_y_score,
-    make_excel, plot_accuracy_results, save_perturbation_results, draw_patch_rectangles_on_image
+    make_record, _to_numpy, _binary_mask,
+    make_excel, draw_patch_rectangles_on_image
 )
+
+# Import utility functions
+from utils import path_to_safe_filename, safe_filename_to_path
 
 # Type definitions
 Kinded = Tuple[str, Any]  # (kind, value)
 Record = OrderedDict[str, Kinded]
+
+
+def _get_patch_base_key_from_filename(file_path: str) -> str:
+    """
+    Return a stable base key for a minimal_diff artifact by stripping the
+    suffix after "__minimal_diff" regardless of the specific type or extension.
+
+    Examples:
+      - "...__minimal_diff_encodedrecon.npy" -> "...__minimal_diff"
+      - "...__minimal_diff_coords.npy"      -> "...__minimal_diff"
+
+    The returned key matches for all artifacts (encodedrecon/latent/anomaly/coords)
+    that belong to the same patch.
+    """
+    name = os.path.basename(file_path)
+    stem, _ = os.path.splitext(name)
+    # Split once at the marker and use the left side (plus the marker itself)
+    parts = stem.split("__minimal_diff", 1)
+    if len(parts) == 0:
+        return stem
+    # Re-attach the marker so keys are unambiguous and consistent
+    return parts[0] + "__minimal_diff"
 
 def _binary_mask_exclude_boundary(diff: torch.Tensor, threshold: int = 5) -> torch.Tensor:
     """
@@ -347,35 +369,192 @@ def _binary_mask_exclude_boundary2(diff: torch.Tensor, threshold: int = 5, debug
     
     return result_tensor
 
-def path_to_safe_filename(file_path: str) -> str:
+def _binary_mask_exclude_boundary3(diff: torch.Tensor, threshold: int = 5, debug: bool = False, visualize: bool = False, save_path: str = None, filename: str = None) -> torch.Tensor:
     """
-    Convert an absolute file path to a safe filename by replacing path separators with underscores.
-    Handles Windows drive letters and both types of path separators.
-    Also replaces any file extension with __{extension} format.
+    Return a binary mask in ``{0, 1}`` based on *absolute* diff magnitude,
+    but exclude pixels that are adjacent to the boundary of the image,
+    and also exclude small connected components (less than 6 pixels) within 12 pixels of boundary.
+    
+    Args:
+        diff: Input tensor with shape (H, W) or (1, H, W)
+        threshold: Threshold value for binary conversion (0-255, default: 5)
+        debug: Enable debug output (default: False)
+        visualize: Enable visualization of the process (default: False)
+        save_path: Path to save visualization image (default: None, saves to current directory)
+        filename: Filename to check for "108826_198" pattern (default: None)
+        
+    Returns:
+        Binary tensor with same shape as input where boundary-adjacent pixels and small boundary components are excluded
     """
-    import re
-    normalized_path = os.path.normpath(file_path)
-    # Replace Windows drive letter at the start (e.g., C:\ or C:/, D:\ or D:/, etc.) with {drive}__
-    normalized_path = re.sub(r'^([a-zA-Z]):[\\/]', r'\1__', normalized_path)
-    # Replace all remaining path separators with double underscores
-    safe_name = re.sub(r'[\\/]', '__', normalized_path)
-    # Replace any file extension with __{extension} format
-    safe_name = re.sub(r'\.([a-zA-Z0-9]+)$', r'__\1', safe_name, flags=re.IGNORECASE)
-    return safe_name
+    
+    # Check if filename contains "108826_198" for debug and visualization
+    should_debug = debug and filename and "108826_198" in filename
+    should_visualize = visualize and filename and "108826_198" in filename
+    import cv2
+    import numpy as np
+    
+    # Create initial binary mask
+    binary_mask = _binary_mask(diff, threshold)
+    
+    # Convert to numpy for OpenCV operations
+    if binary_mask.dim() == 4 and binary_mask.shape[0] == 1 and binary_mask.shape[1] == 1:
+        binary_np = binary_mask.squeeze(0).squeeze(0).cpu().numpy()
+    elif binary_mask.dim() == 3 and binary_mask.shape[0] == 1:
+        binary_np = binary_mask.squeeze(0).cpu().numpy()
+    else:
+        binary_np = binary_mask.cpu().numpy()
+    
+    # Ensure binary values (0 or 1)
+    binary_np = (binary_np > 0).astype(np.uint8)
+    
+    # If the mask is all zeros, return as is
+    if np.all(binary_np == 0):
+        return binary_mask
+    
+    # Ensure we have a 2D array
+    if binary_np.ndim != 2:
+        print(f"Warning: Expected 2D array, got shape {binary_np.shape}")
+        return binary_mask
+    
+    # Create a mask for boundary pixels
+    h, w = binary_np.shape
+    boundary_mask = np.zeros((h, w), dtype=np.uint8)
+    
+    # Mark boundary pixels (first and last row/column)
+    boundary_mask[0, :] = 1      # Top row
+    boundary_mask[-1, :] = 1     # Bottom row
+    boundary_mask[:, 0] = 1      # Left column
+    boundary_mask[:, -1] = 1     # Right column
+    
+    # Create a mask for pixels to exclude
+    pixels_to_exclude = np.zeros_like(binary_np)
+    
+    # Create a distance map from boundary (12 pixels inward)
+    distance_from_boundary = np.zeros((h, w), dtype=np.uint8)
+    
+    remaining_binary = binary_np
+    
+    # Ensure remaining_binary is uint8 for OpenCV
+    remaining_binary = remaining_binary.astype(np.uint8)
+    
+    # Use connected components analysis to find individual pixels and small groups
+    num_labels, labels = cv2.connectedComponents(remaining_binary, connectivity=8)
+    
+    if should_debug:
+        print(f"Found {num_labels-1} connected components in remaining binary")
+    
+    # Check each connected component
+    for label in range(1, num_labels):  # Skip background (label 0)
+        # Create mask for this component
+        component_mask = (labels == label).astype(np.uint8)
+        component_pixels = np.sum(component_mask)
+        
+        if should_debug and component_pixels < 10:
+            # Find the position of this component
+            component_positions = np.where(component_mask > 0)
+            min_distances = []
+            for i, j in zip(component_positions[0], component_positions[1]):
+                min_distances.append(distance_from_boundary[i, j])
+            min_distance = min(min_distances) if min_distances else 999
+            
+            print(f"Component {label}: {component_pixels} pixels, min distance from boundary: {min_distance}")
+        
+        # If component has less than 6 pixels and is within 12 pixels of boundary
+        if component_pixels < 10:
+            # Check if any pixel in this component is within 12 pixels of boundary
+            pixels_to_exclude = np.logical_or(pixels_to_exclude, component_mask)
+            if should_debug:
+                print(f"  -> Excluded component {label} ({component_pixels} pixels)")
 
-def safe_filename_to_path(safe_filename: str) -> str:
-    """
-    Convert a safe filename back to an absolute file path.
-    This is the reverse of path_to_safe_filename.
-    """
-    import re
-    # Replace __{extension} format back to .{extension}
-    path = re.sub(r'__([a-zA-Z0-9]+)$', r'.\1', safe_filename, flags=re.IGNORECASE)
-    # Replace double underscores with path separators (use os.sep for cross-platform compatibility)
-    path = re.sub(r'__', os.sep, path)
-    # Replace drive letter format back to Windows format
-    path = re.sub(r'^([a-zA-Z])__', r'\1:' + os.sep, path)
-    return path
+    # Remove excluded pixels from the original binary mask
+    result_np = binary_np * (1 - pixels_to_exclude)
+    
+    if should_debug:
+        original_pixels = np.sum(binary_np)
+        excluded_pixels = np.sum(pixels_to_exclude)
+        remaining_pixels = np.sum(result_np)
+        print(f"Original pixels: {original_pixels}, Excluded: {excluded_pixels}, Remaining: {remaining_pixels}")
+        
+        # Check for any remaining 1-pixel components
+        remaining_labels, remaining_labels_array = cv2.connectedComponents(result_np.astype(np.uint8), connectivity=8)
+        single_pixels = 0
+        for label in range(1, remaining_labels):
+            component_mask = (remaining_labels_array == label).astype(np.uint8)
+            if np.sum(component_mask) == 1:
+                single_pixels += 1
+        print(f"Remaining single pixels: {single_pixels}")
+    
+    # Convert back to tensor
+    result_tensor = torch.from_numpy(result_np).float()
+    
+    # Move to the same device as input
+    if diff.is_cuda:
+        result_tensor = result_tensor.cuda()
+    
+    # Restore original tensor shape
+    if diff.dim() == 4:
+        result_tensor = result_tensor.unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, H, W)
+    elif diff.dim() == 3:
+        result_tensor = result_tensor.unsqueeze(0)  # Shape: (1, H, W)
+    # If diff.dim() == 2, keep as is (H, W)
+    
+    # Visualization
+    if should_visualize:
+        try:
+            import matplotlib.pyplot as plt
+            
+            # Get the original binary mask for comparison
+            original_binary = _binary_mask(diff, threshold)
+            if original_binary.dim() == 4:
+                original_binary_np = original_binary.squeeze(0).squeeze(0).cpu().numpy()
+            elif original_binary.dim() == 3:
+                original_binary_np = original_binary.squeeze(0).cpu().numpy()
+            else:
+                original_binary_np = original_binary.cpu().numpy()
+            
+            # Get the result as numpy array
+            if result_tensor.dim() == 4:
+                result_np_viz = result_tensor.squeeze(0).squeeze(0).cpu().numpy()
+            elif result_tensor.dim() == 3:
+                result_np_viz = result_tensor.squeeze(0).cpu().numpy()
+            else:
+                result_np_viz = result_tensor.cpu().numpy()
+            
+            # Create visualization
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            
+            # Original binary mask
+            axes[0].imshow(original_binary_np, cmap='gray')
+            axes[0].set_title(f'Original Binary Mask\n({np.sum(original_binary_np > 0)} pixels)')
+            axes[0].axis('off')
+            
+            # Excluded pixels mask
+            excluded_mask = original_binary_np * pixels_to_exclude
+            axes[1].imshow(excluded_mask, cmap='hot')
+            axes[1].set_title(f'Excluded Pixels\n({np.sum(excluded_mask > 0)} pixels)')
+            axes[1].axis('off')
+            
+            # Final result
+            axes[2].imshow(result_np_viz, cmap='gray')
+            axes[2].set_title(f'After Boundary Exclusion\n({np.sum(result_np_viz > 0)} pixels)')
+            axes[2].axis('off')
+            
+            plt.tight_layout()
+            
+            # Save or show the visualization
+            if save_path:
+                plt.savefig(save_path, dpi=150, bbox_inches='tight')
+                print(f"Visualization saved to: {save_path}")
+            
+            plt.show()
+            plt.close()
+            
+        except ImportError:
+            print("Warning: matplotlib not available for visualization")
+        except Exception as e:
+            print(f"Warning: Visualization failed: {e}")
+    
+    return result_tensor
 
 def load_ground_truth_map(annotation_dir: str) -> Dict[str, Set[Tuple[int, int]]]:
     """
@@ -433,12 +612,19 @@ def load_original_images(image_paths: Set[str]) -> Dict[str, np.ndarray]:
                 original_images[image_path] = original_image
             else:
                 # Try converting from safe filename to actual path
-                actual_path = safe_filename_to_path(image_path)
-                if os.path.exists(actual_path):
-                    original_image = np.array(PILImage.open(actual_path).convert('RGB'))
-                    original_images[image_path] = original_image  # Keep safe filename as key
+                # Only try this if the path looks like a safe filename (contains '__')
+                if '__' in image_path:
+                    try:
+                        actual_path = safe_filename_to_path(image_path)
+                        if os.path.exists(actual_path):
+                            original_image = np.array(PILImage.open(actual_path).convert('RGB'))
+                            original_images[image_path] = original_image  # Keep safe filename as key
+                        else:
+                            print(f"Warning: Original image not found: {image_path} (tried: {actual_path})")
+                    except Exception as e:
+                        print(f"Warning: Error converting safe filename {image_path}: {e}")
                 else:
-                    print(f"Warning: Original image not found: {image_path} (tried: {actual_path})")
+                    print(f"Warning@: Original image not found: {image_path}")
         except Exception as e:
             print(f"Warning: Error loading original image {image_path}: {e}")
     
@@ -539,6 +725,7 @@ def save_image_results_from_raw_data(
     ground_truth_map: Dict[str, Set[Tuple[int, int]]] = None,
     original_images: Dict[str, np.ndarray] = None,
     enable_save_optional_image_results: bool = False,
+    enable_save_whole_image_results: bool = False,
     patch_size: int = 128
 ) -> None:
     """
@@ -821,186 +1008,187 @@ def save_image_results_from_raw_data(
             save_side_by_side_image(original_patch, continuous_overlay, 
                                   os.path.join(status_folders[status], f"{patch_name}__ao_anomaly.png"))
     
-    ## Group records by image path for image-level processing
-    #image_records = {}
-    #for record in records:
-    #    image_path = record["image_path"][1]
-    #    if image_path not in image_records:
-    #        image_records[image_path] = []
-    #    image_records[image_path].append(record)
-    ## Process image-level images (full image reconstructions)
-    #for _, (image_path, image_record_list) in enumerate(tqdm(image_records.items(), desc="Saving image-level images")):        
-    #    # Build predicted defective set and ground truth defective set
-    #    predicted_defective_set = set()
-    #    
-    #    # Get ground truth defective set for this image
-    #    ground_truth_defective = ground_truth_map.get(image_path, set()) if ground_truth_map else set()
-    #    for record in image_record_list:
-    #        patch_x, patch_y = record["patch_coords"][1]
-    #        anomaly_pixels = record["anomaly_pixels"][1]
-    #        status = record["status"][1]
-    #        
-    #        # Calculate grid coordinates
-    #        grid_row = patch_y // patch_size
-    #        grid_col = patch_x // patch_size
-    #        
-    #        # Add to predicted defective set if predicted defective (use the same logic as in record creation)
-    #        if record["is_predicted_defective"][1]:
-    #            predicted_defective_set.add((grid_row, grid_col))
-    #    
-    #    # Calculate overlapping regions
-    #    overlapping = predicted_defective_set.intersection(ground_truth_defective)
-    #    
-    #    # Create image-level reconstruction (full image, not patch-level)
-    #    # Get image dimensions from the original image
-    #    image_path = image_record_list[0]["image_path"][1]
-    #    if original_images and image_path in original_images:
-    #        orig_image = original_images[image_path]
-    #        max_y, max_x = orig_image.shape[:2]  # Height, Width
-    #    else:
-    #        # Fallback: estimate from patch coordinates
-    #        max_x = max(record["patch_coords"][1][0] for record in image_record_list) + patch_size
-    #        max_y = max(record["patch_coords"][1][1] for record in image_record_list) + patch_size
-    #    
-    #    # Create full image reconstruction
-    #    full_image = np.zeros((max_y, max_x, 3), dtype=np.uint8)
-    #    
-    #    # Fill the full image with patch data
-    #    for record in image_record_list:
-    #        patch_x, patch_y = record["patch_coords"][1]
-    #        patch_data = record["orig"][1]
-    #        
-    #        # Convert patch data to RGB
-    #        if len(patch_data.shape) == 2:
-    #            patch_rgb = np.stack([patch_data] * 3, axis=-1)
-    #        else:
-    #            patch_rgb = patch_data
-    #        
-    #        # Convert to uint8
-    #        patch_rgb = (patch_rgb * 255).astype(np.uint8)
-    #        
-    #        # Ensure patch fits in the full image
-    #        patch_height = min(patch_size, max_y - patch_y)
-    #        patch_width = min(patch_size, max_x - patch_x)
-    #        if patch_height > 0 and patch_width > 0:
-    #            # Ensure patch_rgb has the right shape
-    #            if patch_rgb.shape[-1] == 1:
-    #                patch_rgb = np.repeat(patch_rgb, 3, axis=-1)
-    #            
-    #            full_image[patch_y:patch_y + patch_height, patch_x:patch_x + patch_width] = \
-    #                patch_rgb[:patch_height, :patch_width]
-    #    
-    #    # Create marked full image for image_level
-    #    marked_full_img = draw_patch_rectangles_on_image(
-    #        full_image, predicted_defective_set, ground_truth_defective, overlapping, 
-    #        patch_size=patch_size, grid_thickness=1
-    #    )
-    #    
-    #    # Create base name without patch coordinates for image_level
-    #    if image_record_list:
-    #        if "image_path_original" in image_record_list[0]:
-    #            file_info_original = image_record_list[0]["image_path_original"][1]
-    #        else:
-    #            file_info_original = image_record_list[0]["image_path"][1]
-    #        base_name = f"{file_info_original}"
-    #    else:
-    #        base_name = f"unknown_image"
-    #    
-    #    # Save in image_level directory
-    #    image_level_path = os.path.join(image_level_dir, f"{base_name}.png")
-    #    PILImage.fromarray(marked_full_img).save(image_level_path)
-    #    
-    #    # Create and save anomaly maps
-    #    # Create anomaly maps for the full image
-    #    anomaly_maps = {
-    #        'arithmetic': np.zeros((max_y, max_x), dtype=np.float32),
-    #        'arithmetic_binary': np.zeros((max_y, max_x), dtype=np.float32),
-    #    }
-    #    
-    #    # Fill anomaly maps with patch data
-    #    for record in image_record_list:
-    #        patch_x, patch_y = record["patch_coords"][1]
-    #        patch_arithmetic = record["anomaly_map_arithmetic"][1]
-    #        patch_arithmetic_binary = record["anomaly_map_arithmetic_binary"][1]
-    #        
-    #        # Ensure patch data is 2D by squeezing extra dimensions
-    #        if len(patch_arithmetic.shape) > 2:
-    #            patch_arithmetic = patch_arithmetic.squeeze()
-    #        if len(patch_arithmetic_binary.shape) > 2:
-    #            patch_arithmetic_binary = patch_arithmetic_binary.squeeze()
-    #        
-    #        # Ensure patch data fits in the map
-    #        patch_height = min(patch_size, max_y - patch_y)
-    #        patch_width = min(patch_size, max_x - patch_x)
-    #        
-    #        if patch_height > 0 and patch_width > 0:
-    #            # Ensure patch data is cropped to match the available space
-    #            # The patch data in records is always full size (128x128), so we need to crop it
-    #            patch_arithmetic_cropped = patch_arithmetic[:patch_height, :patch_width]
-    #            
-    #            # Handle 1D binary arrays by reshaping them to 2D
-    #            if len(patch_arithmetic_binary.shape) == 1:
-    #                # If it's 1D, reshape it to match the expected dimensions
-    #                if patch_arithmetic_binary.shape[0] == patch_height * patch_width:
-    #                    patch_arithmetic_binary = patch_arithmetic_binary.reshape(patch_height, patch_width)
-    #                else:
-    #                    # If the size doesn't match, create a zero array of the correct size
-    #                    patch_arithmetic_binary = np.zeros((patch_height, patch_width), dtype=patch_arithmetic_binary.dtype)
-    #            
-    #            patch_arithmetic_binary_cropped = patch_arithmetic_binary[:patch_height, :patch_width]
-    #            
-    #            anomaly_maps['arithmetic'][patch_y:patch_y + patch_height, patch_x:patch_x + patch_width] = \
-    #                patch_arithmetic_cropped
-    #            anomaly_maps['arithmetic_binary'][patch_y:patch_y + patch_height, patch_x:patch_x + patch_width] = \
-    #                patch_arithmetic_binary_cropped
-    #    
-    #    # Save anomaly maps
-    #    for map_name, map_data in anomaly_maps.items():
-    #        # Create overlay images (anomaly map overlaid on original image)
-    #        # Try to load the original image from the file path
-    #        original_image = None
-    #        try:
-    #            # Extract the original image path from the filename
-    #            # The file_path in the record contains the original path
-    #            original_image_path = image_path
-    #            if os.path.exists(original_image_path):
-    #                original_image = np.array(PILImage.open(original_image_path).convert('RGB'))
-    #                # print(f"Loaded original image: {original_image_path}")
-    #            else:
-    #                # print(f"Original image not found: {original_image_path}, using reconstructed image")
-    #                original_image = full_image.copy()
-    #        except Exception as e:
-    #            # print(f"Error loading original image {image_path}: {e}, using reconstructed image")
-    #            original_image = full_image.copy()
-    #        # Create anomaly map image
-    #        is_binary = map_name.endswith('_binary')
-    #        map_img = create_anomaly_map_image(map_data, is_binary=is_binary)
-    #        
-    #        # Save side-by-side image
-    #        save_side_by_side_image(original_image, map_img, 
-    #                              os.path.join(anomaly_maps_dir, f"{base_name}__{map_name}.png"))
-    #        # Create overlay
-    #        is_binary = map_name.endswith('_binary')
-    #        overlay = create_anomaly_overlay(original_image, map_data, is_binary=is_binary)
-    #        
-    #        # Save side-by-side overlay image
-    #        save_side_by_side_image(original_image, overlay, 
-    #                              os.path.join(anomaly_maps_dir, f"{base_name}__ao_{map_name}.png"))
-    #        
-    #        # Create marked overlay (overlay with patch rectangles)
-    #        marked_overlay = draw_patch_rectangles_on_image(
-    #            overlay, predicted_defective_set, ground_truth_defective, overlapping, 
-    #            patch_size=patch_size, grid_thickness=1
-    #        )
-    #        
-    #        # Create side-by-side image: original image on left, marked overlay on right
-    #        side_by_side_marked_overlay = np.hstack([original_image, marked_overlay])
-    #        
-    #        # Save side-by-side marked overlay image
-    #        marked_overlay_path = os.path.join(anomaly_maps_dir, f"{base_name}__mo_{map_name}.png")
-    #        PILImage.fromarray(side_by_side_marked_overlay).save(marked_overlay_path)
-    #
-    #print(f"Image results saved to: {output_dir}")
+    if enable_save_whole_image_results:
+        ## Group records by image path for image-level processing
+        image_records = {}
+        for record in records:
+            image_path = record["image_path"][1]
+            if image_path not in image_records:
+                image_records[image_path] = []
+            image_records[image_path].append(record)
+        # Process image-level images (full image reconstructions)
+        for _, (image_path, image_record_list) in enumerate(tqdm(image_records.items(), desc="Saving image-level images")):        
+            # Build predicted defective set and ground truth defective set
+            predicted_defective_set = set()
+
+            # Get ground truth defective set for this image
+            ground_truth_defective = ground_truth_map.get(image_path, set()) if ground_truth_map else set()
+            for record in image_record_list:
+                patch_x, patch_y = record["patch_coords"][1]
+                anomaly_pixels = record["anomaly_pixels"][1]
+                status = record["status"][1]
+
+                # Calculate grid coordinates
+                grid_row = patch_y // patch_size
+                grid_col = patch_x // patch_size
+
+                # Add to predicted defective set if predicted defective (use the same logic as in record creation)
+                if record["is_predicted_defective"][1]:
+                    predicted_defective_set.add((grid_row, grid_col))
+
+            # Calculate overlapping regions
+            overlapping = predicted_defective_set.intersection(ground_truth_defective)
+
+            # Create image-level reconstruction (full image, not patch-level)
+            # Get image dimensions from the original image
+            image_path = image_record_list[0]["image_path"][1]
+            if original_images and image_path in original_images:
+                orig_image = original_images[image_path]
+                max_y, max_x = orig_image.shape[:2]  # Height, Width
+            else:
+                # Fallback: estimate from patch coordinates
+                max_x = max(record["patch_coords"][1][0] for record in image_record_list) + patch_size
+                max_y = max(record["patch_coords"][1][1] for record in image_record_list) + patch_size
+
+            # Create full image reconstruction
+            full_image = np.zeros((max_y, max_x, 3), dtype=np.uint8)
+
+            # Fill the full image with patch data
+            for record in image_record_list:
+                patch_x, patch_y = record["patch_coords"][1]
+                patch_data = record["orig"][1]
+
+                # Convert patch data to RGB
+                if len(patch_data.shape) == 2:
+                    patch_rgb = np.stack([patch_data] * 3, axis=-1)
+                else:
+                    patch_rgb = patch_data
+
+                # Convert to uint8
+                patch_rgb = (patch_rgb * 255).astype(np.uint8)
+
+                # Ensure patch fits in the full image
+                patch_height = min(patch_size, max_y - patch_y)
+                patch_width = min(patch_size, max_x - patch_x)
+                if patch_height > 0 and patch_width > 0:
+                    # Ensure patch_rgb has the right shape
+                    if patch_rgb.shape[-1] == 1:
+                        patch_rgb = np.repeat(patch_rgb, 3, axis=-1)
+
+                    full_image[patch_y:patch_y + patch_height, patch_x:patch_x + patch_width] = \
+                        patch_rgb[:patch_height, :patch_width]
+
+            # Create marked full image for image_level
+            marked_full_img = draw_patch_rectangles_on_image(
+                full_image, predicted_defective_set, ground_truth_defective, overlapping, 
+                patch_size=patch_size, grid_thickness=1
+            )
+
+            # Create base name without patch coordinates for image_level
+            if image_record_list:
+                if "image_path_original" in image_record_list[0]:
+                    file_info_original = image_record_list[0]["image_path_original"][1]
+                else:
+                    file_info_original = image_record_list[0]["image_path"][1]
+                base_name = f"{file_info_original}"
+            else:
+                base_name = f"unknown_image"
+
+            # Save in image_level directory
+            image_level_path = os.path.join(image_level_dir, f"{base_name}.png")
+            PILImage.fromarray(marked_full_img).save(image_level_path)
+
+            # Create and save anomaly maps
+            # Create anomaly maps for the full image
+            anomaly_maps = {
+                'arithmetic': np.zeros((max_y, max_x), dtype=np.float32),
+                'arithmetic_binary': np.zeros((max_y, max_x), dtype=np.float32),
+            }
+
+            # Fill anomaly maps with patch data
+            for record in image_record_list:
+                patch_x, patch_y = record["patch_coords"][1]
+                patch_arithmetic = record["anomaly_map_arithmetic"][1]
+                patch_arithmetic_binary = record["anomaly_map_arithmetic_binary"][1]
+
+                # Ensure patch data is 2D by squeezing extra dimensions
+                if len(patch_arithmetic.shape) > 2:
+                    patch_arithmetic = patch_arithmetic.squeeze()
+                if len(patch_arithmetic_binary.shape) > 2:
+                    patch_arithmetic_binary = patch_arithmetic_binary.squeeze()
+
+                # Ensure patch data fits in the map
+                patch_height = min(patch_size, max_y - patch_y)
+                patch_width = min(patch_size, max_x - patch_x)
+
+                if patch_height > 0 and patch_width > 0:
+                    # Ensure patch data is cropped to match the available space
+                    # The patch data in records is always full size (128x128), so we need to crop it
+                    patch_arithmetic_cropped = patch_arithmetic[:patch_height, :patch_width]
+
+                    # Handle 1D binary arrays by reshaping them to 2D
+                    if len(patch_arithmetic_binary.shape) == 1:
+                        # If it's 1D, reshape it to match the expected dimensions
+                        if patch_arithmetic_binary.shape[0] == patch_height * patch_width:
+                            patch_arithmetic_binary = patch_arithmetic_binary.reshape(patch_height, patch_width)
+                        else:
+                            # If the size doesn't match, create a zero array of the correct size
+                            patch_arithmetic_binary = np.zeros((patch_height, patch_width), dtype=patch_arithmetic_binary.dtype)
+
+                    patch_arithmetic_binary_cropped = patch_arithmetic_binary[:patch_height, :patch_width]
+
+                    anomaly_maps['arithmetic'][patch_y:patch_y + patch_height, patch_x:patch_x + patch_width] = \
+                        patch_arithmetic_cropped
+                    anomaly_maps['arithmetic_binary'][patch_y:patch_y + patch_height, patch_x:patch_x + patch_width] = \
+                        patch_arithmetic_binary_cropped
+
+            # Save anomaly maps
+            for map_name, map_data in anomaly_maps.items():
+                # Create overlay images (anomaly map overlaid on original image)
+                # Try to load the original image from the file path
+                original_image = None
+                try:
+                    # Extract the original image path from the filename
+                    # The file_path in the record contains the original path
+                    original_image_path = image_path
+                    if os.path.exists(original_image_path):
+                        original_image = np.array(PILImage.open(original_image_path).convert('RGB'))
+                        # print(f"Loaded original image: {original_image_path}")
+                    else:
+                        # print(f"Original image not found: {original_image_path}, using reconstructed image")
+                        original_image = full_image.copy()
+                except Exception as e:
+                    # print(f"Error loading original image {image_path}: {e}, using reconstructed image")
+                    original_image = full_image.copy()
+                # Create anomaly map image
+                is_binary = map_name.endswith('_binary')
+                map_img = create_anomaly_map_image(map_data, is_binary=is_binary)
+
+                # Save side-by-side image
+                save_side_by_side_image(original_image, map_img, 
+                                      os.path.join(anomaly_maps_dir, f"{base_name}__{map_name}.png"))
+                # Create overlay
+                is_binary = map_name.endswith('_binary')
+                overlay = create_anomaly_overlay(original_image, map_data, is_binary=is_binary)
+
+                # Save side-by-side overlay image
+                save_side_by_side_image(original_image, overlay, 
+                                      os.path.join(anomaly_maps_dir, f"{base_name}__ao_{map_name}.png"))
+
+                # Create marked overlay (overlay with patch rectangles)
+                marked_overlay = draw_patch_rectangles_on_image(
+                    overlay, predicted_defective_set, ground_truth_defective, overlapping, 
+                    patch_size=patch_size, grid_thickness=1
+                )
+
+                # Create side-by-side image: original image on left, marked overlay on right
+                side_by_side_marked_overlay = np.hstack([original_image, marked_overlay])
+
+                # Save side-by-side marked overlay image
+                marked_overlay_path = os.path.join(anomaly_maps_dir, f"{base_name}__mo_{map_name}.png")
+                PILImage.fromarray(side_by_side_marked_overlay).save(marked_overlay_path)
+
+        print(f"Image results saved to: {output_dir}")
 
 def save_json_results_from_raw_data(
     records: List[Record],
@@ -1241,8 +1429,11 @@ def parse_filename_to_info(filename: str) -> Dict[str, Any]:
     coords = [int(x) for x in match.groups()]
     x1, y1, x2, y2, x3, y3, x4, y4 = coords
     
-    # Extract patch coordinates (top-left corner)
+    # Extract patch coordinates (top-left corner for compatibility)
     patch_x, patch_y = x1, y1
+    
+    # Store all 8 coordinate values
+    patch_coords_8_values = coords
     
     # Reconstruct original file path
     # Replace double underscores with path separators, but handle file extensions properly
@@ -1261,16 +1452,42 @@ def parse_filename_to_info(filename: str) -> Dict[str, Any]:
         drive_letter = file_path[0]
         file_path = file_path.replace(f'{drive_letter}/', f'{drive_letter}:\\')
         file_path = file_path.replace('/', '\\')
-    
+
     return {
         'file_path': file_path,
         'file_info': file_info, # Store the original file_info for reconstruction
         'patch_x': patch_x,
         'patch_y': patch_y,
-        'patch_coords': (patch_x, patch_y),
+        'patch_coords': patch_coords_8_values,  # Now returns all 8 values
         'data_type': data_type,
         'filename': filename
     }
+
+def load_coordinates_directly(results_dir: str) -> Dict[str, List[int]]:
+    """
+    Load coordinates directly from _coords.npy files.
+    
+    Returns:
+        Dict mapping base_filename to 8-value coordinates list
+    """
+    coords_files = glob.glob(os.path.join(results_dir, "**/*_coords.npy"), recursive=True)
+    coordinates = {}
+    
+    for coords_file in coords_files:
+        try:
+            # Build a stable key shared across all artifacts of the same patch
+            base_key = _get_patch_base_key_from_filename(coords_file)
+            
+            # Load 8-value coordinates
+            coords_8_values = np.load(coords_file).tolist()
+            coordinates[base_key] = coords_8_values
+            
+        except Exception as e:
+            print(f"Warning: Could not load coordinates from {coords_file}: {e}")
+    
+    print(f"Loaded coordinates for {len(coordinates)} patches from _coords.npy files")
+    return coordinates
+
 
 def load_raw_data_files(results_dir: str, visualize: bool = False) -> Dict[str, Dict[str, np.ndarray]]:
     """
@@ -1283,6 +1500,9 @@ def load_raw_data_files(results_dir: str, visualize: bool = False) -> Dict[str, 
     Returns:
         Dict mapping patch_key to dict of data arrays
     """
+    # Load coordinates directly from _coords.npy files first
+    direct_coordinates = load_coordinates_directly(results_dir)
+    
     # Find all .npy files
     npy_files = glob.glob(os.path.join(results_dir, "**/*.npy"), recursive=True)
     
@@ -1346,12 +1566,22 @@ def load_raw_data_files(results_dir: str, visualize: bool = False) -> Dict[str, 
                     print(f"Warning: Visualization failed: {e}")
             
             if patch_key not in patch_data:
+                # Use a stable base key to look up coordinates loaded from _coords.npy
+                base_key = _get_patch_base_key_from_filename(filename)
+
+                if base_key in direct_coordinates:
+                    coords_8_values = direct_coordinates[base_key]
+                    #print(f"Debug: Using direct coords for {base_key}: {coords_8_values}")
+                else:
+                    coords_8_values = info['patch_coords']  # From filename parsing (8 values)
+                    #print(f"Debug: Using filename coords for {base_key}: {coords_8_values}")
+
                 patch_data[patch_key] = {
                     'file_path': info['file_path'],
                     'file_path_original': info['file_info'],  # Store original format with __png
                     'patch_x': info['patch_x'],
                     'patch_y': info['patch_y'],
-                    'patch_coords': info['patch_coords']
+                    'patch_coords': coords_8_values  # Always 8 values
                 }
             
             patch_data[patch_key][info['data_type']] = data
@@ -1390,7 +1620,14 @@ def reconstruct_records_from_raw_data(
     
     for patch_key, data in tqdm(patch_data.items(), desc="Processing patches"):
         file_path = data['file_path']
-        patch_x, patch_y = data['patch_coords']
+        patch_coords_8_values = data['patch_coords']  # Now contains 8 values
+        
+        # Extract top-left corner coordinates for compatibility
+        if isinstance(patch_coords_8_values, (list, tuple)) and len(patch_coords_8_values) == 8:
+            x1, y1, x2, y2, x3, y3, x4, y4 = patch_coords_8_values
+            patch_x, patch_y = x1, y1  # Top-left corner
+        else:
+            raise ValueError(f"Expected 8-value patch coordinates, got: {patch_coords_8_values}")
         
         # Load the raw data arrays
         encodedrecon_raw = data['encodedrecon']
@@ -1404,7 +1641,7 @@ def reconstruct_records_from_raw_data(
         
         # Create binary masks
         #anomaly_map_arithmetic_binary = _binary_mask(anomaly_map_arithmetic_tensor, anomaly_binary_threshold)
-        anomaly_map_arithmetic_binary = _binary_mask_exclude_boundary2(anomaly_map_arithmetic_tensor, anomaly_binary_threshold, visualize=True, debug=True, filename=file_path)
+        anomaly_map_arithmetic_binary = _binary_mask_exclude_boundary3(anomaly_map_arithmetic_tensor, anomaly_binary_threshold, visualize=True, debug=True, filename=file_path)
         #anomaly_map_arithmetic_binary_raw = _binary_mask(anomaly_map_arithmetic_tensor, anomaly_binary_threshold)
         
         # Debug and visualize anomaly_map_arithmetic_binary if file_path includes "108826_198"
@@ -1520,7 +1757,7 @@ def reconstruct_records_from_raw_data(
             image_path=("meta", file_path),  # Reconstructed path for loading original images
             image_path_original=("meta", data['file_path_original']),  # Original format for output filenames
             anomaly_class=("meta", "all"),  # Default anomaly class
-            patch_coords=("meta", (patch_x, patch_y)),
+            patch_coords=("meta", patch_coords_8_values),
             anomaly_max=("meta", anomaly_max),
             anomaly_pixels=("meta", anomaly_pixels),
             #anomaly_pixels_raw=("meta", anomaly_pixels_raw),
@@ -1635,8 +1872,9 @@ def process_raw_data_to_results(
     anomaly_pixel_num_threshold: int = 0,
     adaptive_threshold: float = 0.1,
     enable_excel_report: bool = False,
-    enable_save_optional_image_results: bool = False,
     enable_save_image_results: bool = False,
+    enable_save_optional_image_results: bool = False,
+    enable_save_whole_image_results: bool = False,
     enable_save_json_results: bool = False,
     enable_confusion_matrix: bool = False,
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1652,7 +1890,6 @@ def process_raw_data_to_results(
     
     # Load ground truth map once
     ground_truth_map = load_ground_truth_map(annotation_dir)
-
     print(f"Loaded ground truth for {len(ground_truth_map)} images")
     
     # Load all raw data files
@@ -1732,6 +1969,7 @@ def process_raw_data_to_results(
                     ground_truth_map=ground_truth_map,
                     original_images=original_images,
                     enable_save_optional_image_results=enable_save_optional_image_results,
+                    enable_save_whole_image_results=enable_save_whole_image_results,
                     patch_size=patch_size
                 )
 
@@ -1765,10 +2003,12 @@ def main():
                        help="Adaptive threshold for contour-based binary masks")
     parser.add_argument("--enable-excel-report", action="store_true",
                        help="Generate Excel report")
-    parser.add_argument("--enable-save-optional-image-results", action="store_true",
-                       help="Save optional image results")
     parser.add_argument("--enable-save-image-results", action="store_true",
                        help="Save image results (marked images and anomaly maps)")
+    parser.add_argument("--enable-save-optional-image-results", action="store_true",
+                       help="Save optional image results")
+    parser.add_argument("--enable-save-whole-image-results", action="store_true",
+                       help="Save whole image results")
     parser.add_argument("--enable-save-json-results", action="store_true",
                        help="Save JSON results (evaluation files per image)")
     parser.add_argument("--enable-confusion-matrix", action="store_true",
@@ -1808,7 +2048,7 @@ def main():
                         value = os.path.expanduser(value)
                     elif key in ['enable_excel_report', 'enable_save_optional_image_results', 
                                'enable_save_image_results', 'enable_save_json_results', 
-                               'enable_confusion_matrix']:
+                               'enable_confusion_matrix', 'enable_save_whole_image_results']:
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
                     setattr(args, key, value)
     
@@ -1838,8 +2078,9 @@ def main():
         anomaly_pixel_num_threshold=args.anomaly_pixel_num_threshold,
         adaptive_threshold=args.adaptive_threshold,
         enable_excel_report=args.enable_excel_report,
-        enable_save_optional_image_results=args.enable_save_optional_image_results,
         enable_save_image_results=args.enable_save_image_results,
+        enable_save_optional_image_results=args.enable_save_optional_image_results,
+        enable_save_whole_image_results=args.enable_save_whole_image_results,
         enable_save_json_results=args.enable_save_json_results,
         enable_confusion_matrix=args.enable_confusion_matrix,
         device=device
