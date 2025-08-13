@@ -1471,21 +1471,143 @@ def load_coordinates_directly(results_dir: str) -> Dict[str, List[int]]:
         Dict mapping base_filename to 8-value coordinates list
     """
     coords_files = glob.glob(os.path.join(results_dir, "**/*_coords.npy"), recursive=True)
+    print(f"Found {len(coords_files)} coordinate files to process")
     coordinates = {}
+    failed_files = 0
     
-    for coords_file in coords_files:
+    for i, coords_file in enumerate(coords_files):
         try:
             # Build a stable key shared across all artifacts of the same patch
             base_key = _get_patch_base_key_from_filename(coords_file)
             
             # Load 8-value coordinates
-            coords_8_values = np.load(coords_file).tolist()
+            coords_raw = np.load(coords_file)
+            
+            # Only show debug info for first few files to avoid overwhelming output
+            if i < 3:
+                print(f"Debug: Loading coordinates from {coords_file}")
+                print(f"  Raw coords shape: {coords_raw.shape}")
+                print(f"  Raw coords dtype: {coords_raw.dtype}")
+                print(f"  Raw coords: {coords_raw}")
+            
+            # Fix: Handle case where coordinates are saved as 2D arrays
+            if len(coords_raw.shape) == 2:
+                if i < 3:
+                    print(f"  Warning: 2D coordinate array detected with shape {coords_raw.shape}")
+                    print(f"  This suggests coordinates were saved incorrectly during the save phase")
+                
+                # If it's [8, N] shape, take the first N values
+                # If it's [N, 8] shape, transpose and take the first N values
+                if coords_raw.shape[0] == 8:
+                    # Shape is [8, N] - take first value from each coordinate
+                    coords_8_values = coords_raw[:, 0].tolist()
+                    if i < 3:
+                        print(f"  Fixed [8, N] coordinates to: {coords_8_values}")
+                elif coords_raw.shape[1] == 8:
+                    # Shape is [N, 8] - take first row
+                    coords_8_values = coords_raw[0, :].tolist()
+                    if i < 3:
+                        print(f"  Fixed [N, 8] coordinates to: {coords_8_values}")
+                else:
+                    # Unexpected shape, try to extract 8 values
+                    if i < 3:
+                        print(f"  Unexpected 2D shape, attempting to extract 8 values...")
+                    coords_8_values = coords_raw.flatten()[:8].tolist()
+                    if i < 3:
+                        print(f"  Extracted coordinates: {coords_8_values}")
+            else:
+                # Normal 1D array case
+                coords_8_values = coords_raw.tolist()
+            
+            if i < 3:
+                print(f"  Converted to list: {coords_8_values}")
+                print(f"  List type: {type(coords_8_values)}")
+                print(f"  List length: {len(coords_8_values)}")
+                if len(coords_8_values) > 0:
+                    print(f"  First element type: {type(coords_8_values[0])}")
+                    print(f"  First element: {coords_8_values[0]}")
+            
+            # Fix: If coordinates are nested lists, flatten them
+            if len(coords_8_values) == 8 and isinstance(coords_8_values[0], (list, tuple)):
+                if i < 3:
+                    print(f"  Warning: Nested coordinates detected, flattening...")
+                # Extract first value from each coordinate list
+                coords_8_values = [coord[0] if isinstance(coord, (list, tuple)) else coord for coord in coords_8_values]
+                if i < 3:
+                    print(f"  Flattened coordinates: {coords_8_values}")
+            
+            # Additional fix: Handle case where coordinates are 2D arrays (e.g., [8, 16] shape)
+            # This happens when coordinates were saved incorrectly during the save phase
+            if len(coords_8_values) == 8 and isinstance(coords_8_values[0], (list, tuple)):
+                # Check if this is a 2D array case where each coordinate has multiple values
+                first_coord_length = len(coords_8_values[0])
+                if first_coord_length > 1:
+                    if i < 3:
+                        print(f"  Warning: 2D coordinate array detected with {first_coord_length} values per coordinate")
+                        print(f"  This suggests coordinates were saved incorrectly during the save phase")
+                    
+                    # Take the first value from each coordinate (most common case)
+                    # Alternative: could take mean, median, or other aggregation
+                    coords_8_values = [coord[0] if isinstance(coord, (list, tuple)) else coord for coord in coords_8_values]
+                    if i < 3:
+                        print(f"  Fixed 2D coordinates to: {coords_8_values}")
+            
+            # Validate: Ensure all coordinates are integers
+            try:
+                coords_8_values = [int(coord) for coord in coords_8_values]
+                if i < 3:
+                    print(f"  Validated coordinates: {coords_8_values}")
+            except (ValueError, TypeError) as e:
+                print(f"  Error: Invalid coordinate values: {e}")
+                print(f"  Raw coordinates: {coords_8_values}")
+                continue  # Skip this file if coordinates are invalid
+            
+            # Final validation: Ensure we have exactly 8 coordinates
+            if len(coords_8_values) != 8:
+                print(f"  Error: Expected 8 coordinates, got {len(coords_8_values)}")
+                print(f"  Raw coordinates: {coords_8_values}")
+                continue  # Skip this file if coordinate count is wrong
+            
+            # Final validation: Ensure all coordinates are single integers (not lists)
+            if any(isinstance(coord, (list, tuple)) for coord in coords_8_values):
+                print(f"  Error: Coordinates still contain nested structures after processing")
+                print(f"  Final coordinates: {coords_8_values}")
+                continue  # Skip this file if coordinates are still nested
+            
             coordinates[base_key] = coords_8_values
             
         except Exception as e:
             print(f"Warning: Could not load coordinates from {coords_file}: {e}")
+            failed_files += 1
     
     print(f"Loaded coordinates for {len(coordinates)} patches from _coords.npy files")
+    if failed_files > 0:
+        print(f"Failed to load {failed_files} coordinate files")
+    
+    # Show summary of coordinate validation
+    if coordinates:
+        sample_coords = list(coordinates.values())[0]
+        print(f"Sample coordinates: {sample_coords}")
+        print(f"Coordinate format: {len(sample_coords)} values, all integers")
+        
+        # Additional validation
+        all_valid = all(
+            isinstance(coord, int) and not isinstance(coord, (list, tuple)) 
+            for coord in sample_coords
+        )
+        print(f"Coordinate validation: {'✅ PASSED' if all_valid else '❌ FAILED'}")
+        
+        if not all_valid:
+            print(f"  Invalid coordinate types found: {[type(coord) for coord in sample_coords]}")
+            print(f"  This indicates a serious issue with coordinate loading")
+    else:
+        print("⚠️  No valid coordinates loaded!")
+        print("   This will cause the process to fail. Check the coordinate files above.")
+        print("   Possible causes:")
+        print("   1. All coordinate files have invalid formats")
+        print("   2. Coordinate files were corrupted during save")
+        print("   3. File permissions or path issues")
+    
     return coordinates
 
 
@@ -1502,6 +1624,12 @@ def load_raw_data_files(results_dir: str, visualize: bool = False) -> Dict[str, 
     """
     # Load coordinates directly from _coords.npy files first
     direct_coordinates = load_coordinates_directly(results_dir)
+    
+    # If no coordinates were loaded, warn the user
+    if not direct_coordinates:
+        print("⚠️  Warning: No coordinates loaded from _coords.npy files")
+        print("   Will fall back to filename parsing for coordinates")
+        print("   This may result in incomplete coordinate information")
     
     # Find all .npy files
     npy_files = glob.glob(os.path.join(results_dir, "**/*.npy"), recursive=True)
@@ -1576,11 +1704,43 @@ def load_raw_data_files(results_dir: str, visualize: bool = False) -> Dict[str, 
                     coords_8_values = info['patch_coords']  # From filename parsing (8 values)
                     #print(f"Debug: Using filename coords for {base_key}: {coords_8_values}")
 
+                # Extract the actual patch coordinates from the 8-value coordinates
+                # Ensure we have proper x, y coordinates for the top-left corner
+                if isinstance(coords_8_values, (list, tuple)) and len(coords_8_values) == 8:
+                    x1, y1 = coords_8_values[0], coords_8_values[1]  # Top-left corner
+                    # Ensure these are integers
+                    if isinstance(x1, (list, tuple)):
+                        x1 = x1[0] if len(x1) > 0 else 0
+                    if isinstance(y1, (list, tuple)):
+                        y1 = y1[0] if len(y1) > 0 else 0
+                    actual_patch_x = int(x1)
+                    actual_patch_y = int(y1)
+                    
+                    # Debug output for first few patches
+                    if len(patch_data) < 3:
+                        print(f"Debug: Extracted coordinates for {patch_key}")
+                        print(f"  coords_8_values: {coords_8_values}")
+                        print(f"  x1: {x1} (type: {type(x1)})")
+                        print(f"  y1: {y1} (type: {type(y1)})")
+                        print(f"  actual_patch_x: {actual_patch_x} (type: {type(actual_patch_x)})")
+                        print(f"  actual_patch_y: {actual_patch_y} (type: {type(actual_patch_y)})")
+                else:
+                    # Fallback to filename-parsed coordinates
+                    actual_patch_x = info['patch_x']
+                    actual_patch_y = info['patch_y']
+                    
+                    # Debug output for fallback case
+                    if len(patch_data) < 3:
+                        print(f"Debug: Using fallback coordinates for {patch_key}")
+                        print(f"  coords_8_values: {coords_8_values}")
+                        print(f"  fallback patch_x: {actual_patch_x} (type: {type(actual_patch_x)})")
+                        print(f"  fallback patch_y: {actual_patch_y} (type: {type(actual_patch_y)})")
+                
                 patch_data[patch_key] = {
                     'file_path': info['file_path'],
                     'file_path_original': info['file_info'],  # Store original format with __png
-                    'patch_x': info['patch_x'],
-                    'patch_y': info['patch_y'],
+                    'patch_x': actual_patch_x,  # Use the properly extracted coordinates
+                    'patch_y': actual_patch_y,  # Use the properly extracted coordinates
                     'patch_coords': coords_8_values  # Always 8 values
                 }
             
@@ -1622,12 +1782,57 @@ def reconstruct_records_from_raw_data(
         file_path = data['file_path']
         patch_coords_8_values = data['patch_coords']  # Now contains 8 values
         
+        # Debug: Print coordinate information for first few patches
+        if len(records) < 3:
+            print(f"\nDebug: Processing patch {len(records)+1}")
+            print(f"  File: {file_path}")
+            print(f"  Coordinates type: {type(patch_coords_8_values)}")
+            print(f"  Coordinates length: {len(patch_coords_8_values) if hasattr(patch_coords_8_values, '__len__') else 'N/A'}")
+            print(f"  First coordinate: {patch_coords_8_values[0] if hasattr(patch_coords_8_values, '__len__') and len(patch_coords_8_values) > 0 else 'N/A'}")
+            if hasattr(patch_coords_8_values, '__len__') and len(patch_coords_8_values) > 0:
+                print(f"  First coordinate type: {type(patch_coords_8_values[0])}")
+                if isinstance(patch_coords_8_values[0], (list, tuple)):
+                    print(f"  First coordinate length: {len(patch_coords_8_values[0])}")
+                    print(f"  First coordinate values: {patch_coords_8_values[0]}")
+        
+        # Additional debug: Check the data structure
+        if len(records) < 3:
+            print(f"  Data keys: {list(data.keys())}")
+            print(f"  patch_x from data: {data.get('patch_x', 'MISSING')} (type: {type(data.get('patch_x', 'MISSING'))})")
+            print(f"  patch_y from data: {data.get('patch_y', 'MISSING')} (type: {type(data.get('patch_y', 'MISSING'))})")
+            print(f"  patch_coords from data: {data.get('patch_coords', 'MISSING')} (type: {type(data.get('patch_coords', 'MISSING'))})")
+        
         # Extract top-left corner coordinates for compatibility
-        if isinstance(patch_coords_8_values, (list, tuple)) and len(patch_coords_8_values) == 8:
-            x1, y1, x2, y2, x3, y3, x4, y4 = patch_coords_8_values
-            patch_x, patch_y = x1, y1  # Top-left corner
+        # Handle both flat lists and nested lists (in case coordinates were saved incorrectly)
+        if isinstance(patch_coords_8_values, (list, tuple)):
+            if len(patch_coords_8_values) == 8:
+                # Check if we have nested lists (each coordinate is a list)
+                if isinstance(patch_coords_8_values[0], (list, tuple)):
+                    # Nested list case: extract first value from each coordinate
+                    x1, y1, x2, y2, x3, y3, x4, y4 = [coord[0] if isinstance(coord, (list, tuple)) else coord for coord in patch_coords_8_values]
+                    print(f"Warning: Nested coordinate format detected, using first value from each coordinate")
+                else:
+                    # Flat list case: direct extraction
+                    x1, y1, x2, y2, x3, y3, x4, y4 = patch_coords_8_values
+                
+                patch_x, patch_y = int(x1), int(y1)  # Top-left corner, ensure integers
+                print(f"Extracted coordinates: patch_x={patch_x}, patch_y={patch_y}")
+            else:
+                raise ValueError(f"Expected 8-value patch coordinates, got {len(patch_coords_8_values)} values: {patch_coords_8_values}")
         else:
-            raise ValueError(f"Expected 8-value patch coordinates, got: {patch_coords_8_values}")
+            raise ValueError(f"Expected list/tuple of patch coordinates, got: {type(patch_coords_8_values)}")
+        
+        # Additional safety check: ensure patch_x and patch_y are integers
+        if not isinstance(patch_x, int) or not isinstance(patch_y, int):
+            print(f"Error: patch_x and patch_y must be integers, got patch_x={type(patch_x)}:{patch_x}, patch_y={type(patch_y)}:{patch_y}")
+            print(f"Original coordinates: {patch_coords_8_values}")
+            # Try to convert them to integers
+            try:
+                patch_x = int(patch_x)
+                patch_y = int(patch_y)
+                print(f"Converted to integers: patch_x={patch_x}, patch_y={patch_y}")
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"Could not convert coordinates to integers: {e}. Original: {patch_coords_8_values}")
         
         # Load the raw data arrays
         encodedrecon_raw = data['encodedrecon']

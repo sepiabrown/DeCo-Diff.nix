@@ -1,0 +1,27 @@
+{
+  "raw_data_processing": {
+    "dataset": "pcb",
+    "annotation-dir": "annotations_test",
+    "model-size": "UNet_L",
+    "object-class": "all",
+    "anomaly-class": "all",
+    "image-size": "256",
+    "center-size": "256",
+    "patch-size": "256",
+    "batch-num": "100000",
+    "center-crop": "False",
+    "pretrained": "DeCo-Diff_pcb_all_UNet_L_128_CenterCrop/001-UNet_L/checkpoints/33000.pt",
+    "output-dir": "raw_data_processing",
+    "anomaly-binary-threshold": "225",
+    "anomaly-pixel-num-threshold": "0",
+    "adaptive-threshold": "0.1",
+    "enable-epoch-stats": "False",
+    "enable-excel-report": "True",
+    "enable-save-optional-image-results": "True",
+    "enable-save-image-results": "True",
+    "enable-save-json-results": "True",
+    "enable-confusion-matrix": "True",
+    "device": "cuda",
+    "force-rerun": "True"
+  }
+} 

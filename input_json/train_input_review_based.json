@@ -1,0 +1,31 @@
+{
+  "pcb_json": {
+    "dataset": "pcb",
+    "model-size": "UNet_XS",
+    "image-size": "128",
+    "center-size": "128",
+    "patch-size": "128",
+    "center-crop": "False",
+    "epochs": "1000000",
+    "warmup-epochs": "10",
+    "global-batch-size": "8",
+    "global-seed": "10",
+    "vae-type": "ema",
+    "num-workers": "4",
+    "log-every": "1",
+    "ckpt-every": "1",
+    "lr": "0.0001",
+    "mask-ratio": "0.7",
+    "patch-shuffle-ratio": "0.3",
+    "object-class": "all",
+    "mask-random-ratio": "True",
+    "from-scratch": "False",
+    "resume-dir": "DeCo-Diff_pcb_all_UNet_XS_pcb_json/001-UNet_XS",
+    "augment": "True",
+    "unified-json": "C:/Users/Public/Documents/deco-diff/filtered_records_all_evaluation_records.json",
+    "mixed-split-ratio": "0.5",
+    "track-crop": "False",
+    "save-crop-visualizations": "False",
+    "debug": "False"
+  }
+}

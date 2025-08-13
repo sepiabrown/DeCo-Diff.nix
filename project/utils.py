@@ -15,3 +15,28 @@ def path_to_safe_filename(file_path: str) -> str:
     # Replace any file extension with __{extension} format
     safe_name = re.sub(r'\.([a-zA-Z0-9]+)$', r'__\1', safe_name, flags=re.IGNORECASE)
     return safe_name
+
+def safe_filename_to_path(safe_filename: str) -> str:
+    """
+    Convert a safe filename back to an absolute file path.
+    This is the inverse of path_to_safe_filename.
+    
+    Args:
+        safe_filename: Safe filename (e.g., "C__Users__Public__Documents__file__png")
+        
+    Returns:
+        Original file path (e.g., "C:\\Users\\Public\\Documents\\file.png")
+    """
+    # Replace __{extension} format back to .{extension}
+    path = re.sub(r'__([a-zA-Z0-9]+)$', r'.\1', safe_filename, flags=re.IGNORECASE)
+    # Replace double underscores with path separators (use string replacement to avoid regex issues)
+    path = path.replace('__', os.sep)
+    # Replace drive letter format back to Windows format
+    # Use string replacement for drive letters to avoid regex escape issues
+    for drive_letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+        if path.startswith(f'{drive_letter}{os.sep}'):
+            path = path.replace(f'{drive_letter}{os.sep}', f'{drive_letter}:{os.sep}', 1)
+            break
+    
+    # Normalize the path to ensure consistent separators
+    return os.path.normpath(path)

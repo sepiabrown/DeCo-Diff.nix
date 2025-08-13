@@ -352,6 +352,12 @@ def _main(args):
             center_crop=args.center_crop,
         )
     elif args.dataset == "pcb":
+        if args.debug:
+            logger.info(f"DEBUG: Creating PCB dataset with unified_json: {args.unified_json}")
+            logger.info(f"DEBUG: Patch size: {args.patch_size}")
+            logger.info(f"DEBUG: Augment: {args.augmentation}")
+            logger.info(f"DEBUG: Center crop: {args.center_crop}")
+        
         dataset = MixedFineTuningDataset(
             "train",
             object_class=args.object_class,
@@ -364,6 +370,8 @@ def _main(args):
             num_datafile=args.num_datafile,
             split_csv_path=args.split_csv_path,
             fine_tuning_csv=args.fine_tuning_csv,
+            unified_json=args.unified_json,
+            patch_size=args.patch_size,
             mixed_split_ratio=args.mixed_split_ratio,
             track_crop=args.track_crop,
             save_crop_visualizations=args.save_crop_visualizations,
@@ -372,6 +380,18 @@ def _main(args):
             resume_epoch=args.resume_epoch,
             debug=args.debug,
         )
+        
+        if args.debug:
+            logger.info(f"DEBUG: Dataset created successfully")
+            logger.info(f"DEBUG: Dataset size: {len(dataset)}")
+            logger.info(f"DEBUG: CSV image paths: {len(dataset.csv_image_paths)}")
+            logger.info(f"DEBUG: Existing image paths: {len(dataset.existing_image_paths)}")
+            
+            # Debug: Show some sample image paths
+            if hasattr(dataset, 'csv_image_paths') and dataset.csv_image_paths:
+                logger.info(f"DEBUG: Sample CSV image paths: {dataset.csv_image_paths[:2]}")
+            if hasattr(dataset, 'existing_image_paths') and dataset.existing_image_paths:
+                logger.info(f"DEBUG: Sample existing image paths: {dataset.existing_image_paths[:2]}")
         
 
     batch_size = args.global_batch_size // dist.get_world_size()
@@ -514,13 +534,53 @@ def _main(args):
             dataset.current_epoch = epoch
             
         for batch_idx, batch in enumerate(loader):
-            x, _, y, _, _, crop_info = batch
-            
-            x = x.to(torch_device)
-            with torch.no_grad():
-                # Map input images to latent space + normalize latents:
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+            try:
+                x, _, y, _, _, crop_info = batch
+                
+                # Debug: Check image dimensions and crop info
+                if args.debug and batch_idx == 0:  # Only log first batch of each epoch
+                    logger.info(f"DEBUG: Batch {batch_idx} - Image shapes: {x.shape}")
+                    logger.info(f"DEBUG: Batch {batch_idx} - Crop info types: {[type(info) for info in crop_info]}")
+                    
+                    # Get image paths from the batch (they should be in the 4th position)
+                    if len(batch) >= 4:
+                        image_paths = batch[3]  # Image paths are at index 3
+                        logger.info(f"DEBUG: Batch {batch_idx} - Image paths: {image_paths}")
+                    
+                    for i, info in enumerate(crop_info):
+                        if info and isinstance(info, dict):
+                            logger.info(f"DEBUG: Item {i} crop info: {info.get('patch_type', 'unknown')} - {info.get('crop_coords', 'N/A')}")
+                            if 'grid_position' in info:
+                                logger.info(f"DEBUG: Item {i} grid position: {info['grid_position']}")
+                            if 'original_shape' in info:
+                                logger.info(f"DEBUG: Item {i} original shape: {info['original_shape']}")
+                            # Check for missing keys that might cause the KeyError
+                            required_keys = ['patch_type', 'crop_coords', 'is_csv_image', 'epoch', 'augmentation_applied']
+                            missing_keys = [key for key in required_keys if key not in info]
+                            if missing_keys:
+                                logger.warning(f"DEBUG: Item {i} missing keys: {missing_keys}")
+                                logger.warning(f"DEBUG: Item {i} available keys: {list(info.keys())}")
+                
+                x = x.to(torch_device)
+                
+                with torch.no_grad():
+                    # Map input images to latent space + normalize latents:
+                    x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+                
+                # Debug: Check latent dimensions
+                if args.debug and batch_idx == 0:
+                    logger.info(f"DEBUG: Latent tensor shape: {x.shape}")
+                    logger.info(f"DEBUG: Expected latent size: {args.actual_image_size // 8}")
+                
+                t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+                
+            except Exception as e:
+                logger.error(f"ERROR: Failed to process batch {batch_idx}: {e}")
+                logger.error(f"ERROR: Batch data types: {[type(item) for item in batch]}")
+                if args.debug:
+                    import traceback
+                    logger.error(f"ERROR: Full traceback: {traceback.format_exc()}")
+                raise e  # Re-raise the exception to stop training
 
             if args.actual_image_size == 128:
                 mask_patch_size = np.random.choice(
@@ -748,6 +808,11 @@ def _main(args):
                 
                 # Recreate dataset with new data files
                 if args.dataset == "pcb":
+                    if args.debug:
+                        logger.info(f"DEBUG: Recreating dataset at epoch {epoch}")
+                        logger.info(f"DEBUG: Unified JSON: {args.unified_json}")
+                        logger.info(f"DEBUG: Patch size: {args.patch_size}")
+                    
                     dataset = MixedFineTuningDataset(
                         "train",
                         object_class=args.object_class,
@@ -760,6 +825,8 @@ def _main(args):
                         num_datafile=args.num_datafile,
                         split_csv_path=args.split_csv_path,
                         fine_tuning_csv=args.fine_tuning_csv,
+                        unified_json=args.unified_json,
+                        patch_size=args.patch_size,
                         mixed_split_ratio=args.mixed_split_ratio,
                         track_crop=args.track_crop,
                         save_crop_visualizations=args.save_crop_visualizations,
@@ -769,6 +836,18 @@ def _main(args):
                         cumulative_crops=dataset.cumulative_crops if hasattr(dataset, 'cumulative_crops') else None,
                         debug=args.debug,
                     )
+                    
+                    if args.debug:
+                        logger.info(f"DEBUG: Dataset recreated successfully")
+                        logger.info(f"DEBUG: New dataset size: {len(dataset)}")
+                        logger.info(f"DEBUG: New CSV image paths: {len(dataset.csv_image_paths)}")
+                        logger.info(f"DEBUG: New existing image paths: {len(dataset.existing_image_paths)}")
+                        
+                        # Debug: Show some sample image paths
+                        if hasattr(dataset, 'csv_image_paths') and dataset.csv_image_paths:
+                            logger.info(f"DEBUG: Sample new CSV image paths: {dataset.csv_image_paths[:2]}")
+                        if hasattr(dataset, 'existing_image_paths') and dataset.existing_image_paths:
+                            logger.info(f"DEBUG: Sample new existing image paths: {dataset.existing_image_paths[:2]}")
                 
                 # Set the current epoch IMMEDIATELY after dataset recreation
                 dataset.current_epoch = epoch
@@ -871,6 +950,18 @@ def main():
         help="Path to JSON file containing multiple training configurations"
     )
     parser.add_argument(
+        "--unified-json",
+        type=str,
+        default=None,
+        help="Path to unified JSON file containing both fine-tuning patches and split information. Items with valid patch_coords are used as fine-tuning data, items without patch_coords or with empty patch_coords go through random/equal-spaced cropping."
+    )
+    parser.add_argument(
+        "--patch-size",
+        type=int,
+        default=128,
+        help="Patch size for equal-spaced cropping when using unified-json with empty patch_coords"
+    )
+    parser.add_argument(
         "--no-distributed",
         action="store_true",
         help="Run training without distributed training (useful for Windows)"
@@ -946,13 +1037,13 @@ def main():
                     # Convert string values to appropriate types
                     if key in ['image_size', 'center_size', 'epochs', 'warmup_epochs', 
                               'global_seed', 'num_workers', 'log_every', 'ckpt_every', 
-                              'local_rank', 'resume_epoch']:
+                              'local_rank', 'resume_epoch', 'patch_size']:
                         value = int(value) if value is not None else None
                     elif key in ['lr', 'mask_ratio', 'patch_shuffle_ratio', 'mixed_split_ratio']:
                         value = float(value)
                     elif key in ['center_crop', 'mask_random_ratio', 'from_scratch', 'augmentation', 'track_crop', 'save_crop_visualizations', 'debug']:
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
-                    elif key in ['data_dir', 'resume_dir', 'split_csv_path', 'split_json_path', 'fine_tuning_json', 'fine_tuning_csv']:
+                    elif key in ['data_dir', 'resume_dir', 'split_csv_path', 'split_json_path', 'fine_tuning_json', 'fine_tuning_csv', 'unified_json']:
                         if value:  # Only expand if not None/empty
                             value = os.path.expanduser(value)
                     elif key in ['global_batch_size']:
