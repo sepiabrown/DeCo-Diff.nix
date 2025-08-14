@@ -408,9 +408,16 @@ def custom_collate_fn(batch):
         all_x.append(x)
         all_seg.append(seg)
         all_object_cls.append(object_cls)
-        all_image_paths.extend(image_paths)
-        all_anomaly_classes.extend(anomaly_classes)
-        all_patch_coords.extend(patch_coords)
+        # Expand per-patch metadata to per-patch lists aligned with x
+        num_patches = x.shape[0]
+        all_image_paths.extend([image_paths[0] if isinstance(image_paths, list) and len(image_paths) > 0 else image_paths] * num_patches)
+        all_anomaly_classes.extend([anomaly_classes[0] if isinstance(anomaly_classes, list) and len(anomaly_classes) > 0 else anomaly_classes] * num_patches)
+        # Ensure patch_coords is a list of 8-value coords, one per patch
+        if isinstance(patch_coords, list) and len(patch_coords) == num_patches:
+            all_patch_coords.extend(patch_coords)
+        else:
+            # Broadcast a single coord to all patches if needed
+            all_patch_coords.extend([patch_coords] * num_patches)
     
     # Concatenate all tensors along the first dimension
     # Ensure we're concatenating along the batch dimension (dim=0)
@@ -458,6 +465,8 @@ def custom_collate_fn(batch):
 def process_patches_in_chunks(patches_tensor, chunk_size=32):
     """
     Process patches in smaller chunks to avoid memory issues.
+    Handles both image tensors [batch, channels, height, width] and 
+    class tensors [batch, num_classes] correctly.
     """
     total_patches = patches_tensor.size(0)
     results = []
@@ -502,9 +511,76 @@ def _process_batch_inference(x_chunk, object_cls_chunk, model, vae, diffusion, r
     debug_print(f"   ✅ VAE encoding completed, latent shape: {encoded.shape}")
 
     # Reverse DDIM sampling conditioned on encoder latents
-    model_kwargs = {"context": object_cls_device.unsqueeze(1), "mask": None}
+    # Ensure object_cls has the correct shape and dtype for the model's class embedder
+    # The UNet's ClassEmbedder expects Long indices shaped [batch_size, 1] (so embedding -> [batch_size, 1, dim])
+    if len(object_cls_device.shape) == 2:
+        # Use as-is, expected shape: [batch_size, 1]
+        context = object_cls_device
+    elif len(object_cls_device.shape) == 1:
+        # [batch_size] -> [batch_size, 1]
+        context = object_cls_device.unsqueeze(1)
+    else:
+        # Squeeze/reshape unexpected shapes to [batch_size, 1]
+        context = object_cls_device.view(object_cls_device.shape[0], -1)
+        if context.shape[1] != 1:
+            context = context[:, :1]
+    
+    debug_print(f"   🔍 Context tensor shape (indices): {context.shape}")
+    
+    # Validate context tensor shape for embedding: must be 2D [batch_size, 1]
+    if len(context.shape) != 2 or context.shape[1] != 1:
+        raise ValueError(f"Context indices must be 2D [batch_size, 1], got: {context.shape}")
+
+    # Ensure dtype is long for embedding indices
+    if context.dtype != torch.long:
+        context = context.long()
+    
+    # Additional validation: ensure the input tensor has the correct shape for the model
+    debug_print(f"   🔍 Input tensor x_device shape: {x_device.shape}")
+    debug_print(f"   🔍 Input tensor x_device dtype: {x_device.dtype}")
+    debug_print(f"   🔍 Input tensor x_device device: {x_device.device}")
+    
+    # The model might expect a specific input format
+    # Try to ensure the input tensor is in the right format
+    if len(x_device.shape) == 4:
+        # Standard format: [batch, channels, height, width]
+        debug_print(f"   ✅ Input tensor has correct 4D format: {x_device.shape}")
+        
+        # The model architecture might have specific input requirements
+        # Let's check if there's a mismatch between what we're providing and what the model expects
+        debug_print(f"   🔍 Model type: {type(model)}")
+        debug_print(f"   🔍 Model device: {next(model.parameters()).device}")
+        
+        # Check if the model has any specific input requirements
+        if hasattr(model, 'config'):
+            debug_print(f"   🔍 Model config: {model.config}")
+        
+        # The issue might be that the model expects a different input format
+        # Let's try to understand what the model actually expects
+        debug_print(f"   🔍 Input tensor shape: {x_device.shape}")
+        debug_print(f"   🔍 Context tensor shape: {context.shape}")
+    else:
+        debug_print(f"   ⚠️  Warning: Input tensor has unexpected shape: {x_device.shape}")
+    
+    model_kwargs = {"context": context, "mask": None}
     
     debug_print(f"   🔄 Starting DDIM sampling with {reverse_steps} steps...")
+    debug_print(f"   🔍 Encoded latent shape: {encoded.shape}")
+    debug_print(f"   🔍 Model kwargs: {model_kwargs}")
+    
+    # Try to catch the error earlier by testing the model with a simple forward pass
+    try:
+        debug_print(f"   🔍 Testing model forward pass...")
+        with torch.no_grad():
+            # Create a simple test input with the same shape as encoded
+            test_input = torch.randn_like(encoded)
+            test_output = model(test_input, torch.zeros(1, device=device), **model_kwargs)
+            debug_print(f"   ✅ Model forward pass successful, output shape: {test_output.shape}")
+    except Exception as e:
+        debug_print(f"   ❌ Model forward pass failed: {e}")
+        debug_print(f"   🔍 This suggests the model has input format requirements we're not meeting")
+        # Continue anyway to see the full error
+    
     latent_samples_list = []
     step_count = 0
     for samples in diffusion.ddim_deviation_sample_loop_progressive(
@@ -586,7 +662,14 @@ def _validate_and_fix_coordinates(coords_8_values):
     
     fixed_coords = []
     for i, coord in enumerate(coords_8_values):
-        if isinstance(coord, (list, tuple)):
+        # Handle torch tensors explicitly
+        if 'torch' in globals() and isinstance(coord, torch.Tensor):
+            if coord.numel() == 0:
+                raise ValueError(f"Coordinate[{i}] is an empty tensor: {coord}")
+            fixed_value = int(coord.view(-1)[0].item())
+            fixed_coords.append(fixed_value)
+            debug_print(f"  🔧 Fixed coordinate[{i}] tensor -> {fixed_value}")
+        elif isinstance(coord, (list, tuple)):
             # If coordinate is a list/array, take the first value
             if len(coord) > 0:
                 fixed_coords.append(int(coord[0]))
@@ -656,6 +739,8 @@ def _process_chunked_inference(x, object_cls, model, vae, diffusion, reverse_ste
     debug_print(f"📦 Creating chunks with size {chunk_size} from {x.size(0)} patches")
     debug_print(f"🔍 Input tensor x shape: {x.shape}")
     debug_print(f"🔍 Input tensor object_cls shape: {object_cls.shape}")
+    debug_print(f"🔍 Input tensor object_cls dtype: {object_cls.dtype}")
+    debug_print(f"🔍 Input tensor object_cls device: {object_cls.device}")
     
     # Final safety check: ensure input tensor is 4D
     if len(x.shape) != 4:
@@ -681,19 +766,47 @@ def _process_chunked_inference(x, object_cls, model, vae, diffusion, reverse_ste
     
     debug_print(f"✅ Input tensor validated: {x.shape}")
     
+    # Process image tensor in chunks
     x_chunks = process_patches_in_chunks(x, chunk_size=chunk_size)
-    object_cls_chunks = process_patches_in_chunks(object_cls, chunk_size=chunk_size)
+    
+    # Process object class tensor - ensure proper shape but DON'T chunk it
+    # object_cls should be [batch_size, num_classes] where num_classes is typically 1
+    if len(object_cls.shape) == 2:
+        # Standard case: [batch_size, num_classes]
+        object_cls_final = object_cls
+    elif len(object_cls.shape) == 1:
+        # If it's [batch_size], add a dimension to make it [batch_size, 1]
+        object_cls_final = object_cls.unsqueeze(1)
+        debug_print(f"🔧 Added dimension to object_cls: {object_cls_final.shape}")
+    else:
+        # Unexpected shape, try to fix it
+        debug_print(f"⚠️  Warning: Unexpected object_cls shape {object_cls.shape}, attempting to fix")
+        if len(object_cls.shape) > 2:
+            # Flatten extra dimensions
+            batch_size = object_cls.shape[0]
+            object_cls_final = object_cls.view(batch_size, -1)
+            debug_print(f"🔧 Fixed object_cls shape to: {object_cls_final.shape}")
+        else:
+            object_cls_final = object_cls
     
     debug_print(f"📊 Created {len(x_chunks)} chunks")
+    debug_print(f"🔍 Final object_cls shape: {object_cls_final.shape}")
     
     all_encodedrecon_diffs = []
     all_encoded_latent_diffs = []
     all_anomaly_maps = []
     
-    for chunk_idx, (x_chunk, object_cls_chunk) in enumerate(zip(x_chunks, object_cls_chunks)):
+    current_index = 0
+    for chunk_idx, x_chunk in enumerate(x_chunks):
         debug_print(f"🔧 Processing chunk {chunk_idx+1}/{len(x_chunks)} with {x_chunk.size(0)} patches")
         debug_print(f"🔍 Chunk {chunk_idx+1} x_chunk shape: {x_chunk.shape}")
-        debug_print(f"🔍 Chunk {chunk_idx+1} object_cls_chunk shape: {object_cls_chunk.shape}")
+        # Slice per-chunk class indices so batch sizes match
+        chunk_size_now = x_chunk.size(0)
+        object_cls_chunk = object_cls_final[current_index:current_index + chunk_size_now]
+        current_index += chunk_size_now
+        debug_print(f"🔍 Using object_cls_chunk shape: {object_cls_chunk.shape}")
+        debug_print(f"🔍 Using object_cls_chunk dtype: {object_cls_chunk.dtype}")
+        debug_print(f"🔍 Using object_cls_chunk device: {object_cls_chunk.device}")
         
         encodedrecon_diff, encoded_latent_diff, anomaly_map = _process_batch_inference(
             x_chunk, object_cls_chunk, model, vae, diffusion, reverse_steps, device, epoch_metrics
@@ -1465,6 +1578,27 @@ def load_model_and_components(args):
     print(model.load_state_dict(state_dict))
     model.eval()  # important!
     model.cuda()
+    
+    # Debug: Check model configuration
+    debug_print(f"🔍 Model loaded successfully")
+    debug_print(f"🔍 Model type: {type(model)}")
+    debug_print(f"🔍 Model device: {next(model.parameters()).device}")
+    
+    # Check if the model has any specific input requirements
+    if hasattr(model, 'config'):
+        debug_print(f"🔍 Model config: {model.config}")
+    
+    # Check the model's expected input format
+    debug_print(f"🔍 Model latent_size: {latent_size}")
+    debug_print(f"🔍 Model patch_size: {args.patch_size}")
+    
+    # Check if there's a mismatch between the model architecture and input
+    if hasattr(model, 'image_size'):
+        debug_print(f"🔍 Model expected image_size: {model.image_size}")
+    
+    if hasattr(model, 'in_channels'):
+        debug_print(f"🔍 Model expected in_channels: {model.in_channels}")
+    
     print("model loaded")
 
     # Create diffusion
@@ -1489,64 +1623,16 @@ def get_dataloader(dataset, batch_size=1, irregular_patch=False):
     """Get dataloader for the dataset."""
     debug_print(f"🔧 get_dataloader: batch_size={batch_size}, irregular_patch={irregular_patch}")
     
-    # Check if we actually need the custom collate function
-    # The issue occurs when different images have different numbers of patches
-    need_custom_collate = False
-    
-    if irregular_patch:
-        # Irregular patches always need custom collate
-        need_custom_collate = True
-        debug_print(f"🔧 Using custom_collate_fn for irregular patches")
-    else:
-        # For regular patches, check if we actually have variable patch counts
-        try:
-            # Sample a few items to check patch counts
-            sample_indices = min(3, len(dataset))
-            patch_counts = []
-            
-            for i in range(sample_indices):
-                try:
-                    x, seg, object_cls, image_paths, anomaly_classes, coords = dataset[i]
-                    patch_counts.append(x.shape[0])  # First dimension is number of patches
-                    debug_print(f"🔍 Sample {i}: {patch_counts[-1]} patches")
-                except Exception as e:
-                    debug_print(f"⚠️  Could not sample item {i}: {e}")
-                    continue
-            
-            # Check if patch counts vary
-            if len(set(patch_counts)) > 1:
-                need_custom_collate = True
-                debug_print(f"🔧 Variable patch counts detected: {patch_counts}, using custom_collate_fn")
-            else:
-                # Even with uniform patch counts, we need to handle the stacking correctly
-                # The default collate function creates 5D tensors when stacking [1, 3, 256, 256] tensors
-                # We can use default collate + squeeze approach for uniform patch counts
-                need_custom_collate = False
-                debug_print(f"🔧 Uniform patch counts detected: {patch_counts}, using default collate + squeeze approach")
-                
-        except Exception as e:
-            debug_print(f"⚠️  Error checking patch counts: {e}, defaulting to custom collate for safety")
-            need_custom_collate = True
-    
-    if need_custom_collate:
-        debug_print(f"🔧 Using custom_collate_fn for variable patch counts")
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=0,  # Windows-friendly
-            drop_last=False,
-            collate_fn=custom_collate_fn
-        )
-    else:
-        debug_print(f"🔧 Using PyTorch's built-in default collate function for uniform patch counts")
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=0,  # Windows-friendly
-            drop_last=False
-        )
+    # Always use custom_collate_fn to ensure consistent shapes and per-patch metadata formatting
+    debug_print(f"🔧 Using custom_collate_fn for all cases to keep patch coords and paths aligned")
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,  # Windows-friendly
+        drop_last=False,
+        collate_fn=custom_collate_fn
+    )
 
 def _before_saving_results(args):
     """
