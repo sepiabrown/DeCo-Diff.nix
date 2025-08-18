@@ -110,6 +110,15 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 if device == torch.device("cpu"):
     print("GPU not found. Using CPU instead.")
+else:
+    # Enable performance knobs for GPU
+    try:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        print("GPU not found. Using CPU instead.")
+        pass
 
 # Constants
 _LATENT_SCALE = 0.18215
@@ -507,7 +516,13 @@ def _process_batch_inference(x_chunk, object_cls_chunk, model, vae, diffusion, r
     
     debug_print(f"   🎨 VAE encoding...")
     # Forward pass through VAE encoder (to latent space)
-    encoded = vae.encode(x_device).latent_dist.mean * _LATENT_SCALE
+    if torch.cuda.is_available():
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            encoded = vae.encode(x_device).latent_dist.mean * _LATENT_SCALE
+        # Ensure downstream diffusion/model (kept in FP32) receives FP32 tensors
+        encoded = encoded.float()
+    else:
+        encoded = vae.encode(x_device).latent_dist.mean * _LATENT_SCALE
     debug_print(f"   ✅ VAE encoding completed, latent shape: {encoded.shape}")
 
     # Reverse DDIM sampling conditioned on encoder latents
@@ -603,8 +618,16 @@ def _process_batch_inference(x_chunk, object_cls_chunk, model, vae, diffusion, r
 
     debug_print(f"   🎨 VAE decoding...")
     # Decode final latent samples
-    image_samples = vae.decode(latent_samples_final / _LATENT_SCALE).sample
-    x0 = vae.decode(encoded / _LATENT_SCALE).sample
+    if torch.cuda.is_available():
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            image_samples = vae.decode(latent_samples_final / _LATENT_SCALE).sample
+            x0 = vae.decode(encoded / _LATENT_SCALE).sample
+        # Bring back to FP32 for subsequent ops
+        image_samples = image_samples.float()
+        x0 = x0.float()
+    else:
+        image_samples = vae.decode(latent_samples_final / _LATENT_SCALE).sample
+        x0 = vae.decode(encoded / _LATENT_SCALE).sample
     debug_print(f"   ✅ VAE decoding completed")
     
     debug_print(f"   📊 Computing differences...")
@@ -1023,8 +1046,10 @@ def _save_results(
                 debug_print(f"✅ Tensor validated before inference: {x.shape}")
                 
                 # Use shared inference logic with smaller chunk size for debugging
+                # Use user-configurable chunk size for better throughput
+                chunk_size = getattr(args, "inference_chunk_size", 16)
                 encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic = _process_chunked_inference(
-                    x, object_cls, model, vae, diffusion, reverse_steps, device, chunk_size=1, epoch_metrics=epoch_metrics
+                    x, object_cls, model, vae, diffusion, reverse_steps, device, chunk_size=chunk_size, epoch_metrics=epoch_metrics
                 )
                 debug_print(f"✅ Inference completed")
             
@@ -1082,9 +1107,14 @@ def _save_results(
                 anomaly_map_arithmetic_raw = anomaly_map_arithmetic_raw.squeeze()
 
                 # Save raw values efficiently as numpy arrays (preserves [0,1] range)
-                np.save(os.path.join(save_dir, f"{base_filename}_encodedrecon.npy"), encodedrecon_raw)
-                np.save(os.path.join(save_dir, f"{base_filename}_latent.npy"), latent_raw)
-                np.save(os.path.join(save_dir, f"{base_filename}_anomaly_map_arithmetic.npy"), anomaly_map_arithmetic_raw)
+                if getattr(args, "save_npy_dtype", "float16") == "float16":
+                    np.save(os.path.join(save_dir, f"{base_filename}_encodedrecon.npy"), encodedrecon_raw.astype(np.float16))
+                    np.save(os.path.join(save_dir, f"{base_filename}_latent.npy"), latent_raw.astype(np.float16))
+                    np.save(os.path.join(save_dir, f"{base_filename}_anomaly_map_arithmetic.npy"), anomaly_map_arithmetic_raw.astype(np.float16))
+                else:
+                    np.save(os.path.join(save_dir, f"{base_filename}_encodedrecon.npy"), encodedrecon_raw.astype(np.float32))
+                    np.save(os.path.join(save_dir, f"{base_filename}_latent.npy"), latent_raw.astype(np.float32))
+                    np.save(os.path.join(save_dir, f"{base_filename}_anomaly_map_arithmetic.npy"), anomaly_map_arithmetic_raw.astype(np.float32))
                 
                 # Save 8-value coordinates as a separate .npy file (more efficient than filename parsing)
                 # Create coordinate list and validate it
@@ -1111,27 +1141,27 @@ def _save_results(
                 
                 np.save(os.path.join(save_dir, f"{base_filename}_coords.npy"), patch_coords_array)
                 
-                # Verify the saved coordinates by loading them back
-                saved_coords_path = os.path.join(save_dir, f"{base_filename}_coords.npy")
-                try:
-                    loaded_coords = np.load(saved_coords_path)
-                    debug_print(f"  ✅ Verified saved coordinates: shape={loaded_coords.shape}, dtype={loaded_coords.dtype}")
-                    if len(loaded_coords.shape) != 1 or loaded_coords.shape[0] != 8:
-                        debug_print(f"  ⚠️  Warning: Saved coordinates have unexpected shape: {loaded_coords.shape}")
-                    else:
-                        debug_print(f"  ✅ Coordinates saved correctly as 1D array with 8 values")
-                except Exception as e:
-                    debug_print(f"  ❌ Error verifying saved coordinates: {e}")
+                # Optional verification can be expensive on HDD/large runs; keep behind debug flag
+                if DEBUG_ENABLED:
+                    saved_coords_path = os.path.join(save_dir, f"{base_filename}_coords.npy")
+                    try:
+                        loaded_coords = np.load(saved_coords_path)
+                        debug_print(f"  ✅ Verified saved coordinates: shape={loaded_coords.shape}, dtype={loaded_coords.dtype}")
+                        if len(loaded_coords.shape) != 1 or loaded_coords.shape[0] != 8:
+                            debug_print(f"  ⚠️  Warning: Saved coordinates have unexpected shape: {loaded_coords.shape}")
+                        else:
+                            debug_print(f"  ✅ Coordinates saved correctly as 1D array with 8 values")
+                    except Exception as e:
+                        debug_print(f"  ❌ Error verifying saved coordinates: {e}")
                 
-                # Convert to [0,255] range for image saving
-                encodedrecon_img = (encodedrecon_raw * 255).astype(np.uint8)
-                latent_img = (latent_raw * 255).astype(np.uint8)
-                anomaly_map_arithmetic_img = (anomaly_map_arithmetic_raw * 255).astype(np.uint8)
-                
-                # Save as images for quick visual inspection
-                PILImage.fromarray(encodedrecon_img).save(os.path.join(save_dir, f"{base_filename}_encodedrecon.png"))
-                PILImage.fromarray(latent_img).save(os.path.join(save_dir, f"{base_filename}_latent.png"))
-                PILImage.fromarray(anomaly_map_arithmetic_img).save(os.path.join(save_dir, f"{base_filename}_anomaly_map_arithmetic.png"))
+                # Save preview images only when explicitly requested to reduce I/O overhead
+                if getattr(args, "save_preview_images", False):
+                    encodedrecon_img = (encodedrecon_raw * 255).astype(np.uint8)
+                    latent_img = (latent_raw * 255).astype(np.uint8)
+                    anomaly_map_arithmetic_img = (anomaly_map_arithmetic_raw * 255).astype(np.uint8)
+                    PILImage.fromarray(encodedrecon_img).save(os.path.join(save_dir, f"{base_filename}_encodedrecon.png"))
+                    PILImage.fromarray(latent_img).save(os.path.join(save_dir, f"{base_filename}_latent.png"))
+                    PILImage.fromarray(anomaly_map_arithmetic_img).save(os.path.join(save_dir, f"{base_filename}_anomaly_map_arithmetic.png"))
             
             # After finishing all patches for this image, update checkpoint
             if checkpoint_manager is not None:
@@ -1625,14 +1655,26 @@ def get_dataloader(dataset, batch_size=1, irregular_patch=False):
     
     # Always use custom_collate_fn to ensure consistent shapes and per-patch metadata formatting
     debug_print(f"🔧 Using custom_collate_fn for all cases to keep patch coords and paths aligned")
-    return DataLoader(
-        dataset,
+    # Allow caller to control num_workers via dataset attribute if present (set in _before_saving_results)
+    effective_num_workers = getattr(dataset, "_num_workers", 0)
+
+    # Build kwargs conditionally to avoid invalid combinations on single-process mode
+    dataloader_kwargs = dict(
+        dataset=dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,  # Windows-friendly
+        num_workers=effective_num_workers,
         drop_last=False,
-        collate_fn=custom_collate_fn
+        collate_fn=custom_collate_fn,
+        pin_memory=torch.cuda.is_available(),
     )
+    if effective_num_workers and effective_num_workers > 0:
+        dataloader_kwargs.update({
+            "prefetch_factor": 2,
+            "persistent_workers": True,
+        })
+
+    return DataLoader(**dataloader_kwargs)
 
 def _before_saving_results(args):
     """
@@ -1649,6 +1691,11 @@ def _before_saving_results(args):
         transform=get_transform(),
         object_class=args.object_class,
     )
+    # Attach desired dataloader worker count to the dataset for loader construction
+    try:
+        dataset._num_workers = max(0, int(getattr(args, "num_workers", 0)))
+    except Exception:
+        dataset._num_workers = 0
     
     # Use smaller batch size for irregular patches to avoid tensor dimension issues
     if args.irregular_patch:
@@ -2475,6 +2522,9 @@ def main():
     parser.add_argument("--enable-confusion-matrix", action="store_true", help="Create confusion matrix")
     parser.add_argument("--enable-epoch-stats", action="store_true", help="Enable detailed epoch-wise statistics collection and printing")
     parser.add_argument("--no-sort-records-by-anomaly", action="store_true", help="Disable sorting records by anomaly_pixels (default: sorted by anomaly_pixels, largest to smallest)")
+    parser.add_argument("--save-preview-images", action="store_true", help="Save PNG previews; disable to reduce I/O overhead in save_only mode")
+    parser.add_argument("--save-npy-dtype", type=str, choices=["float16", "float32"], default="float16",
+                        help="Data type for saved .npy arrays (float16 reduces disk I/O, float32 for full precision)")
     
     # Input JSON for batch processing
     parser.add_argument("--input-json", type=str, 
@@ -2495,6 +2545,11 @@ def main():
                        help="Checkpoint behavior: auto=resume if possible, resume=force resume, overwrite=ignore existing checkpoints")
     parser.add_argument("--checkpoint-interval", type=int, default=1,
                        help="Save checkpoint every N batches (default: 1)")
+    # Performance knobs
+    parser.add_argument("--inference-chunk-size", type=int, default=16,
+                        help="Number of patches per inference chunk (higher improves throughput if memory allows)")
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="Number of DataLoader workers (Windows often needs 0; try >0 if stable)")
     
     args = parser.parse_args()
     
@@ -2561,7 +2616,7 @@ def main():
                 key = key.replace('-', '_')
                 if hasattr(args, key):
                     if key in ['anomaly_binary_threshold', 'anomaly_pixel_num_threshold', 'patch_size', 
-                              'patch_size', 'batch_num', 'reverse_steps']:
+                              'patch_size', 'batch_num', 'reverse_steps', 'inference_chunk_size']:
                         value = int(value)
                     elif key == 'adaptive_threshold':
                         value = float(value)
@@ -2572,7 +2627,7 @@ def main():
                             value = os.path.abspath(value)
                     elif key in ['irregular_patch', 'enable_excel_report', 'enable_save_optional_image_results', 
                                'enable_save_image_results', 'enable_save_json_results', 'enable_save_whole_image_results',
-                               'enable_confusion_matrix', 'force_rerun', 'append_timestamp', 'enable_epoch_stats']:
+                               'enable_confusion_matrix', 'force_rerun', 'append_timestamp', 'enable_epoch_stats', 'save_preview_images']:
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
                     elif key == 'debug':
                         DEBUG_ENABLED = value.lower() in ('yes', 'true', 't', 'y', '1') if isinstance(value, str) else bool(value)
