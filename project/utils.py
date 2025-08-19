@@ -1,5 +1,7 @@
 import os
 import re
+import torch
+import numpy as np
 
 def path_to_safe_filename(file_path: str) -> str:
     """
@@ -40,3 +42,13 @@ def safe_filename_to_path(safe_filename: str) -> str:
     
     # Normalize the path to ensure consistent separators
     return os.path.normpath(path)
+
+def _binary_mask(diff: torch.Tensor, threshold: int = 5) -> torch.Tensor:
+    """Return a binary mask in ``{0, 1}`` based on *absolute* diff magnitude."""
+    return (diff.abs() > (threshold / 255.0)).float()
+
+def _to_numpy(
+    t: torch.Tensor,
+) -> np.ndarray:  # keep Images API compatibility
+    """Detach, move to CPU and convert to ``numpy`` if ``t`` is a tensor."""
+    return t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else t

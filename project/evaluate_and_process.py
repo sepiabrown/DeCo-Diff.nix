@@ -10,11 +10,11 @@ to provide 4 different execution modes:
 3. save_and_process: Save .npy files and immediately process them for categorization
 4. full_pipeline: Complete pipeline without saving intermediates (evaluation to categorization)
 
-IMPORTANT: This script includes fixes for tensor shape issues:
-- The dataset returns variable numbers of patches per image (depending on image dimensions)
-- The default PyTorch collate function creates 5D tensors when stacking [1, 3, 256, 256] tensors
-- We always use a custom collate function to properly concatenate patches and maintain 4D tensor shapes
-- This prevents the 5D tensor error: "Expected 4D input tensor, got shape: [16, 1, 3, 256, 256]"
+IMPORTANT: This script handles patch-level processing:
+- The dataset returns individual patches (each __getitem__ returns a single patch)
+- The DataLoader naturally batches individual patches together
+- Each patch is a 3D tensor with shape [3, patch_size, patch_size]
+- The default PyTorch collate function works perfectly for this use case
 
 Usage examples:
   # Mode 1: Save only
@@ -61,6 +61,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Tuple, Set, Any
 from collections import OrderedDict
+from collections import deque
 from tqdm import tqdm
 import glob
 from PIL import Image as PILImage
@@ -68,6 +69,7 @@ import cv2
 import matplotlib.pyplot as plt
 import re
 import platform
+from concurrent.futures import ThreadPoolExecutor
 
 # Import from evaluation_DeCo_Diff_raw.py
 from diffusion import create_diffusion
@@ -77,9 +79,17 @@ from torchvision import transforms
 from torch.utils.data import DataLoader, Dataset
 import sys
 
+# Import utility functions
+from utils import (
+    path_to_safe_filename,
+    safe_filename_to_path,
+    _binary_mask,
+    _to_numpy
+)
+
 # Import from process_raw_data_to_results.py
 from evaluation_DeCo_Diff2 import (
-    make_record, _to_numpy, add_metric_fields, _binary_mask,
+    make_record, add_metric_fields,
     _get_largest_connected_component_pixels, _create_contour_based_binary_mask_single,
     CheckpointManager, save_image_results_from_records, save_patch_results_from_records,
     determine_image_status, compute_y_true_y_score, compute_metrics_from_y_true_y_score,
@@ -87,15 +97,10 @@ from evaluation_DeCo_Diff2 import (
     EvaluationMetrics
 )
 
-# Import utility functions
-from utils import path_to_safe_filename, safe_filename_to_path
-
 # Import from process_raw_data_to_results.py
 from process_raw_data_to_results import (
     load_ground_truth_map,
     load_original_images,
-    _binary_mask,
-    _binary_mask_exclude_boundary3,
     parse_filename_to_info,
     load_raw_data_files,
     reconstruct_records_from_raw_data,
@@ -135,6 +140,41 @@ def debug_print(*args, **kwargs):
     if DEBUG_ENABLED:
         print(*args, **kwargs)
 
+# Helper: create a safe filename component from an image path or string
+# Ensures no illegal characters (like ':' on Windows) and provides a fallback
+# when input is empty or invalid
+import re as _re_for_safe_name
+
+def _safe_filename_component(value: Any) -> str:
+    try:
+        # Normalize input
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else ""
+        value = str(value or "")
+
+        # First try provided utility to preserve mapping if available
+        if value:
+            try:
+                safe = path_to_safe_filename(value)
+            except Exception:
+                safe = ""
+        else:
+            safe = ""
+
+        # Fallback: sanitize basename or raw value; strip drive letters and illegal chars
+        if not safe or safe.strip() == "" or safe == ":":
+            base = os.path.basename(value) or value.split(":")[-1]
+            safe = _re_for_safe_name.sub(r"_", base)
+
+        # Final cleanup: remove any remaining illegal characters, especially ':'
+        safe = safe.replace(":", "_")
+        safe = safe.strip("._ ")
+        if not safe:
+            safe = "unknown"
+        return safe
+    except Exception:
+        return "unknown"
+
 class AnnotatedImageDataset(Dataset):
     """Dataset for images with JSON annotations for defective regions."""
     
@@ -158,128 +198,210 @@ class AnnotatedImageDataset(Dataset):
                     self.annotation_files.append(os.path.join(root, file))
         
         print(f"Found {len(self.annotation_files)} annotation files")
+
+        # Build a per-patch index at initialization time.
+        # Each entry is a tuple: (resolved_image_path, coords_8_values)
+        self.patch_items = []
+        self._unique_image_paths = set()
+
+        for annotation_file in self.annotation_files:
+            # Load annotation data to get image path
+            with open(annotation_file, 'r') as f:
+                annotation_data = json.load(f)
+
+            image_path_raw = annotation_data.get('image_path', '')
+            resolved_image_path = self._resolve_image_path(annotation_file, image_path_raw)
+
+            # Open image only to read its size; do not load into memory
+            with PILImage.open(resolved_image_path) as img:
+                width, height = img.size
+
+            # Compute padded dimensions (divisible by patch_size)
+            pad_height = (self.patch_size - (height % self.patch_size)) % self.patch_size
+            pad_width = (self.patch_size - (width % self.patch_size)) % self.patch_size
+            padded_height = height + pad_height
+            padded_width = width + pad_width
+
+            # Generate 8-value coordinates for each patch on the padded image grid
+            for y in range(0, padded_height, self.patch_size):
+                for x in range(0, padded_width, self.patch_size):
+                    # Standard parallel patch (aligned with image axes)
+                    x1, y1 = x, y  # Top-left
+                    x2, y2 = x + self.patch_size, y  # Top-right
+                    x3, y3 = x + self.patch_size, y + self.patch_size  # Bottom-right
+                    x4, y4 = x, y + self.patch_size  # Bottom-left
+                    coords_8_values = (x1, y1, x2, y2, x3, y3, x4, y4)
+                    self.patch_items.append((resolved_image_path, coords_8_values))
+
+            self._unique_image_paths.add(resolved_image_path)
+
+        print(f"Indexed {len(self.patch_items)} patches from {len(self._unique_image_paths)} images")
+        
+        # Image cache to avoid reloading the same image multiple times
+        self._image_cache = {}
+        self._cache_size_limit = 10  # Limit cache to prevent memory issues
         
     def __len__(self):
-        return len(self.annotation_files)
+        # Dataset unit is now a single patch
+        return len(self.patch_items)
         
     def __getitem__(self, index):
-        annotation_file = self.annotation_files[index]
-        
-        # Load annotation data
-        with open(annotation_file, 'r') as f:
-            annotation_data = json.load(f)
-        
-        image_path = annotation_data.get('image_path', '')
+        debug_print(f"!!!!!!🔍 starting __getitem__ index: {index}")
 
-        # Load image
-        if os.path.exists(image_path):
-            image = PILImage.open(image_path).convert('RGB')
-        else:
-            # Try to construct path from annotation file name
-            base_name = os.path.splitext(os.path.basename(annotation_file))[0]
-            # Remove the '_annotations' suffix if present
-            if base_name.endswith('_annotations'):
-                base_name = base_name[:-12]
-            # Try different extensions
-            for ext in ['.png', '.jpg', '.jpeg']:
-                potential_path = os.path.join(os.path.dirname(image_path), base_name + ext)
-                if os.path.exists(potential_path):
-                    image = PILImage.open(potential_path).convert('RGB')
-                    break
-            else:
-                raise FileNotFoundError(f"Image not found for annotation: {annotation_file}")
+        # Retrieve per-patch unit: (image_path, coords_8_values)
+        image_path, coords_8_values = self.patch_items[index]
+
+        # Resolve image path
+        resolved_image_path = self._resolve_image_path(None, image_path)
         
-        # Convert to numpy for patch extraction
+        # Get or load image from cache
+        image_np = self._get_cached_image(resolved_image_path)
+
+        # Extract patch using all 8 coordinate values
+        patch_np = self._extract_patch_from_coords(image_np, coords_8_values)
+
+        if patch_np.shape[0] != self.patch_size or patch_np.shape[1] != self.patch_size:
+            raise ValueError(f"Extracted patch has wrong size: {patch_np.shape} at index {index}")
+
+        # Convert to tensor [3, patch_size, patch_size]
+        x = self.transform(PILImage.fromarray(patch_np)) if self.transform else transforms.ToTensor()(PILImage.fromarray(patch_np))
+
+        # Sanity check: ensure 3D tensor
+        if len(x.shape) == 4 and x.shape[0] == 1:
+            x = x.squeeze(0)
+        if len(x.shape) != 3 or x.shape[0] != 3:
+            raise ValueError(f"Dataset[{index}]: Expected 3D tensor with 3 channels, got shape {x.shape}")
+
+        # Dummy segmentation and class per single patch item
+        seg = torch.zeros(1, self.patch_size, self.patch_size)
+        object_cls = torch.zeros(1, dtype=torch.long)
+
+        # Metadata
+        anomaly_classes = "all"
+        # Convert patch coordinates to tensor for proper batching
+        patch_coords = torch.tensor(coords_8_values, dtype=torch.long)
+
+        debug_print(f"🔍 Dataset[{index}]: Final shapes - x: {x.shape}, seg: {seg.shape}, object_cls: {object_cls.shape}")
+        debug_print(f"🔍 Dataset[{index}]: patch_coords shape: {patch_coords.shape}, dtype: {patch_coords.dtype}")
+        debug_print(f"!!!!!!🔍 ending __getitem__ index: {index}")
+        return x, seg, object_cls, anomaly_classes, image_path, patch_coords
+
+    def _resolve_image_path(self, annotation_file, image_path):
+        """Resolve the actual image path, trying common fallbacks if needed."""
+        # If valid absolute/relative path is provided and exists
+        if image_path and os.path.exists(image_path):
+            return image_path
+
+        # If annotation_file is provided, try constructing from its base name
+        base_name = None
+        if annotation_file is not None:
+            base_name = os.path.splitext(os.path.basename(annotation_file))[0]
+        else:
+            # If we don't have the annotation file, try to parse from provided path
+            provided = image_path or ""
+            base_name = os.path.splitext(os.path.basename(provided))[0]
+
+        if base_name and base_name.endswith('_annotations'):
+            base_name = base_name[:-12]
+
+        candidate_dirs = [os.path.dirname(image_path) if image_path else ""]
+        if annotation_file is not None:
+            candidate_dirs.append(os.path.dirname(annotation_file))
+
+        for d in candidate_dirs:
+            for ext in ['.png', '.jpg', '.jpeg']:
+                potential_path = os.path.join(d, f"{base_name}{ext}") if base_name else ""
+                if potential_path and os.path.exists(potential_path):
+                    return potential_path
+
+        raise FileNotFoundError(f"Image not found for annotation: {annotation_file if annotation_file else image_path}")
+
+    def get_all_image_paths(self):
+        """Return a list of unique image paths indexed by this dataset."""
+        return list(self._unique_image_paths)
+    
+    def _extract_patch_from_coords(self, image_np, coords_8_values):
+        """
+        Extract patch from image using 8-value coordinates.
+        Optimizes for parallel patches (faster) vs non-parallel patches (slower but more flexible).
+        """
+        x1, y1, x2, y2, x3, y3, x4, y4 = coords_8_values
+        
+        # Check if patch is parallel to image axes (faster extraction)
+        is_parallel = (y1 == y2 and y3 == y4 and x1 == x4 and x2 == x3)
+        
+        if is_parallel:
+            # Fast path: rectangular patch aligned with image axes
+            # Use top-left corner and dimensions
+            x_min, y_min = int(x1), int(y1)
+            x_max, y_max = int(x3), int(y3)
+            
+            # Ensure coordinates are within image bounds
+            height, width = image_np.shape[:2]
+            x_min = max(0, min(x_min, width - 1))
+            y_min = max(0, min(y_min, height - 1))
+            x_max = max(x_min + 1, min(x_max, width))
+            y_max = max(y_min + 1, min(y_max, height))
+            
+            # Extract patch
+            patch = image_np[y_min:y_max, x_min:x_max]
+            
+            # Resize to target patch_size if needed
+            if patch.shape[:2] != (self.patch_size, self.patch_size):
+                patch_pil = PILImage.fromarray(patch)
+                patch_pil = patch_pil.resize((self.patch_size, self.patch_size), PILImage.Resampling.LANCZOS)
+                patch = np.array(patch_pil)
+            
+            debug_print(f"🔧 Fast parallel patch extraction: {patch.shape}")
+            return patch
+        else:
+            # Slow path: non-parallel patch requires perspective transform
+            # This is more computationally expensive but handles rotated patches
+            debug_print(f"🔧 Slow non-parallel patch extraction (perspective transform)")
+            
+            # Convert coordinates to numpy arrays for OpenCV
+            src_points = np.float32([[x1, y1], [x2, y2], [x3, y3], [x4, y4]])
+            dst_points = np.float32([[0, 0], [self.patch_size, 0], 
+                                   [self.patch_size, self.patch_size], [0, self.patch_size]])
+            
+            # Calculate perspective transform matrix
+            transform_matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+            
+            # Apply perspective transform
+            patch = cv2.warpPerspective(image_np, transform_matrix, (self.patch_size, self.patch_size))
+            
+            return patch
+
+    
+    def _get_cached_image(self, image_path):
+        """
+        Get image from cache or load and cache it if not present.
+        Implements LRU-style cache management to prevent memory issues.
+        """
+        if image_path in self._image_cache:
+            debug_print(f"🔧 Using cached image: {image_path}")
+            return self._image_cache[image_path]
+        
+        # Load and cache new image
+        debug_print(f"🔧 Loading new image into cache: {image_path}")
+        image = PILImage.open(image_path).convert('RGB')
         image_np = np.array(image)
         
         # Pad image to ensure dimensions are divisible by patch_size
         image_np = self._pad_image_to_patch_size(image_np)
         
-        # Extract patches
-        patches, coords = self._extract_patches(image_np)
+        # Manage cache size
+        if len(self._image_cache) >= self._cache_size_limit:
+            # Remove oldest entry (simple FIFO for now)
+            oldest_key = next(iter(self._image_cache))
+            del self._image_cache[oldest_key]
+            debug_print(f"🔧 Removed oldest image from cache: {oldest_key}")
         
-        # Return all patches from the image
-        if patches:
-            # Convert all patches to tensors
-            patch_tensors = []
-            for patch in patches:
-                patch_tensor = self.transform(PILImage.fromarray(patch))
-                patch_tensors.append(patch_tensor)
-            
-            # Stack all patches into a single tensor
-            x = torch.stack(patch_tensors)
-            
-            # Debug: Check tensor shapes
-            debug_print(f"🔍 Dataset[{index}]: Created x tensor with shape: {x.shape}")
-            debug_print(f"🔍 Dataset[{index}]: Number of patches: {len(patches)}")
-            
-            # For single patch images, we need to ensure the tensor has the right shape for batching
-            # For single patch images, return 3D tensor to work with default collate
-            # This avoids the 5D tensor issue that requires squeeze operations
-            if len(patches) == 1:
-                # Single patch: ensure shape is [3, 256, 256] (3D tensor)
-                if len(x.shape) == 4 and x.shape[0] == 1:
-                    # Remove the batch dimension: [1, 3, 256, 256] -> [3, 256, 256]
-                    x = x.squeeze(0)
-                    debug_print(f"🔧 Dataset[{index}]: Removed batch dimension to create 3D tensor: {x.shape}")
-                elif len(x.shape) == 3:
-                    # Already correct shape: [3, 256, 256]
-                    pass
-                else:
-                    # Reshape to correct dimensions
-                    x = x.view(3, patches[0].shape[0], patches[0].shape[1])
-                    debug_print(f"🔧 Dataset[{index}]: Reshaped tensor to: {x.shape}")
-            else:
-                # Multiple patches: ensure shape is [num_patches, 3, 256, 256]
-                if len(x.shape) != 4:
-                    debug_print(f"⚠️  Dataset[{index}]: Unexpected tensor shape {x.shape}, expected 4D")
-                    if len(x.shape) == 5:
-                        # Flatten first two dimensions
-                        batch_size = x.shape[0] * x.shape[1]
-                        x = x.view(batch_size, *x.shape[2:])
-                        debug_print(f"🔧 Dataset[{index}]: Fixed 5D tensor to: {x.shape}")
-                    elif len(x.shape) == 3:
-                        # Add batch dimension
-                        x = x.unsqueeze(0)
-                        debug_print(f"🔧 Dataset[{index}]: Added batch dimension to 3D tensor: {x.shape}")
-            
-            # Validate final shape based on patch count
-            if len(patches) == 1:
-                # Single patch: expect 3D tensor [channels, height, width]
-                if len(x.shape) != 3:
-                    raise ValueError(f"Dataset[{index}]: Failed to create 3D tensor for single patch. Final shape: {x.shape}")
-                if x.shape[0] != 3:
-                    raise ValueError(f"Dataset[{index}]: Expected 3 channels (RGB), got {x.shape[0]} channels")
-            else:
-                # Multiple patches: expect 4D tensor [num_patches, channels, height, width]
-                if len(x.shape) != 4:
-                    raise ValueError(f"Dataset[{index}]: Failed to create 4D tensor for multiple patches. Final shape: {x.shape}")
-                if x.shape[1] != 3:
-                    raise ValueError(f"Dataset[{index}]: Expected 3 channels (RGB), got {x.shape[1]} channels")
-            
-            # Create dummy segmentation for all patches (all zeros for now)
-            if len(patches) == 1:
-                # Single patch: create 3D tensor [1, height, width]
-                seg = torch.zeros(1, patches[0].shape[0], patches[0].shape[1])
-                # Create dummy object class tensor for single patch
-                object_cls = torch.zeros(1, dtype=torch.long)  # Assuming single class
-            else:
-                # Multiple patches: create 4D tensor [num_patches, 1, height, width]
-                seg = torch.zeros(len(patches), 1, patches[0].shape[0], patches[0].shape[1])
-                # Create dummy object class tensor for all patches
-                object_cls = torch.zeros(len(patches), dtype=torch.long)  # Assuming single class
-            
-            # Create dummy anomaly class for all patches
-            anomaly_classes = ["all"] * len(patches)
-            
-            # Create image paths for all patches
-            image_paths = [image_path] * len(patches)
-            
-            debug_print(f"🔍 Dataset[{index}]: Final shapes - x: {x.shape}, seg: {seg.shape}, object_cls: {object_cls.shape}")
-            
-            return x, seg, object_cls, image_paths, anomaly_classes, coords
-        else:
-            raise ValueError(f"No patches extracted from image: {image_path}")
+        # Add to cache
+        self._image_cache[image_path] = image_np
+        debug_print(f"🔧 Cached image: {image_path} (cache size: {len(self._image_cache)})")
+        
+        return image_np
     
     def _pad_image_to_patch_size(self, img):
         """
@@ -371,146 +493,29 @@ def _compute_abs_diff_max(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.abs(a - b).max(dim=1, keepdim=True)[0]
 
 
-def custom_collate_fn(batch):
-    """
-    Custom collate function to handle variable-sized batches.
-    Each item in the batch is a tuple of (x, seg, object_cls, image_paths, anomaly_classes, patch_coords)
-    where x has shape [num_patches, channels, height, width] and num_patches varies between images.
-    
-    This function is necessary because:
-    1. Different images have different numbers of patches (depending on image dimensions)
-    2. The default collate function expects all items to have the same shape
-    3. We need to concatenate patches from different images into a single batch
-    """
-    # Separate the components
-    x_list, seg_list, object_cls_list, image_paths_list, anomaly_classes_list, patch_coords_list = zip(*batch)
-    
-    # For variable-sized tensors, we need to handle them differently
-    # Instead of stacking, we'll concatenate along a new dimension
-    # But first, let's flatten all patches from all images into a single list
-    
-    all_x = []
-    all_seg = []
-    all_object_cls = []
-    all_image_paths = []
-    all_anomaly_classes = []
-    all_patch_coords = []
-    
-    for i, (x, seg, object_cls, image_paths, anomaly_classes, patch_coords) in enumerate(batch):
-        # Debug: Check individual tensor shapes
-        debug_print(f"🔍 custom_collate_fn: Image {i} tensor x shape: {x.shape}")
-        
-        # Ensure x has the expected 4D shape before adding to list
-        if len(x.shape) != 4:
-            debug_print(f"⚠️  Warning: Image {i} has unexpected tensor shape {x.shape}, attempting to fix")
-            if len(x.shape) == 5:
-                # Flatten the first two dimensions
-                batch_size = x.shape[0] * x.shape[1]
-                x = x.view(batch_size, *x.shape[2:])
-                debug_print(f"🔧 Fixed 5D tensor to shape: {x.shape}")
-            elif len(x.shape) == 3:
-                # Add batch dimension
-                x = x.unsqueeze(0)
-                debug_print(f"🔧 Added batch dimension to 3D tensor: {x.shape}")
-        
-        # Add all patches from this image
-        all_x.append(x)
-        all_seg.append(seg)
-        all_object_cls.append(object_cls)
-        # Expand per-patch metadata to per-patch lists aligned with x
-        num_patches = x.shape[0]
-        all_image_paths.extend([image_paths[0] if isinstance(image_paths, list) and len(image_paths) > 0 else image_paths] * num_patches)
-        all_anomaly_classes.extend([anomaly_classes[0] if isinstance(anomaly_classes, list) and len(anomaly_classes) > 0 else anomaly_classes] * num_patches)
-        # Ensure patch_coords is a list of 8-value coords, one per patch
-        if isinstance(patch_coords, list) and len(patch_coords) == num_patches:
-            all_patch_coords.extend(patch_coords)
-        else:
-            # Broadcast a single coord to all patches if needed
-            all_patch_coords.extend([patch_coords] * num_patches)
-    
-    # Concatenate all tensors along the first dimension
-    # Ensure we're concatenating along the batch dimension (dim=0)
-    try:
-        x_combined = torch.cat(all_x, dim=0)
-        seg_combined = torch.cat(all_seg, dim=0)
-        object_cls_combined = torch.cat(all_object_cls, dim=0)
-    except Exception as e:
-        debug_print(f"❌ Error during tensor concatenation: {e}")
-        debug_print(f"🔍 Individual tensor shapes: {[x.shape for x in all_x]}")
-        raise
-    
-    # Debug: Print tensor shapes to verify dimensions
-    debug_print(f"🔍 custom_collate_fn: x_combined shape: {x_combined.shape}")
-    debug_print(f"🔍 custom_collate_fn: seg_combined shape: {seg_combined.shape}")
-    debug_print(f"🔍 custom_collate_fn: object_cls_combined shape: {object_cls_combined.shape}")
-    
-    # Ensure x_combined has the correct 4D shape [batch, channels, height, width]
-    if len(x_combined.shape) != 4:
-        debug_print(f"⚠️  Warning: x_combined has unexpected shape {x_combined.shape}, expected 4D")
-        # If we somehow got a 5D tensor, try to reshape it
-        if len(x_combined.shape) == 5:
-            # This shouldn't happen, but if it does, flatten the first two dimensions
-            debug_print(f"🔧 Reshaping 5D tensor to 4D")
-            batch_size = x_combined.shape[0] * x_combined.shape[1]
-            x_combined = x_combined.view(batch_size, *x_combined.shape[2:])
-            debug_print(f"🔧 Reshaped to: {x_combined.shape}")
-        elif len(x_combined.shape) == 3:
-            # If we got a 3D tensor, add a batch dimension
-            debug_print(f"🔧 Adding batch dimension to 3D tensor")
-            x_combined = x_combined.unsqueeze(0)
-            debug_print(f"🔧 Reshaped to: {x_combined.shape}")
-    
-    # Final validation: ensure we have exactly 4D with 3 channels
-    if len(x_combined.shape) != 4:
-        raise ValueError(f"Failed to create 4D tensor. Final shape: {x_combined.shape}")
-    
-    if x_combined.shape[1] != 3:
-        raise ValueError(f"Expected 3 channels (RGB), got {x_combined.shape[1]} channels")
-    
-    debug_print(f"✅ custom_collate_fn: Final x_combined shape: {x_combined.shape}")
-    
-    return x_combined, seg_combined, object_cls_combined, all_image_paths, all_anomaly_classes, all_patch_coords
 
-def process_patches_in_chunks(patches_tensor, chunk_size=32):
-    """
-    Process patches in smaller chunks to avoid memory issues.
-    Handles both image tensors [batch, channels, height, width] and 
-    class tensors [batch, num_classes] correctly.
-    """
-    total_patches = patches_tensor.size(0)
-    results = []
-    
-    debug_print(f"🔍 process_patches_in_chunks: Input tensor shape: {patches_tensor.shape}")
-    debug_print(f"🔍 process_patches_in_chunks: Total patches: {total_patches}, chunk_size: {chunk_size}")
-    
-    for start_idx in range(0, total_patches, chunk_size):
-        end_idx = min(start_idx + chunk_size, total_patches)
-        chunk = patches_tensor[start_idx:end_idx]
-        debug_print(f"🔍 process_patches_in_chunks: Chunk {start_idx//chunk_size + 1} shape: {chunk.shape}")
-        results.append(chunk)
-    
-    debug_print(f"🔍 process_patches_in_chunks: Created {len(results)} chunks")
-    return results
 
-def _process_batch_inference(x_chunk, object_cls_chunk, model, vae, diffusion, reverse_steps, device, epoch_metrics=None):
+
+
+def _process_batch_inference(x, object_cls, model, vae, diffusion, reverse_steps, device, epoch_metrics=None):
     """
-    Shared inference logic for processing a batch chunk.
+    Shared inference logic for processing a batch.
     Returns the computed difference tensors.
     """
-    debug_print(f"   🔄 Moving {x_chunk.size(0)} patches to device: {device}")
-    debug_print(f"   🔍 x_chunk shape before device move: {x_chunk.shape}")
-    debug_print(f"   🔍 object_cls_chunk shape: {object_cls_chunk.shape}")
+    debug_print(f"   🔄 Moving {x.size(0)} patches to device: {device}")
+    debug_print(f"   🔍 x shape before device move: {x.shape}")
+    debug_print(f"   🔍 object_cls shape: {object_cls.shape}")
     
     # Validate tensor dimensions before processing
-    if len(x_chunk.shape) != 4:
-        raise ValueError(f"Expected 4D input tensor for VAE, got shape: {x_chunk.shape}. Expected: [batch, channels, height, width]")
+    if len(x.shape) != 4:
+        raise ValueError(f"Expected 4D input tensor for VAE, got shape: {x.shape}. Expected: [batch, channels, height, width]")
     
-    if x_chunk.shape[1] != 3:  # Check channels
-        raise ValueError(f"Expected 3 channels (RGB), got {x_chunk.shape[1]} channels")
+    if x.shape[1] != 3:  # Check channels
+        raise ValueError(f"Expected 3 channels (RGB), got {x.shape[1]} channels")
     
-    # Move chunk to device
-    x_device = x_chunk.to(device)
-    object_cls_device = object_cls_chunk.to(device)
+    # Move batch to device
+    x_device = x.to(device)
+    object_cls_device = object_cls.to(device)
     
     debug_print(f"   🔍 x_device shape after device move: {x_device.shape}")
     
@@ -706,148 +711,6 @@ def _validate_and_fix_coordinates(coords_8_values):
     debug_print(f"  ✅ Validated coordinates: {fixed_coords}")
     return fixed_coords
 
-
-def _extract_patch_info(patch_coords, image_paths_batch, b, patch_size=128):
-    """
-    Shared logic for extracting patch coordinates and image paths.
-    Expects 8-value coordinate format: (x1, y1, x2, y2, x3, y3, x4, y4)
-    """
-    # Get patch coordinates
-    if b < len(patch_coords):
-        patch_coord_tensor = patch_coords[b]
-    else:
-        # If we don't have enough coordinates, use the last available one or default
-        default_coords = (0, 0, patch_size, 0, patch_size, patch_size, 0, patch_size)
-        patch_coord_tensor = patch_coords[-1] if patch_coords else default_coords
-    
-    # Debug: Check coordinate types and structure
-    debug_print(f"🔍 _extract_patch_info: patch_coords[{b}] type: {type(patch_coord_tensor)}")
-    debug_print(f"🔍 _extract_patch_info: patch_coords[{b}] value: {patch_coord_tensor}")
-    if hasattr(patch_coord_tensor, '__len__'):
-        debug_print(f"🔍 _extract_patch_info: patch_coords[{b}] length: {len(patch_coord_tensor)}")
-        if len(patch_coord_tensor) > 0:
-            debug_print(f"🔍 _extract_patch_info: first element type: {type(patch_coord_tensor[0])}")
-            debug_print(f"🔍 _extract_patch_info: first element: {patch_coord_tensor[0]}")
-    
-    # Extract 8-value coordinates
-    if isinstance(patch_coord_tensor, (list, tuple)) and len(patch_coord_tensor) == 8:
-        # Use validation function to ensure coordinates are single integers
-        fixed_coords = _validate_and_fix_coordinates(patch_coord_tensor)
-        x1, y1, x2, y2, x3, y3, x4, y4 = fixed_coords
-        
-        x_coord, y_coord = x1, y1  # Use top-left corner
-        
-        debug_print(f"🔍 _extract_patch_info: extracted coordinates: x1={x1}, y1={y1}, x2={x2}, y2={y2}, x3={x3}, y3={y3}, x4={x4}, y4={y4}")
-    else:
-        raise ValueError(f"Expected 8-value coordinate format, got {type(patch_coord_tensor)} with {len(patch_coord_tensor) if hasattr(patch_coord_tensor, '__len__') else 'unknown'} values")
-    
-    # Get image path
-    if b < len(image_paths_batch):
-        if isinstance(image_paths_batch[b], str):
-            image_path = image_paths_batch[b]
-        elif isinstance(image_paths_batch[b], (list, tuple)):
-            image_path = image_paths_batch[b][0] if image_paths_batch[b] else ""
-        else:
-            image_path = str(image_paths_batch[b])
-    else:
-        image_path = str(image_paths_batch[-1]) if image_paths_batch else ""
-    
-    return x_coord, y_coord, image_path
-
-
-def _process_chunked_inference(x, object_cls, model, vae, diffusion, reverse_steps, device, chunk_size=16, epoch_metrics=None):
-    """
-    Process patches in chunks and return concatenated results.
-    """
-    debug_print(f"📦 Creating chunks with size {chunk_size} from {x.size(0)} patches")
-    debug_print(f"🔍 Input tensor x shape: {x.shape}")
-    debug_print(f"🔍 Input tensor object_cls shape: {object_cls.shape}")
-    debug_print(f"🔍 Input tensor object_cls dtype: {object_cls.dtype}")
-    debug_print(f"🔍 Input tensor object_cls device: {object_cls.device}")
-    
-    # Final safety check: ensure input tensor is 4D
-    if len(x.shape) != 4:
-        debug_print(f"⚠️  CRITICAL: Input tensor has wrong shape {x.shape}, attempting to fix")
-        if len(x.shape) == 5:
-            # Flatten first two dimensions
-            batch_size = x.shape[0] * x.shape[1]
-            x = x.view(batch_size, *x.shape[2:])
-            debug_print(f"🔧 Fixed 5D tensor to: {x.shape}")
-        elif len(x.shape) == 3:
-            # Add batch dimension
-            x = x.unsqueeze(0)
-            debug_print(f"🔧 Added batch dimension to 3D tensor: {x.shape}")
-        else:
-            raise ValueError(f"Cannot fix tensor with shape {x.shape}")
-    
-    # Validate final shape
-    if len(x.shape) != 4:
-        raise ValueError(f"Failed to create 4D tensor. Final shape: {x.shape}")
-    
-    if x.shape[1] != 3:
-        raise ValueError(f"Expected 3 channels (RGB), got {x.shape[1]} channels")
-    
-    debug_print(f"✅ Input tensor validated: {x.shape}")
-    
-    # Process image tensor in chunks
-    x_chunks = process_patches_in_chunks(x, chunk_size=chunk_size)
-    
-    # Process object class tensor - ensure proper shape but DON'T chunk it
-    # object_cls should be [batch_size, num_classes] where num_classes is typically 1
-    if len(object_cls.shape) == 2:
-        # Standard case: [batch_size, num_classes]
-        object_cls_final = object_cls
-    elif len(object_cls.shape) == 1:
-        # If it's [batch_size], add a dimension to make it [batch_size, 1]
-        object_cls_final = object_cls.unsqueeze(1)
-        debug_print(f"🔧 Added dimension to object_cls: {object_cls_final.shape}")
-    else:
-        # Unexpected shape, try to fix it
-        debug_print(f"⚠️  Warning: Unexpected object_cls shape {object_cls.shape}, attempting to fix")
-        if len(object_cls.shape) > 2:
-            # Flatten extra dimensions
-            batch_size = object_cls.shape[0]
-            object_cls_final = object_cls.view(batch_size, -1)
-            debug_print(f"🔧 Fixed object_cls shape to: {object_cls_final.shape}")
-        else:
-            object_cls_final = object_cls
-    
-    debug_print(f"📊 Created {len(x_chunks)} chunks")
-    debug_print(f"🔍 Final object_cls shape: {object_cls_final.shape}")
-    
-    all_encodedrecon_diffs = []
-    all_encoded_latent_diffs = []
-    all_anomaly_maps = []
-    
-    current_index = 0
-    for chunk_idx, x_chunk in enumerate(x_chunks):
-        debug_print(f"🔧 Processing chunk {chunk_idx+1}/{len(x_chunks)} with {x_chunk.size(0)} patches")
-        debug_print(f"🔍 Chunk {chunk_idx+1} x_chunk shape: {x_chunk.shape}")
-        # Slice per-chunk class indices so batch sizes match
-        chunk_size_now = x_chunk.size(0)
-        object_cls_chunk = object_cls_final[current_index:current_index + chunk_size_now]
-        current_index += chunk_size_now
-        debug_print(f"🔍 Using object_cls_chunk shape: {object_cls_chunk.shape}")
-        debug_print(f"🔍 Using object_cls_chunk dtype: {object_cls_chunk.dtype}")
-        debug_print(f"🔍 Using object_cls_chunk device: {object_cls_chunk.device}")
-        
-        encodedrecon_diff, encoded_latent_diff, anomaly_map = _process_batch_inference(
-            x_chunk, object_cls_chunk, model, vae, diffusion, reverse_steps, device, epoch_metrics
-        )
-        debug_print(f"✅ Chunk {chunk_idx+1} completed")
-        
-        all_encodedrecon_diffs.append(encodedrecon_diff)
-        all_encoded_latent_diffs.append(encoded_latent_diff)
-        all_anomaly_maps.append(anomaly_map)
-    
-    # Concatenate all results
-    encodedrecon_dodrecon_diff = torch.cat(all_encodedrecon_diffs, dim=0)
-    encoded_latent_diff_resized = torch.cat(all_encoded_latent_diffs, dim=0)
-    anomaly_map_arithmetic = torch.cat(all_anomaly_maps, dim=0)
-    
-    return encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic
-
-
 def _save_results(
     args,
     dataloader,
@@ -962,8 +825,52 @@ def _save_results(
     
     idx = start_idx - 1  # Start from the batch before start_idx since we increment at the beginning
     
+    # Setup async saving executor (Windows-safe). Default to 1 worker on Windows.
+    async_workers = getattr(args, "async_save_workers", None)
+    if async_workers is None:
+        # If not provided via CLI or JSON, set default: 1 for Windows, 4 otherwise
+        async_workers = 1 if platform.system().lower().startswith("win") else max(2, min(8, os.cpu_count() or 4))
+    # Ensure at least 1
+    async_workers = max(1, int(async_workers))
+
+    executor = ThreadPoolExecutor(max_workers=async_workers)
+    pending = deque()
+    # throttle pending tasks to avoid unbounded memory when disk is slow
+    # allow more queueing so we can exit the batch quickly and overlap with next batch
+    max_pending = max(8, async_workers * 8)
+
+    def _submit_save_job(save_dir_local, base_filename_local,
+                         encodedrecon_raw_local, latent_raw_local, anomaly_raw_local,
+                         coords_array_local, save_preview_local, save_dtype_is_f16_local):
+        def _job():
+            # Save npy arrays
+            if save_dtype_is_f16_local:
+                np.save(os.path.join(save_dir_local, f"{base_filename_local}_encodedrecon.npy"), encodedrecon_raw_local.astype(np.float16))
+                np.save(os.path.join(save_dir_local, f"{base_filename_local}_latent.npy"), latent_raw_local.astype(np.float16))
+                np.save(os.path.join(save_dir_local, f"{base_filename_local}_anomaly_map_arithmetic.npy"), anomaly_raw_local.astype(np.float16))
+            else:
+                np.save(os.path.join(save_dir_local, f"{base_filename_local}_encodedrecon.npy"), encodedrecon_raw_local.astype(np.float32))
+                np.save(os.path.join(save_dir_local, f"{base_filename_local}_latent.npy"), latent_raw_local.astype(np.float32))
+                np.save(os.path.join(save_dir_local, f"{base_filename_local}_anomaly_map_arithmetic.npy"), anomaly_raw_local.astype(np.float32))
+
+            # Save coords
+            np.save(os.path.join(save_dir_local, f"{base_filename_local}_coords.npy"), coords_array_local.astype(np.int32))
+
+            # Save previews if requested
+            if save_preview_local:
+                PILImage.fromarray((encodedrecon_raw_local * 255).astype(np.uint8)).save(os.path.join(save_dir_local, f"{base_filename_local}_encodedrecon.png"))
+                PILImage.fromarray((latent_raw_local * 255).astype(np.uint8)).save(os.path.join(save_dir_local, f"{base_filename_local}_latent.png"))
+                PILImage.fromarray((anomaly_raw_local * 255).astype(np.uint8)).save(os.path.join(save_dir_local, f"{base_filename_local}_anomaly_map_arithmetic.png"))
+
+        # throttle pending jobs
+        while len(pending) >= max_pending:
+            fut = pending.popleft()
+            fut.result()
+        fut = executor.submit(_job)
+        pending.append(fut)
+
     try:
-        for idx, (x, seg, object_cls, image_paths, anomaly_classes, patch_coords) in enumerate(
+        for idx, (x, seg, object_cls, anomaly_classes, image_path, patch_coords) in enumerate(
             tqdm(dataloader, desc=f"{split} split")
         ):
             if idx >= batch_num:
@@ -983,9 +890,9 @@ def _save_results(
                     # We'll check the first few patches to see if they're already processed
                     sample_patch_count = min(3, x.size(0))  # Check first 3 patches
                     for b in range(sample_patch_count):
-                        if b < len(image_paths):
-                            image_path = image_paths[b] if isinstance(image_paths[b], str) else str(image_paths[b])
-                            file_info = path_to_safe_filename(image_path)
+                        if b < len(image_path):
+                            sample_image_path = image_path[b] if isinstance(image_path[b], str) else str(image_path[b])
+                            file_info = path_to_safe_filename(sample_image_path)
                             
                             # Check if the output files exist
                             base_filename = f"{file_info}__minimal_diff"
@@ -1045,52 +952,51 @@ def _save_results(
                 
                 debug_print(f"✅ Tensor validated before inference: {x.shape}")
                 
-                # Use shared inference logic with smaller chunk size for debugging
-                # Use user-configurable chunk size for better throughput
-                chunk_size = getattr(args, "inference_chunk_size", 16)
-                encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic = _process_chunked_inference(
-                    x, object_cls, model, vae, diffusion, reverse_steps, device, chunk_size=chunk_size, epoch_metrics=epoch_metrics
+                # Direct inference on the batch (no chunking needed since dataset returns individual patches)
+                encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic = _process_batch_inference(
+                    x, object_cls, model, vae, diffusion, reverse_steps, device, epoch_metrics=epoch_metrics
                 )
                 debug_print(f"✅ Inference completed")
             
             # ---------------------------------------------------------------------
-            # Per‑sample aggregation and saving
+            # Per‑sample aggregation and async saving (Windows-safe threading)
             # ---------------------------------------------------------------------
             batch_size = x.size(0)
+            save_f16 = getattr(args, "save_npy_dtype", "float16") == "float16"
+            save_preview = getattr(args, "save_preview_images", False)
             
             for b in range(batch_size):
-                # Use shared coordinate and path extraction
-                x_coord, y_coord, image_path = _extract_patch_info(patch_coords, image_paths, b, args.patch_size)
-                
-                # Get all 4 corner coordinates for irregular patches
-                x1, y1 = x_coord, y_coord  # Top-left corner
-                
-                # Since we use padding, all patches are regular patch_size x patch_size
-                patch_size_actual = args.patch_size  # All patches are now regular due to padding
-                x2, y2 = x_coord + patch_size_actual, y_coord  # Top-right
-                x3, y3 = x_coord + patch_size_actual, y_coord + patch_size_actual  # Bottom-right
-                x4, y4 = x_coord, y_coord + patch_size_actual  # Bottom-left
-                
-                # Create base filename with file info and patch info (all 4 corners)
-                if b < len(image_paths):
-                    if isinstance(image_paths[b], str):
-                        image_path = image_paths[b]
-                    elif isinstance(image_paths[b], (list, tuple)):
-                        image_path = image_paths[b][0] if image_paths[b] else ""
+                # Get the image path directly from the batch
+                if b < len(image_path):
+                    if isinstance(image_path[b], str):
+                        current_image_path = image_path[b]
+                    elif isinstance(image_path[b], (list, tuple)):
+                        current_image_path = image_path[b][0] if image_path[b] else ""
                     else:
-                        image_path = str(image_paths[b])
+                        current_image_path = str(image_path[b])
                 else:
-                    # If we don't have enough image paths, use the last available one or default
-                    if image_paths:
-                        if isinstance(image_paths[-1], str):
-                            image_path = image_paths[-1]
-                        elif isinstance(image_paths[-1], (list, tuple)):
-                            image_path = image_paths[-1][0] if image_paths[-1] else ""
-                        else:
-                            image_path = str(image_paths[-1])
+                    current_image_path = str(image_path[-1]) if image_path else ""
+                
+                # Get the 8-value coordinates directly from the batch
+                if isinstance(patch_coords, torch.Tensor) and len(patch_coords.shape) == 2:
+                    if b < patch_coords.size(0):
+                        coords_8_values = patch_coords[b].tolist()  # Get [8] tensor for this batch item
                     else:
-                        image_path = ""
-                file_info = path_to_safe_filename(image_path)
+                        coords_8_values = patch_coords[-1].tolist() if patch_coords.size(0) > 0 else [0, 0, args.patch_size, 0, args.patch_size, args.patch_size, 0, args.patch_size]
+                else:
+                    raise ValueError(f"Expected patch_coords to be [batch_size, 8] tensor, got {type(patch_coords)} with shape {patch_coords.shape if hasattr(patch_coords, 'shape') else 'unknown'}")
+                
+                # Extract individual coordinates from the 8-value format
+                x1, y1, x2, y2, x3, y3, x4, y4 = coords_8_values
+                
+                # Debug: Log the image path extraction
+                debug_print(f"🔍 Patch {b}: current_image_path = '{current_image_path}'")
+                
+                # Ensure we have a valid file_info, fallback to "unknown" if empty
+                file_info = _safe_filename_component(current_image_path)
+                if file_info == "unknown":
+                    debug_print(f"⚠️  Warning: Empty/invalid image path for patch {b}, using fallback filename")
+                
                 patch_info = f"x{x1}_y{y1}_x{x2}_y{y2}_x{x3}_y{y3}_x{x4}_y{y4}"
                 base_filename = f"{file_info}__{patch_info}__minimal_diff"
                 
@@ -1106,62 +1012,27 @@ def _save_results(
                 latent_raw = latent_raw.squeeze()
                 anomaly_map_arithmetic_raw = anomaly_map_arithmetic_raw.squeeze()
 
-                # Save raw values efficiently as numpy arrays (preserves [0,1] range)
-                if getattr(args, "save_npy_dtype", "float16") == "float16":
-                    np.save(os.path.join(save_dir, f"{base_filename}_encodedrecon.npy"), encodedrecon_raw.astype(np.float16))
-                    np.save(os.path.join(save_dir, f"{base_filename}_latent.npy"), latent_raw.astype(np.float16))
-                    np.save(os.path.join(save_dir, f"{base_filename}_anomaly_map_arithmetic.npy"), anomaly_map_arithmetic_raw.astype(np.float16))
-                else:
-                    np.save(os.path.join(save_dir, f"{base_filename}_encodedrecon.npy"), encodedrecon_raw.astype(np.float32))
-                    np.save(os.path.join(save_dir, f"{base_filename}_latent.npy"), latent_raw.astype(np.float32))
-                    np.save(os.path.join(save_dir, f"{base_filename}_anomaly_map_arithmetic.npy"), anomaly_map_arithmetic_raw.astype(np.float32))
-                
-                # Save 8-value coordinates as a separate .npy file (more efficient than filename parsing)
-                # Create coordinate list and validate it
-                patch_coords_8_values = [x1, y1, x2, y2, x3, y3, x4, y4]
-                
-                # Use validation function to ensure coordinates are single integers
-                validated_coords = _validate_and_fix_coordinates(patch_coords_8_values)
-                
-                # Debug: Check coordinate types before saving
+                # Prepare coords as numpy and submit async save
+                validated_coords = _validate_and_fix_coordinates(coords_8_values)
                 debug_print(f"🔍 Saving coordinates for patch {b}: {validated_coords}")
                 debug_print(f"  Coordinate types: {[type(coord) for coord in validated_coords]}")
                 debug_print(f"  All integers: {all(isinstance(coord, int) for coord in validated_coords)}")
-                
-                # Convert to numpy array and ensure it's 1D
                 patch_coords_array = np.array(validated_coords, dtype=np.int32)
-                debug_print(f"  Numpy array shape: {patch_coords_array.shape}")
-                debug_print(f"  Numpy array dtype: {patch_coords_array.dtype}")
-                
-                # Ensure it's 1D
                 if len(patch_coords_array.shape) > 1:
                     debug_print(f"  ⚠️  Warning: Coordinates have unexpected shape {patch_coords_array.shape}, flattening...")
                     patch_coords_array = patch_coords_array.flatten()
                     debug_print(f"  Flattened shape: {patch_coords_array.shape}")
-                
-                np.save(os.path.join(save_dir, f"{base_filename}_coords.npy"), patch_coords_array)
-                
-                # Optional verification can be expensive on HDD/large runs; keep behind debug flag
-                if DEBUG_ENABLED:
-                    saved_coords_path = os.path.join(save_dir, f"{base_filename}_coords.npy")
-                    try:
-                        loaded_coords = np.load(saved_coords_path)
-                        debug_print(f"  ✅ Verified saved coordinates: shape={loaded_coords.shape}, dtype={loaded_coords.dtype}")
-                        if len(loaded_coords.shape) != 1 or loaded_coords.shape[0] != 8:
-                            debug_print(f"  ⚠️  Warning: Saved coordinates have unexpected shape: {loaded_coords.shape}")
-                        else:
-                            debug_print(f"  ✅ Coordinates saved correctly as 1D array with 8 values")
-                    except Exception as e:
-                        debug_print(f"  ❌ Error verifying saved coordinates: {e}")
-                
-                # Save preview images only when explicitly requested to reduce I/O overhead
-                if getattr(args, "save_preview_images", False):
-                    encodedrecon_img = (encodedrecon_raw * 255).astype(np.uint8)
-                    latent_img = (latent_raw * 255).astype(np.uint8)
-                    anomaly_map_arithmetic_img = (anomaly_map_arithmetic_raw * 255).astype(np.uint8)
-                    PILImage.fromarray(encodedrecon_img).save(os.path.join(save_dir, f"{base_filename}_encodedrecon.png"))
-                    PILImage.fromarray(latent_img).save(os.path.join(save_dir, f"{base_filename}_latent.png"))
-                    PILImage.fromarray(anomaly_map_arithmetic_img).save(os.path.join(save_dir, f"{base_filename}_anomaly_map_arithmetic.png"))
+
+                _submit_save_job(
+                    save_dir,
+                    base_filename,
+                    encodedrecon_raw,
+                    latent_raw,
+                    anomaly_map_arithmetic_raw,
+                    patch_coords_array,
+                    save_preview,
+                    save_f16,
+                )
             
             # After finishing all patches for this image, update checkpoint
             if checkpoint_manager is not None:
@@ -1171,7 +1042,7 @@ def _save_results(
                     try:
                         # Collect valid image paths (deduplicated)
                         processed_image_paths = []
-                        for p in image_paths:
+                        for p in image_path:
                             if isinstance(p, str) and p:
                                 processed_image_paths.append(p)
                             elif isinstance(p, (list, tuple)) and len(p) > 0:
@@ -1213,6 +1084,15 @@ def _save_results(
     except Exception as e:
         print(f"\nError occurred: {e}")
         raise
+    finally:
+        # Drain pending save jobs and shutdown executor
+        while pending:
+            fut = pending.popleft()
+            try:
+                fut.result()
+            except Exception as e:
+                debug_print(f"❌ Error in async save job: {e}")
+        executor.shutdown(wait=True)
 
     # Print summary of processing
     total_batches = min(batch_num, len(dataloader))
@@ -1277,84 +1157,17 @@ def create_confusion_matrix_from_records(
     
     print(f"Creating confusion matrix for {len(image_records)} images...")
     
-    for image_path, image_record_list in tqdm(image_records.items(), desc="Processing confusion matrix"):
-        # Get predicted defective patches
-        predicted = set()
-        for record in image_record_list:
-            # Handle 8-value coordinates: (x1, y1, x2, y2, x3, y3, x4, y4)
-            patch_coords = record["patch_coords"][1]
-            if len(patch_coords) == 8:
-                # Use top-left corner (x1, y1) for grid calculation
-                patch_x, patch_y = patch_coords[0], patch_coords[1]
-            elif len(patch_coords) == 2:
-                # Legacy 2-value format - convert to 8-value for consistency
-                patch_x, patch_y = patch_coords[0], patch_coords[1]
-                # Update the record with 8-value coordinates
-                x1, y1 = patch_x, patch_y
-                x2, y2 = x1 + patch_size, y1  # Top-right
-                x3, y3 = x1 + patch_size, y1 + patch_size  # Bottom-right
-                x4, y4 = x1, y1 + patch_size  # Bottom-left
-                record["patch_coords"] = ("meta", [x1, y1, x2, y2, x3, y3, x4, y4])
-            else:
-                print(f"Warning: Unexpected coordinate format in record: {len(patch_coords)} values")
-                continue
-            
-            grid_row = patch_y // patch_size
-            grid_col = patch_x // patch_size
-            status = record["status"][1]
-            
-            # Add to predicted if TP or FP (predicted as defective)
-            if status in ["TP", "FP"]:
-                predicted.add((grid_row, grid_col))
-        
-        # Get ground truth defective patches
-        gt = set()
-        if annotation_dir:
-            annotation_filename = f"{os.path.basename(image_path).replace('.png', '')}__annotations.json"
-            annotation_path = os.path.join(annotation_dir, annotation_filename)
-            if os.path.exists(annotation_path):
-                try:
-                    with open(annotation_path, 'r') as f:
-                        annotation = json.load(f)
-                        gt = set(tuple(x) for x in annotation.get("defective_patches", []))
-                except Exception as e:
-                    print(f"Warning: Error reading annotation file {annotation_path}: {e}")
-        
-        # Calculate grid dimensions
-        try:
-            img = PILImage.open(image_path)
-            h, w = img.height, img.width
-        except Exception as e:
-            print(f"Warning: Could not open image {image_path}: {e}")
-            # Estimate grid size from patch coordinates
-            # Handle both 8-value and 2-value coordinate formats
-            max_x = 0
-            max_y = 0
-            for record in image_record_list:
-                patch_coords = record["patch_coords"][1]
-                if len(patch_coords) >= 2:
-                    # Use first two values (x1, y1) for max calculation
-                    max_x = max(max_x, patch_coords[0])
-                    max_y = max(max_y, patch_coords[1])
-            
-            h, w = max_y + patch_size, max_x + patch_size
-        
-        n_rows = (h + patch_size - 1) // patch_size  # Ceiling division
-        n_cols = (w + patch_size - 1) // patch_size   # Ceiling division
-        all_cells = set((r, c) for r in range(n_rows) for c in range(n_cols))
-        
-        # Count confusion matrix elements
-        for cell in all_cells:
-            pred = cell in predicted
-            truth = cell in gt
-            if pred and truth:
-                all_TP += 1
-            elif pred and not truth:
-                all_FP += 1
-            elif not pred and truth:
-                all_FN += 1
-            else:
-                all_TN += 1
+    # Simply count the status values directly from the records instead of re-deriving them
+    for record in records:
+        status = record["status"][1]
+        if status == "TP":
+            all_TP += 1
+        elif status == "FP":
+            all_FP += 1
+        elif status == "FN":
+            all_FN += 1
+        elif status == "TN":
+            all_TN += 1
     
     total = all_TP + all_FP + all_FN + all_TN
     accuracy = (all_TP + all_TN) / total if total > 0 else 0
@@ -1567,8 +1380,7 @@ def save_all_records_json(records: List[Record], output_dir: str, filename: str 
     else:
         print(f"📊 Records kept in original order (no sorting)")
     
-    if "summary" in all_records_data:
-        print(f"Status distribution: {all_records_data['summary']['status_counts']}")
+    print(f"Status distribution: {all_records_data['summary']['status_counts']}")
 
 def load_model_and_components(args):
     """Load VAE, model, and diffusion components."""
@@ -1649,33 +1461,6 @@ def get_transform():
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
 
-def get_dataloader(dataset, batch_size=1, irregular_patch=False):
-    """Get dataloader for the dataset."""
-    debug_print(f"🔧 get_dataloader: batch_size={batch_size}, irregular_patch={irregular_patch}")
-    
-    # Always use custom_collate_fn to ensure consistent shapes and per-patch metadata formatting
-    debug_print(f"🔧 Using custom_collate_fn for all cases to keep patch coords and paths aligned")
-    # Allow caller to control num_workers via dataset attribute if present (set in _before_saving_results)
-    effective_num_workers = getattr(dataset, "_num_workers", 0)
-
-    # Build kwargs conditionally to avoid invalid combinations on single-process mode
-    dataloader_kwargs = dict(
-        dataset=dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=effective_num_workers,
-        drop_last=False,
-        collate_fn=custom_collate_fn,
-        pin_memory=torch.cuda.is_available(),
-    )
-    if effective_num_workers and effective_num_workers > 0:
-        dataloader_kwargs.update({
-            "prefetch_factor": 2,
-            "persistent_workers": True,
-        })
-
-    return DataLoader(**dataloader_kwargs)
-
 def _before_saving_results(args):
     """
     Shared logic for preparing evaluation components.
@@ -1691,40 +1476,24 @@ def _before_saving_results(args):
         transform=get_transform(),
         object_class=args.object_class,
     )
-    # Attach desired dataloader worker count to the dataset for loader construction
-    try:
-        dataset._num_workers = max(0, int(getattr(args, "num_workers", 0)))
-    except Exception:
-        dataset._num_workers = 0
-    
-    # Use smaller batch size for irregular patches to avoid tensor dimension issues
-    if args.irregular_patch:
-        batch_size = 1  # Process one image at a time to avoid dimension conflicts
-        debug_print(f"🔧 Using irregular patch mode with batch_size={batch_size}")
-    else:
-        batch_size = 16  # Standard batch size for regular patches
-        debug_print(f"🔧 Using regular patch mode with batch_size={batch_size}")
-    
-    debug_print(f"🔧 Final irregular_patch value: {args.irregular_patch}")
-    debug_print(f"🔧 Final batch_size: {batch_size}")
-    
-    # Note: We use intelligent collate function selection to prevent 5D tensor stacking issues
-    # - For uniform patch counts: use PyTorch's default collate function directly (dataset returns 3D tensors)
-    # - For variable patch counts: use custom collate function (more flexible)
-    # - Both approaches ensure proper tensor shapes: [batch, channels, height, width]
-    # - This prevents the "Expected 4D input tensor" error during inference
-    loader = get_dataloader(dataset, batch_size=batch_size, irregular_patch=args.irregular_patch)
-    
-    # Debug: Check what type of collate function is being used
-    if hasattr(loader, 'collate_fn'):
-        debug_print(f"🔧 DataLoader collate_fn: {loader.collate_fn}")
-        if loader.collate_fn == custom_collate_fn:
-            debug_print(f"🔧 Using custom_collate_fn")
-        else:
-            debug_print(f"🔧 Using default collate function")
-    else:
-        debug_print(f"🔧 DataLoader has no collate_fn attribute")
-    
+
+    dataloader_kwargs = dict(
+        dataset=dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        drop_last=False,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    if args.num_workers and args.num_workers > 0:
+        dataloader_kwargs.update({
+            "prefetch_factor": 2,
+            "persistent_workers": True,
+        })
+
+    loader = DataLoader(**dataloader_kwargs)
+
     # Create checkpoint manager
     checkpoint_manager = CheckpointManager(args.results_dir, args.annotation_dir, args.force_rerun)
     
@@ -1749,7 +1518,7 @@ def _reading_saved_results(args):
         annotation_dir=args.annotation_dir,
         patch_size=args.patch_size,
         transform=get_transform(),
-        object_class=args.object_class,
+        object_class=args.object_class
     )
     
     # Create empty ground truth map for compatibility
@@ -2111,15 +1880,8 @@ def _generate_records_directly(args, vae, model, diffusion, loader):
     ground_truth_map = load_ground_truth_map(args.annotation_dir)
     print(f"Loaded ground truth for {len(ground_truth_map)} images")
     
-    # Extract unique image paths from dataset
-    image_paths = set()
-    for i in range(len(loader.dataset)):
-        annotation_file = loader.dataset.annotation_files[i]
-        with open(annotation_file, 'r') as f:
-            annotation_data = json.load(f)
-        image_path = annotation_data.get('image_path', '')
-        if image_path:
-            image_paths.add(image_path)
+    # Extract unique image paths from dataset (dataset is patch-level now)
+    image_paths = set(loader.dataset.get_all_image_paths())
     
     # Load original images
     original_images = load_original_images(image_paths)
@@ -2130,39 +1892,51 @@ def _generate_records_directly(args, vae, model, diffusion, loader):
     
     idx = -1
     try:
-        for idx, (x, seg, object_cls, image_paths_batch, anomaly_classes, patch_coords) in enumerate(
+        for idx, (x, seg, object_cls, anomaly_classes, image_paths_batch, patch_coords) in enumerate(
             tqdm(loader, desc="Processing patches")
         ):
             if idx >= args.batch_num:
                 break
-
+            debug_print(f"!!!!!!🔍 idx: {idx}")
+            debug_print(f"!!!!!!🔍 Input tensor x shape: {x.shape}")
+            debug_print(f"!!!!!!🔍 Input tensor x type: {type(x)}")
+            debug_print(f"!!!!!!🔍 Input tensor x dtype: {x.dtype}")
+            debug_print(f"!!!!!!🔍 Input tensor x device: {x.device}")
             with torch.no_grad():
-                # Use shared inference logic
-                encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic = _process_chunked_inference(
-                    x, object_cls, model, vae, diffusion, args.reverse_steps, device, chunk_size=16, epoch_metrics=epoch_metrics
+                # Direct inference on the batch (no chunking needed since dataset returns individual patches)
+                encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic = _process_batch_inference(
+                    x, object_cls, model, vae, diffusion, args.reverse_steps, device, epoch_metrics=epoch_metrics
                 )
             
             # Process each patch to create records
             batch_size = x.size(0)
             
             for b in range(batch_size):
-                # Use shared coordinate and path extraction
-                x_coord, y_coord, image_path = _extract_patch_info(patch_coords, image_paths_batch, b, args.patch_size)
-                
-                # Get the 8-value coordinates from the dataset
-                patch_coords_raw = patch_coords[b]  # Should already be 8 values from dataset
-                debug_print(f"  🔍 Raw patch_coords[{b}]: {patch_coords_raw} (type: {type(patch_coords_raw)}, len: {len(patch_coords_raw) if hasattr(patch_coords_raw, '__len__') else 'N/A'})")
-                
-                # Ensure we have 8-value coordinates and convert to list if needed
-                if isinstance(patch_coords_raw, (list, tuple)) and len(patch_coords_raw) == 8:
-                    patch_coords_8_values = list(patch_coords_raw)
-                elif hasattr(patch_coords_raw, '__len__') and len(patch_coords_raw) == 8:
-                    # Handle numpy arrays or other array-like objects
-                    patch_coords_8_values = list(patch_coords_raw)
+                # Get the image path directly from the batch
+                if b < len(image_paths_batch):
+                    if isinstance(image_paths_batch[b], str):
+                        current_image_path = image_paths_batch[b]
+                    elif isinstance(image_paths_batch[b], (list, tuple)):
+                        current_image_path = image_paths_batch[b][0] if image_paths_batch[b] else ""
+                    else:
+                        current_image_path = str(image_paths_batch[b])
                 else:
-                    raise ValueError(f"Expected 8-value coordinates from dataset, got {type(patch_coords_raw)} with {len(patch_coords_raw) if hasattr(patch_coords_raw, '__len__') else 'unknown'} values: {patch_coords_raw}")
+                    current_image_path = str(image_paths_batch[-1]) if image_paths_batch else ""
                 
-                debug_print(f"  ✅ Using 8-value coordinates: {patch_coords_8_values}")
+                # Extract x_coord and y_coord from the patch coordinates
+                if isinstance(patch_coords, torch.Tensor) and len(patch_coords.shape) == 2:
+                    if b < patch_coords.size(0):
+                        coords_8_values = patch_coords[b].tolist()
+                    else:
+                        coords_8_values = patch_coords[-1].tolist() if patch_coords.size(0) > 0 else [0, 0, args.patch_size, 0, args.patch_size, args.patch_size, 0, args.patch_size]
+                else:
+                    raise ValueError(f"Expected patch_coords to be [batch_size, 8] tensor, got {type(patch_coords)} with shape {patch_coords.shape if hasattr(patch_coords, 'shape') else 'unknown'}")
+                
+                # Extract x_coord and y_coord from the first two values (top-left corner)
+                x_coord, y_coord = coords_8_values[0], coords_8_values[1]
+                
+                # We already have coords_8_values from above
+                debug_print(f"  ✅ Using 8-value coordinates: {coords_8_values}")
                 
                 # Convert tensors to numpy
                 encodedrecon_raw = _to_numpy(encodedrecon_dodrecon_diff[b]).squeeze()
@@ -2175,10 +1949,7 @@ def _generate_records_directly(args, vae, model, diffusion, loader):
                 # Create binary mask
                 anomaly_map_arithmetic_binary = _binary_mask(
                     anomaly_map_arithmetic_tensor, 
-                    args.anomaly_binary_threshold, 
-                    visualize=False, 
-                    debug=False, 
-                    filename=image_path
+                    args.anomaly_binary_threshold
                 )
                 #anomaly_map_arithmetic_binary = _binary_mask_exclude_boundary3(
                 #    anomaly_map_arithmetic_tensor, 
@@ -2192,8 +1963,8 @@ def _generate_records_directly(args, vae, model, diffusion, loader):
                 anomaly_max = int(round(anomaly_map_arithmetic_tensor.max().item() * 255))
                 
                 # Get actual patch dimensions for consistent cropping
-                if image_path in original_images:
-                    original_image = original_images[image_path]
+                if current_image_path in original_images:
+                    original_image = original_images[current_image_path]
                     h, w = original_image.shape[:2]
                     actual_patch_height = min(args.patch_size, h - y_coord)
                     actual_patch_width = min(args.patch_size, w - x_coord)
@@ -2204,7 +1975,7 @@ def _generate_records_directly(args, vae, model, diffusion, loader):
                     is_predicted_defective = anomaly_pixels > args.anomaly_pixel_num_threshold
                     
                     # Get ground truth defective patches for this image
-                    ground_truth_defective = ground_truth_map.get(image_path, set()) if ground_truth_map else set()
+                    ground_truth_defective = ground_truth_map.get(current_image_path, set()) if ground_truth_map else set()
                     
                     # Convert pixel coordinates to grid coordinates (simple division since no overlapping)
                     # With padded images, all patches are regular grid-aligned patches
@@ -2223,13 +1994,13 @@ def _generate_records_directly(args, vae, model, diffusion, loader):
                     binary_map_numpy = _to_numpy(anomaly_binary_cropped).squeeze()
                     
                     # Create record
-                    debug_print(f"🔍 Creating record with patch_coords_8_values: {patch_coords_8_values}")
+                    debug_print(f"🔍 Creating record with patch_coords_8_values: {coords_8_values}")
                     record = make_record(
                         split=("meta", args.split),
-                        image_path=("meta", image_path),
-                        image_path_original=("meta", path_to_safe_filename(image_path)),
+                        image_path=("meta", current_image_path),
+                        image_path_original=("meta", path_to_safe_filename(current_image_path)),
                         anomaly_class=("meta", "all"),
-                        patch_coords=("meta", patch_coords_8_values),
+                        patch_coords=("meta", coords_8_values),
                         anomaly_max=("meta", anomaly_max),
                         anomaly_pixels=("meta", anomaly_pixels),
                         is_predicted_defective=("meta", is_predicted_defective),
@@ -2494,6 +2265,8 @@ def main():
                        help="Path to pretrained model (REQUIRED for save_only, save_and_process, full_pipeline)")
     parser.add_argument("--reverse-steps", type=int, default=5,
                        help="Number of reverse steps (for model loading modes)")
+    parser.add_argument("--batch-size", type=int, default=64,
+                       help="Batch size for processing (for model loading modes)")
     parser.add_argument("--batch-num", type=int, default=12,
                        help="Number of batches to process (for model loading modes)")
     parser.add_argument("--split", type=str, default="test",
@@ -2546,10 +2319,11 @@ def main():
     parser.add_argument("--checkpoint-interval", type=int, default=1,
                        help="Save checkpoint every N batches (default: 1)")
     # Performance knobs
-    parser.add_argument("--inference-chunk-size", type=int, default=16,
-                        help="Number of patches per inference chunk (higher improves throughput if memory allows)")
+
     parser.add_argument("--num-workers", type=int, default=0,
                         help="Number of DataLoader workers (Windows often needs 0; try >0 if stable)")
+    parser.add_argument("--async-save-workers", type=int, default=4,
+                        help="Number of async saving threads. Default: 4 on Windows, 2-8 elsewhere.")
     
     args = parser.parse_args()
     
@@ -2616,9 +2390,9 @@ def main():
                 key = key.replace('-', '_')
                 if hasattr(args, key):
                     if key in ['anomaly_binary_threshold', 'anomaly_pixel_num_threshold', 'patch_size', 
-                              'patch_size', 'batch_num', 'reverse_steps', 'inference_chunk_size']:
+                              'patch_size', 'batch_num', 'batch_size', 'reverse_steps', 'async_save_workers']:
                         value = int(value)
-                    elif key == 'adaptive_threshold':
+                    elif key in ['adaptive_threshold']:
                         value = float(value)
                     elif key in ['results_dir', 'annotation_dir', 'pretrained']:
                         value = os.path.expanduser(value)
@@ -2629,6 +2403,8 @@ def main():
                                'enable_save_image_results', 'enable_save_json_results', 'enable_save_whole_image_results',
                                'enable_confusion_matrix', 'force_rerun', 'append_timestamp', 'enable_epoch_stats', 'save_preview_images']:
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
+                    elif key in ['save_npy_dtype']:
+                        value = value.lower() in ('float16', 'float32')
                     elif key == 'debug':
                         DEBUG_ENABLED = value.lower() in ('yes', 'true', 't', 'y', '1') if isinstance(value, str) else bool(value)
                     setattr(args, key, value)
@@ -2687,6 +2463,20 @@ def main():
         mode_full_pipeline(args)
     
     print(f"Mode {args.mode} completed successfully!")
+
+def _get_memory_usage():
+    """Get current memory usage for monitoring."""
+    if torch.cuda.is_available():
+        try:
+            allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+            reserved = torch.cuda.memory_reserved() / 1024**3    # GB
+            total = torch.cuda.get_device_properties(0).total_memory / 1024**3  # Total GPU memory in GB
+            return allocated, reserved, total
+        except Exception:
+            return 0, 0, 0
+    return 0, 0, 0
+
+
 
 if __name__ == "__main__":
     main()

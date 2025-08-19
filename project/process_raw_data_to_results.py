@@ -1816,7 +1816,7 @@ def reconstruct_records_from_raw_data(
                     x1, y1, x2, y2, x3, y3, x4, y4 = patch_coords_8_values
                 
                 patch_x, patch_y = int(x1), int(y1)  # Top-left corner, ensure integers
-                print(f"Extracted coordinates: patch_x={patch_x}, patch_y={patch_y}")
+                #print(f"Extracted coordinates: patch_x={patch_x}, patch_y={patch_y}")
             else:
                 raise ValueError(f"Expected 8-value patch coordinates, got {len(patch_coords_8_values)} values: {patch_coords_8_values}")
         else:
