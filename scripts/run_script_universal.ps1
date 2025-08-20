@@ -125,6 +125,12 @@ $InputJsonAbs = if ([System.IO.Path]::IsPathRooted($InputJson)) { $InputJson } e
 Write-Host "Absolute Script Path: $ScriptPathAbs" -ForegroundColor Cyan
 Write-Host "Absolute Input JSON: $InputJsonAbs" -ForegroundColor Cyan
 
+# Sleep at the beginning if specified
+if ($SleepMinutes -gt 0) {
+    Write-Host "Initial sleep before starting execution..." -ForegroundColor Yellow
+    Start-SleepWithCountdown -Minutes $SleepMinutes
+}
+
 # Set environment variables for training
 if ($ScriptType -eq "train") {
     $env:NO_ALBUMENTATIONS_UPDATE = "1"
@@ -195,22 +201,12 @@ if ($Loop) {
         # Check if we should continue
         if ($ExitCode -eq 0) {
             Write-Host "✓ Iteration completed successfully." -ForegroundColor Green
-            if ($SleepMinutes -gt 0) {
-                Write-Host "Sleeping before next iteration..." -ForegroundColor Yellow
-                Start-SleepWithCountdown -Minutes $SleepMinutes
-            } else {
-                Write-Host "Restarting immediately..." -ForegroundColor Green
-                Start-Sleep -Seconds 5  # Brief pause before restart
-            }
+            Write-Host "Restarting immediately..." -ForegroundColor Green
+            Start-Sleep -Seconds 5  # Brief pause before restart
         } else {
             Write-Host "✗ Iteration failed with exit code $ExitCode" -ForegroundColor Red
             Write-Host "Restarting anyway due to loop mode..." -ForegroundColor Yellow
-            if ($SleepMinutes -gt 0) {
-                Write-Host "Sleeping before retry..." -ForegroundColor Yellow
-                Start-SleepWithCountdown -Minutes $SleepMinutes
-            } else {
-                Start-Sleep -Seconds 10  # Longer pause after failure
-            }
+            Start-Sleep -Seconds 10  # Longer pause after failure
         }
         
         $Iteration++
@@ -241,12 +237,5 @@ if ($Loop) {
         Write-Host "Note: Exit code $ExitCode may indicate warnings but not failure" -ForegroundColor Yellow
     } else {
         Write-Host "✗ $ScriptType failed with exit code $ExitCode" -ForegroundColor Red
-    }
-    
-    # Sleep after completion if specified
-    if ($SleepMinutes -gt 0) {
-        Write-Host ""
-        Write-Host "Sleeping after completion..." -ForegroundColor Yellow
-        Start-SleepWithCountdown -Minutes $SleepMinutes
     }
 } 

@@ -83,8 +83,10 @@ import sys
 from utils import (
     path_to_safe_filename,
     safe_filename_to_path,
+    _to_numpy,
     _binary_mask,
-    _to_numpy
+    _binary_mask_exclude_boundary3,
+    load_original_images
 )
 
 # Import from process_raw_data_to_results.py
@@ -103,7 +105,6 @@ from process_raw_data_to_results import (
     load_original_images,
     parse_filename_to_info,
     load_raw_data_files,
-    reconstruct_records_from_raw_data,
     compute_simple_metrics,
     save_image_results_from_raw_data,
     save_json_results_from_raw_data
@@ -139,6 +140,218 @@ def debug_print(*args, **kwargs):
     """Print debug messages only if debug mode is enabled."""
     if DEBUG_ENABLED:
         print(*args, **kwargs)
+
+# Shared utility functions for record creation and processing
+def _extract_patch_coordinates(patch_coords, batch_index=0, patch_size=128):
+    """
+    Extract patch coordinates from various input formats.
+    
+    Args:
+        patch_coords: Tensor or list containing patch coordinates
+        batch_index: Index for batch processing (default: 0)
+        patch_size: Default patch size for fallback coordinates
+    
+    Returns:
+        tuple: coords_8_values
+    """
+    if isinstance(patch_coords, torch.Tensor) and len(patch_coords.shape) == 2:
+        if batch_index < patch_coords.size(0):
+            coords_8_values = patch_coords[batch_index].tolist()
+        else:
+            coords_8_values = patch_coords[-1].tolist() if patch_coords.size(0) > 0 else [0, 0, patch_size, 0, patch_size, patch_size, 0, patch_size]
+    elif isinstance(patch_coords, (list, tuple)):
+        coords_8_values = patch_coords
+    else:
+        raise ValueError(f"Expected patch_coords to be [batch_size, 8] tensor or list, got {type(patch_coords)} with shape {patch_coords.shape if hasattr(patch_coords, 'shape') else 'unknown'}")
+    
+    # Validate coordinate format
+    if len(coords_8_values) != 8:
+        raise ValueError(f"Expected 8-value patch coordinates, got {len(coords_8_values)} values: {coords_8_values}")
+
+    return coords_8_values
+
+def _process_anomaly_maps(anomaly_map_arithmetic_raw, anomaly_binary_threshold, patch_size, x_coord, y_coord, original_image):
+    """
+    Process anomaly maps and create binary masks with proper cropping.
+    
+    Args:
+        anomaly_map_arithmetic_raw: Raw anomaly map data
+        anomaly_binary_threshold: Threshold for binary mask creation
+        patch_size: Size of the patch
+        x_coord, y_coord: Top-left corner coordinates
+        original_image: Original image for dimension checking
+    
+    Returns:
+        tuple: (anomaly_map_arithmetic_tensor, anomaly_binary_cropped, anomaly_pixels, is_predicted_defective, binary_map_numpy)
+    """
+    # Convert to torch tensor for processing
+    anomaly_map_arithmetic_tensor = torch.from_numpy(anomaly_map_arithmetic_raw).float().unsqueeze(0).unsqueeze(0)
+    
+    # Create binary mask
+    anomaly_map_arithmetic_binary = _binary_mask(anomaly_map_arithmetic_tensor, anomaly_binary_threshold)
+    
+    # Get actual patch dimensions for consistent cropping
+    h, w = original_image.shape[:2]
+    actual_patch_height = min(patch_size, h - y_coord)
+    actual_patch_width = min(patch_size, w - x_coord)
+    
+    # Crop the binary mask tensor to match the actual patch size
+    anomaly_binary_cropped = anomaly_map_arithmetic_binary[:, :, :actual_patch_height, :actual_patch_width]
+    
+    # Calculate anomaly pixels
+    anomaly_pixels = torch.sum(anomaly_binary_cropped).item()
+    
+    # Store the binary map with proper shape
+    binary_map_numpy = _to_numpy(anomaly_binary_cropped).squeeze()
+    
+    return anomaly_map_arithmetic_tensor, anomaly_binary_cropped, anomaly_pixels, binary_map_numpy
+
+def _calculate_patch_status(x_coord, y_coord, patch_size, is_predicted_defective, ground_truth_defective):
+    """
+    Calculate the status (TP, FP, FN, TN) for a patch.
+    
+    Args:
+        x_coord, y_coord: Top-left corner coordinates
+        patch_size: Size of the patch
+        is_predicted_defective: Whether the patch is predicted as defective
+        ground_truth_defective: Set of ground truth defective patches
+    
+    Returns:
+        str: Status string (TP, FP, FN, TN)
+    """
+    # Convert pixel coordinates to grid coordinates
+    grid_row = y_coord // patch_size
+    grid_col = x_coord // patch_size
+    
+    # Determine status
+    status = "TP" if is_predicted_defective and (grid_row, grid_col) in ground_truth_defective else \
+             "FP" if is_predicted_defective else \
+             "FN" if (grid_row, grid_col) in ground_truth_defective else "TN"
+    
+    return status
+
+def _create_evaluation_record(
+    split, image_path, coords_8_values, anomaly_max, anomaly_pixels, 
+    is_predicted_defective, status, original_patch, encodedrecon_raw, 
+    latent_raw, anomaly_map_arithmetic_raw, binary_map_numpy
+):
+    """
+    Create a standardized evaluation record.
+    
+    Args:
+        split: Data split identifier
+        image_path: Path to the image
+        coords_8_values: 8-value patch coordinates
+        anomaly_max: Maximum anomaly value
+        anomaly_pixels: Number of anomaly pixels
+        is_predicted_defective: Whether patch is predicted defective
+        status: Patch status (TP, FP, FN, TN)
+        original_patch: Original image patch
+        encodedrecon_raw: Encoded reconstruction data
+        latent_raw: Latent representation data
+        anomaly_map_arithmetic_raw: Raw anomaly map data
+        binary_map_numpy: Binary mask data
+    
+    Returns:
+        dict: Evaluation record
+    """
+    record = make_record(
+        split=("meta", split),
+        image_path=("meta", image_path),
+        image_path_original=("meta", path_to_safe_filename(image_path)),
+        anomaly_class=("meta", "all"),
+        patch_coords=("meta", coords_8_values),
+        anomaly_max=("meta", anomaly_max),
+        anomaly_pixels=("meta", anomaly_pixels),
+        is_predicted_defective=("meta", is_predicted_defective),
+        status=("meta", status),
+        orig=("image", original_patch),
+        dod_recon=("image", encodedrecon_raw),
+        encoded_recon=("image", encodedrecon_raw),
+        anomaly_map_arithmetic=("image", anomaly_map_arithmetic_raw),
+        anomaly_map_arithmetic_binary=("image", binary_map_numpy),
+        anomaly_map_geometric=("image", anomaly_map_arithmetic_raw),
+        anomaly_map_geometric_binary=("image", binary_map_numpy),
+        encoded=("image", latent_raw),
+    )
+    
+    # Add metric fields
+    record["lpips"] = ("metric", 0.0)
+    record["ssim"] = ("metric", 0.0)
+    record["mse"] = ("metric", 0.0)
+    
+    return record
+
+def _process_single_patch(
+    ground_truth_map, original_images, anomaly_binary_threshold,
+    anomaly_pixel_num_threshold, patch_size, current_image_path, coords_8_values,
+    encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw
+):
+    """
+    Process a single patch and create an evaluation record.
+    
+    Args:
+        patch_data: Patch data dictionary
+        ground_truth_map: Ground truth information
+        original_images: Dictionary of original images
+        anomaly_binary_threshold: Threshold for binary mask
+        anomaly_pixel_num_threshold: Threshold for anomaly pixel count
+        patch_size: Size of the patch
+        current_image_path: Path to current image
+        coords_8_values: 8-value patch coordinates
+        encodedrecon_raw: Encoded reconstruction data
+        latent_raw: Latent representation data
+        anomaly_map_arithmetic_raw: Raw anomaly map data
+    
+    Returns:
+        dict: Evaluation record or None if processing fails
+    """
+    try:
+        # Extract coordinates
+        x_coord, y_coord = coords_8_values[0], coords_8_values[1]
+        
+        # Check if image exists in original images
+        if current_image_path not in original_images:
+            debug_print(f"⚠️  Image not found in original_images: {current_image_path}")
+            return None
+        
+        original_image = original_images[current_image_path]
+        
+        # Process anomaly maps
+        anomaly_map_arithmetic_tensor, anomaly_binary_cropped, anomaly_pixels, binary_map_numpy = _process_anomaly_maps(
+            anomaly_map_arithmetic_raw, anomaly_binary_threshold, patch_size, x_coord, y_coord, original_image
+        )
+        
+        # Determine if patch is defective
+        is_predicted_defective = anomaly_pixels > anomaly_pixel_num_threshold
+        
+        # Calculate metrics
+        anomaly_max = int(round(anomaly_map_arithmetic_tensor.max().item() * 255))
+        
+        # Get ground truth defective patches
+        ground_truth_defective = ground_truth_map.get(current_image_path, set()) if ground_truth_map else set()
+        
+        # Calculate status
+        status = _calculate_patch_status(x_coord, y_coord, patch_size, is_predicted_defective, ground_truth_defective)
+        
+        # Get original patch
+        h, w = original_image.shape[:2]
+        actual_patch_height = min(patch_size, h - y_coord)
+        actual_patch_width = min(patch_size, w - x_coord)
+        original_patch = original_image[y_coord:y_coord + actual_patch_height, x_coord:x_coord + actual_patch_width]
+        
+        # Create record
+        record = _create_evaluation_record(
+            "test", current_image_path, coords_8_values, anomaly_max, anomaly_pixels,
+            is_predicted_defective, status, original_patch, encodedrecon_raw,
+            latent_raw, anomaly_map_arithmetic_raw, binary_map_numpy
+        )
+        
+        return record
+        
+    except Exception as e:
+        debug_print(f"⚠️  Error processing patch for {current_image_path}: {e}")
+        return None
 
 # Helper: create a safe filename component from an image path or string
 # Ensures no illegal characters (like ':' on Windows) and provides a fallback
@@ -493,9 +706,81 @@ def _compute_abs_diff_max(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.abs(a - b).max(dim=1, keepdim=True)[0]
 
 
-
-
-
+def reconstruct_records_from_raw_data(
+    patch_data: Dict[str, Dict[str, np.ndarray]],
+    ground_truth_map: Dict[str, Set[Tuple[int, int]]] = None,
+    original_images: Dict[str, np.ndarray] = None,
+    anomaly_binary_threshold: int = 5,
+    anomaly_pixel_num_threshold: int = 0,
+    adaptive_threshold: float = 0.1,
+    patch_size: int = 128,
+    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+) -> List[Record]:
+    """
+    Reconstruct evaluation records from raw data.
+    """
+    records = []
+    
+    for patch_key, data in tqdm(patch_data.items(), desc="Processing patches"):
+        file_path = data['file_path']
+        patch_coords_8_values = data['patch_coords']  # Now contains 8 values
+        
+        # Debug: Print coordinate information for first few patches
+        if len(records) < 3:
+            print(f"\nDebug: Processing patch {len(records)+1}")
+            print(f"  File: {file_path}")
+            print(f"  Coordinates type: {type(patch_coords_8_values)}")
+            print(f"  Coordinates length: {len(patch_coords_8_values) if hasattr(patch_coords_8_values, '__len__') else 'N/A'}")
+            print(f"  First coordinate: {patch_coords_8_values[0] if hasattr(patch_coords_8_values, '__len__') and len(patch_coords_8_values) > 0 else 'N/A'}")
+            if hasattr(patch_coords_8_values, '__len__') and len(patch_coords_8_values) > 0:
+                print(f"  First coordinate type: {type(patch_coords_8_values[0])}")
+                if isinstance(patch_coords_8_values[0], (list, tuple)):
+                    print(f"  First coordinate length: {len(patch_coords_8_values[0])}")
+                    print(f"  First coordinate values: {patch_coords_8_values[0]}")
+        
+        # Additional debug: Check the data structure
+        if len(records) < 3:
+            print(f"  Data keys: {list(data.keys())}")
+            print(f"  patch_x from data: {data.get('patch_x', 'MISSING')} (type: {type(data.get('patch_x', 'MISSING'))})")
+            print(f"  patch_y from data: {data.get('patch_y', 'MISSING')} (type: {type(data.get('patch_y', 'MISSING'))})")
+            print(f"  patch_coords from data: {data.get('patch_coords', 'MISSING')} (type: {type(data.get('patch_coords', 'MISSING'))})")
+        
+        # Extract coordinates using shared function
+        try:
+            coords_8_values = _extract_patch_coordinates(
+                patch_coords_8_values, 0, patch_size
+            )
+        except Exception as e:
+            print(f"⚠️  Error extracting coordinates for {file_path}: {e}")
+            continue
+        
+        # Load the raw data arrays
+        encodedrecon_raw = data['encodedrecon']
+        latent_raw = data['latent']
+        anomaly_map_arithmetic_raw = data['anomaly_map_arithmetic']
+        
+        # Process the patch using shared function
+        record = _process_single_patch(
+            ground_truth_map=ground_truth_map,
+            original_images=original_images,
+            anomaly_binary_threshold=anomaly_binary_threshold,
+            anomaly_pixel_num_threshold=anomaly_pixel_num_threshold,
+            patch_size=patch_size,
+            current_image_path=file_path,
+            coords_8_values=coords_8_values,
+            encodedrecon_raw=encodedrecon_raw,
+            latent_raw=latent_raw,
+            anomaly_map_arithmetic_raw=anomaly_map_arithmetic_raw
+        )
+        
+        if record is not None:
+            # Update the split to match the function parameter
+            record["split"] = ("meta", "test")
+            records.append(record)
+        else:
+            print(f"⚠️  Failed to create record for {file_path}")
+    
+    return records
 
 def _process_batch_inference(x, object_cls, model, vae, diffusion, reverse_steps, device, epoch_metrics=None):
     """
@@ -1632,15 +1917,13 @@ def _after_reading_saved_results(
     Process records after reading from saved data and generate outputs.
     Returns: (metrics, output_dir)
     """
-    # Generate timestamp for output directory if requested
-    if args.append_timestamp:
-        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = os.path.join(args.results_dir, f"{output_subdir_name}_{current_time}")
-    else:
-        output_dir = os.path.join(args.results_dir, output_subdir_name)
     
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(args.results_dir, f"{current_time}")
     os.makedirs(output_dir, exist_ok=True)
-    debug_print(f"📁 Output directory: {output_dir}")
+    output_subdir = os.path.join(output_dir, f"{output_subdir_name}")
+    os.makedirs(output_subdir, exist_ok=True)
+    debug_print(f"📁 Output directory: {output_subdir}")
     
     # Calculate metrics from records
     debug_print("📊 Computing evaluation metrics...")
@@ -1668,7 +1951,7 @@ def _after_reading_saved_results(
     if args.enable_confusion_matrix:
         create_confusion_matrix_from_records(
             records,
-            output_dir,
+            output_subdir,
             annotation_dir=args.annotation_dir,
             patch_size=args.patch_size
         )
@@ -1678,7 +1961,7 @@ def _after_reading_saved_results(
         debug_print("📄 Saving comprehensive JSON with all records...")
         save_all_records_json(
             records,
-            output_dir,
+            output_subdir,
             filename="all_evaluation_records.json",
             patch_size=args.patch_size,
             sort_records=not args.no_sort_records_by_anomaly
@@ -1767,10 +2050,10 @@ def _after_reading_saved_results(
     
     if args.enable_excel_report:
         debug_print("📊 Creating Excel report...")
-        make_excel(records, output_dir, args.split, args.object_class)
+        make_excel(records, output_subdir, args.split, args.object_class)
     
     debug_print("✅ Processing completed successfully!")
-    return metrics, output_dir
+    return metrics, output_subdir
 
 
 def mode_save_only(args):
@@ -1856,17 +2139,287 @@ def _reading_saved_results(args):
     return records, ground_truth_map, original_images
 
 
+# === Shared streaming helpers (for both incremental eval and process_only) ===
+def _process_records_stream_incrementally(
+    args,
+    patch_item_iter,
+    ground_truth_map,
+    original_images,
+    output_subdir_name: str = "processed_results",
+):
+    """
+    Consume a stream of patch items incrementally and process/save results without
+    materializing all records in memory.
+
+    Each item yielded by patch_item_iter must be a tuple:
+      (current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw)
+
+    Returns: (metrics, output_subdir)
+    """
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(args.results_dir, f"{current_time}")
+    os.makedirs(output_dir, exist_ok=True)
+    output_subdir = os.path.join(output_dir, output_subdir_name)
+    os.makedirs(output_subdir, exist_ok=True)
+    debug_print(f"📁 Output directory: {output_subdir}")
+
+    checkpoint_manager = CheckpointManager(args.results_dir, args.annotation_dir, args.force_rerun)
+
+    total_records = 0
+    normal_records_count = 0
+    defect_records_count = 0
+
+    from collections import defaultdict
+    image_to_records = defaultdict(list)
+    batch_records = []
+    flush_every = max(1, int(getattr(args, "batch_size", 64)))
+
+    for i, (current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw) in enumerate(patch_item_iter):
+        record = _process_single_patch(
+            ground_truth_map=ground_truth_map,
+            original_images=original_images,
+            anomaly_binary_threshold=args.anomaly_binary_threshold,
+            anomaly_pixel_num_threshold=args.anomaly_pixel_num_threshold,
+            patch_size=args.patch_size,
+            current_image_path=current_image_path,
+            coords_8_values=coords_8_values,
+            encodedrecon_raw=encodedrecon_raw,
+            latent_raw=latent_raw,
+            anomaly_map_arithmetic_raw=anomaly_map_arithmetic_raw,
+        )
+        if record is None:
+            continue
+
+        batch_records.append(record)
+        total_records += 1
+        is_predicted_defective = record.get("is_predicted_defective", (None, False))[1]
+        if is_predicted_defective:
+            defect_records_count += 1
+        else:
+            normal_records_count += 1
+        image_to_records[current_image_path].append(record)
+
+        if len(batch_records) >= flush_every:
+            _process_batch_records_immediately(
+                args,
+                batch_records,
+                ground_truth_map,
+                original_images,
+                checkpoint_manager,
+                output_subdir,
+                image_to_records,
+            )
+            del batch_records
+            batch_records = []
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+
+    if batch_records:
+        _process_batch_records_immediately(
+            args,
+            batch_records,
+            ground_truth_map,
+            original_images,
+            checkpoint_manager,
+            output_subdir,
+            image_to_records,
+        )
+        del batch_records
+
+    metrics = _finalize_incremental_processing(
+        args,
+        total_records,
+        normal_records_count,
+        defect_records_count,
+        image_to_records,
+        ground_truth_map,
+        output_subdir,
+    )
+    return metrics, output_subdir
+
+
+def _extract_image_path_from_batch(image_paths_batch, batch_index):
+    """Extract image path from batch at given index, handling various formats."""
+    if batch_index < len(image_paths_batch):
+        value = image_paths_batch[batch_index]
+    else:
+        value = image_paths_batch[-1] if image_paths_batch else ""
+    
+    if isinstance(value, str):
+        return value
+    elif isinstance(value, (list, tuple)):
+        return value[0] if value else ""
+    else:
+        return str(value)
+
+
+def _iterate_saved_patch_items(args):
+    """
+    Iterate saved .npy patches as a generator without building full records.
+
+    Yields:
+      (current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw)
+    """
+    import glob as _glob
+    npy_pattern = os.path.join(args.results_dir, "evaluation_results", "*_encodedrecon.npy")
+    npy_files = _glob.glob(npy_pattern)
+
+    for npy_file in npy_files:
+        base_name = npy_file.replace("_encodedrecon.npy", "")
+        coords_file = f"{base_name}_coords.npy"
+        latent_file = f"{base_name}_latent.npy"
+        anomaly_file = f"{base_name}_anomaly_map_arithmetic.npy"
+        if os.path.exists(coords_file) and os.path.exists(latent_file) and os.path.exists(anomaly_file):
+            try:
+                patch_coords_8_values = np.load(coords_file).tolist()
+                filename = os.path.basename(npy_file)
+                # Extract image path portion by removing patch coordinates and file suffix
+                # Pattern: safe_filename__x1_y1_x2_y2_x3_y3_x4_y4__minimal_diff_encodedrecon.npy
+                # We want to extract everything before the first coordinate pattern
+                import re as _re
+                coord_pattern = r"__x\d+_y\d+_x\d+_y\d+_x\d+_y\d+_x\d+_y\d+__"
+                match = _re.search(coord_pattern, filename)
+                if match:
+                    # Extract everything before the coordinate pattern
+                    file_info = filename[:match.start()]
+                else:
+                    # Fallback: try splitting at __minimal_diff
+                    if "__minimal_diff" in filename:
+                        file_info = filename.split("__minimal_diff")[0]
+                        # Remove any trailing coordinate pattern
+                        file_info = _re.sub(r"__x\d+_y\d+_x\d+_y\d+_x\d+_y\d+_x\d+_y\d+$", "", file_info)
+                    else:
+                        # Last resort: split at first __ (original approach)
+                        file_info = filename.split("__")[0]
+                
+                image_path = safe_filename_to_path(file_info)
+                encodedrecon_data = np.load(npy_file)
+                latent_data = np.load(latent_file)
+                anomaly_data = np.load(anomaly_file)
+                yield (
+                    image_path,
+                    patch_coords_8_values,
+                    encodedrecon_data.squeeze(),
+                    latent_data.squeeze(),
+                    anomaly_data.squeeze(),
+                )
+            except Exception as e:
+                debug_print(f"⚠️  Failed reading saved patch: {npy_file}: {e}")
+                continue
+        else:
+            # Legacy fallback: parse filename
+            try:
+                filename = os.path.basename(npy_file)
+                coord_pattern = r"__x(\d+)_y(\d+)_x(\d+)_y(\d+)_x(\d+)_y(\d+)_x(\d+)_y(\d+)__minimal_diff"
+                import re as _re
+                match = _re.search(coord_pattern, filename)
+                if not match:
+                    continue
+                x1, y1, x2, y2, x3, y3, x4, y4 = map(int, match.groups())
+                patch_coords_8_values = [x1, y1, x2, y2, x3, y3, x4, y4]
+                # Extract image path portion by removing patch coordinates and file suffix
+                # Use the same logic as above for consistency
+                coord_pattern_full = r"__x\d+_y\d+_x\d+_y\d+_x\d+_y\d+_x\d+_y\d+__"
+                match_full = _re.search(coord_pattern_full, filename)
+                if match_full:
+                    file_info = filename[:match_full.start()]
+                else:
+                    # Fallback: try splitting at __minimal_diff
+                    if "__minimal_diff" in filename:
+                        file_info = filename.split("__minimal_diff")[0]
+                        file_info = _re.sub(r"__x\d+_y\d+_x\d+_y\d+_x\d+_y\d+_x\d+_y\d+$", "", file_info)
+                    else:
+                        file_info = filename.split("__")[0]
+                
+                image_path = safe_filename_to_path(file_info)
+                encodedrecon_data = np.load(npy_file)
+                latent_data = np.load(f"{base_name}_latent.npy")
+                anomaly_data = np.load(f"{base_name}_anomaly_map_arithmetic.npy")
+                yield (
+                    image_path,
+                    patch_coords_8_values,
+                    encodedrecon_data.squeeze(),
+                    latent_data.squeeze(),
+                    anomaly_data.squeeze(),
+                )
+            except Exception as e:
+                debug_print(f"⚠️  Legacy load failed for {npy_file}: {e}")
+                continue
+
+
+def _iterate_eval_patch_items(args, vae, model, diffusion, loader):
+    """
+    Iterate evaluation batches and yield patch items compatible with the shared streaming pipeline.
+    Yields tuples:
+      (current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw)
+    """
+    idx = -1
+    for idx, (x, seg, object_cls, anomaly_classes, image_paths_batch, patch_coords) in enumerate(
+        tqdm(loader, desc="Processing patches (eval iterator)")
+    ):
+        if idx >= args.batch_num:
+            break
+        with torch.no_grad():
+            encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic = _process_batch_inference(
+                x, object_cls, model, vae, diffusion, args.reverse_steps, device, epoch_metrics=None
+            )
+
+        batch_size = x.size(0)
+        for b in range(batch_size):
+            # Extract image path using shared helper
+            current_image_path = _extract_image_path_from_batch(image_paths_batch, b)
+
+            # Extract coordinates using shared helper
+            coords_8_values = _extract_patch_coordinates(
+                patch_coords, b, args.patch_size
+            )
+
+            # Numpy arrays
+            encodedrecon_raw = _to_numpy(encodedrecon_dodrecon_diff[b]).squeeze()
+            latent_raw = _to_numpy(encoded_latent_diff_resized[b]).squeeze()
+            anomaly_map_arithmetic_raw = _to_numpy(anomaly_map_arithmetic[b]).squeeze()
+
+            yield (
+                current_image_path,
+                coords_8_values,
+                encodedrecon_raw,
+                latent_raw,
+                anomaly_map_arithmetic_raw,
+            )
+
 def mode_process_only(args):
-    """Mode 2: Read existing .npy files and generate categorization results."""
+    """Mode 2: Read existing .npy files and generate categorization results using the incremental streaming pipeline."""
     print("=== Mode 2: Process Only ===")
     
-    # Reading saved results
-    records, ground_truth_map, original_images = _reading_saved_results(args)
-    
-    # After reading saved results
-    metrics, output_dir = _after_reading_saved_results(args, records, ground_truth_map, original_images)
-    
-    return records
+    # Load ground truth and original images based on annotations, mirroring the incremental path
+    ground_truth_map = load_ground_truth_map(args.annotation_dir)
+    print(f"Loaded ground truth for {len(ground_truth_map)} images")
+
+    # To load original images, we need the set of image paths referenced by saved results
+    # Scan saved .npy items to collect image paths without loading all into memory
+    image_paths_set = set()
+    for image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw in _iterate_saved_patch_items(args):
+        if image_path:
+            image_paths_set.add(image_path)
+    # Reload iterator after scan (it is a generator)
+    patch_item_iter = _iterate_saved_patch_items(args)
+
+    # Load original images
+    original_images = load_original_images(image_paths_set)
+    print(f"Loaded {len(original_images)} original images")
+
+    # Process incrementally via shared pipeline
+    metrics, output_dir = _process_records_stream_incrementally(
+        args,
+        patch_item_iter,
+        ground_truth_map,
+        original_images,
+        output_subdir_name="processed_results",
+    )
+
+    return metrics
 
 def _generate_records_directly(args, vae, model, diffusion, loader):
     """
@@ -2063,20 +2616,357 @@ def mode_save_and_process(args):
 def mode_full_pipeline(args):
     """
     Mode 4: Complete pipeline without saving intermediates.
-    Composed from shared components: _before_saving_results + _generate_records_directly + _after_reading_saved_results
+    Composed from shared components: _before_saving_results + _generate_records_incrementally + _after_reading_saved_results
     """
     print("=== Mode 4: Full Pipeline ===")
     
     # Before saving results: Load model components and prepare evaluation setup
     vae, model, diffusion, dataset, loader, evaluation_results_dir, checkpoint_manager = _before_saving_results(args)
     
-    # Generate records directly (bypassing disk I/O): Evaluate and create records in memory
-    records, ground_truth_map, original_images = _generate_records_directly(args, vae, model, diffusion, loader)
+    # Prepare maps used by the shared streaming pipeline
+    ground_truth_map = load_ground_truth_map(args.annotation_dir)
+    print(f"Loaded ground truth for {len(ground_truth_map)} images")
+
+    image_paths = set(loader.dataset.get_all_image_paths())
+    original_images = load_original_images(image_paths)
+    print(f"Loaded {len(original_images)} original images")
+
+    # Create an iterator that yields patch items directly from evaluation
+    patch_item_iter = _iterate_eval_patch_items(args, vae, model, diffusion, loader)
+
+    # Process via shared streaming pipeline
+    metrics, output_dir = _process_records_stream_incrementally(
+        args,
+        patch_item_iter,
+        ground_truth_map,
+        original_images,
+        output_subdir_name="processed_results",
+    )
+
+    return metrics, output_dir
+
+def _generate_and_process_records_incrementally(args, vae, model, diffusion, loader):
+    """
+    Generate records incrementally and process them in batches to avoid memory issues.
+    This combines record generation with immediate processing without accumulating all records in memory.
+    Returns: (metrics, output_dir)
+    """
+    # Initialize epoch metrics if enabled
+    epoch_metrics = EvaluationMetrics() if args.enable_epoch_stats else None
     
-    # After reading saved results: Process records and generate evaluation outputs
-    metrics, output_dir = _after_reading_saved_results(args, records, ground_truth_map, original_images)
+    # Load ground truth map
+    ground_truth_map = load_ground_truth_map(args.annotation_dir)
+    print(f"Loaded ground truth for {len(ground_truth_map)} images")
     
-    return records
+    # Extract unique image paths from dataset (dataset is patch-level now)
+    image_paths = set(loader.dataset.get_all_image_paths())
+    
+    # Load original images
+    original_images = load_original_images(image_paths)
+    print(f"Loaded {len(original_images)} original images")
+    
+    # Initialize output directory
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(args.results_dir, f"{current_time}")
+    os.makedirs(output_dir, exist_ok=True)
+    output_subdir = os.path.join(output_dir, "processed_results")
+    os.makedirs(output_subdir, exist_ok=True)
+    debug_print(f"📁 Output directory: {output_subdir}")
+    
+    # Initialize metrics tracking
+    all_metrics = []
+    total_records = 0
+    normal_records_count = 0
+    defect_records_count = 0
+    
+    # Initialize checkpoint manager for image saving
+    checkpoint_manager = CheckpointManager(args.results_dir, args.annotation_dir, args.force_rerun)
+    
+    # Initialize per-image record tracking for image-level processing
+    from collections import defaultdict
+    image_to_records = defaultdict(list)
+    
+    idx = -1
+    try:
+        for idx, (x, seg, object_cls, anomaly_classes, image_paths_batch, patch_coords) in enumerate(
+            tqdm(loader, desc="Processing patches incrementally")
+        ):
+            if idx >= args.batch_num:
+                break
+            debug_print(f"!!!!!!🔍 idx: {idx}")
+            debug_print(f"!!!!!!🔍 Input tensor x shape: {x.shape}")
+            debug_print(f"!!!!!!🔍 Input tensor x type: {type(x)}")
+            debug_print(f"!!!!!!🔍 Input tensor x dtype: {x.dtype}")
+            debug_print(f"!!!!!!🔍 Input tensor x device: {x.device}")
+            
+            with torch.no_grad():
+                # Direct inference on the batch (no chunking needed since dataset returns individual patches)
+                encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic = _process_batch_inference(
+                    x, object_cls, model, vae, diffusion, args.reverse_steps, device, epoch_metrics=epoch_metrics
+                )
+            
+            # Process each patch to create records
+            batch_size = x.size(0)
+            batch_records = []
+            
+            for b in range(batch_size):
+                # Get the image path directly from the batch
+                if b < len(image_paths_batch):
+                    if isinstance(image_paths_batch[b], str):
+                        current_image_path = image_paths_batch[b]
+                    elif isinstance(image_paths_batch[b], (list, tuple)):
+                        current_image_path = image_paths_batch[b][0] if image_paths_batch[b] else ""
+                    else:
+                        current_image_path = str(image_paths_batch[b])
+                else:
+                    current_image_path = str(image_paths_batch[-1]) if image_paths_batch else ""
+                
+                # Extract coordinates using shared function
+                try:
+                    coords_8_values = _extract_patch_coordinates(
+                        patch_coords, b, args.patch_size
+                    )
+                    debug_print(f"  ✅ Using 8-value coordinates: {coords_8_values}")
+                except Exception as e:
+                    debug_print(f"⚠️  Error extracting coordinates: {e}")
+                    continue
+                
+                # Convert tensors to numpy
+                encodedrecon_raw = _to_numpy(encodedrecon_dodrecon_diff[b]).squeeze()
+                latent_raw = _to_numpy(encoded_latent_diff_resized[b]).squeeze()
+                anomaly_map_arithmetic_raw = _to_numpy(anomaly_map_arithmetic[b]).squeeze()
+                
+                # Process the patch using shared function
+                record = _process_single_patch(
+                    ground_truth_map=ground_truth_map,
+                    original_images=original_images,
+                    anomaly_binary_threshold=args.anomaly_binary_threshold,
+                    anomaly_pixel_num_threshold=args.anomaly_pixel_num_threshold,
+                    patch_size=args.patch_size,
+                    current_image_path=current_image_path,
+                    coords_8_values=coords_8_values,
+                    encodedrecon_raw=encodedrecon_raw,
+                    latent_raw=latent_raw,
+                    anomaly_map_arithmetic_raw=anomaly_map_arithmetic_raw
+                )
+                
+                if record is not None:
+                    # Add to batch records and update counters
+                    batch_records.append(record)
+                    total_records += 1
+                    
+                    # Update counters based on prediction
+                    is_predicted_defective = record.get("is_predicted_defective", (None, False))[1]
+                    if is_predicted_defective:
+                        defect_records_count += 1
+                    else:
+                        normal_records_count += 1
+                    
+                    # Add to per-image tracking for image-level processing
+                    image_to_records[current_image_path].append(record)
+                else:
+                    debug_print(f"⚠️  Failed to create record for patch {b} in batch {idx}")
+            
+            # Process batch records immediately (save images, update metrics, etc.)
+            _process_batch_records_immediately(
+                args, batch_records, ground_truth_map, original_images, 
+                checkpoint_manager, output_subdir, image_to_records
+            )
+            
+            # Clear batch records to free memory
+            del batch_records
+            
+            # Memory optimization
+            if idx % 10 == 0 and idx > 0:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+
+    except KeyboardInterrupt:
+        print("\nProcess interrupted.")
+        raise
+    except Exception as e:
+        print(f"\nError occurred: {e}")
+        raise
+
+    print(f"Generated and processed {total_records} records incrementally")
+    
+    # Print epoch statistics if enabled
+    if epoch_metrics is not None:
+        epoch_metrics.print_epoch_stats()
+    else:
+        debug_print("Skipping epoch statistics (disabled)")
+    
+    # Final processing and metrics computation
+    final_metrics = _finalize_incremental_processing(
+        args, total_records, normal_records_count, defect_records_count, 
+        image_to_records, ground_truth_map, output_subdir
+    )
+    
+    return final_metrics, output_subdir
+
+def _process_batch_records_immediately(args, batch_records, ground_truth_map, original_images, 
+                                     checkpoint_manager, output_subdir, image_to_records):
+    """
+    Process a batch of records immediately without accumulating them in memory.
+    This function handles immediate processing tasks like saving images and updating metrics.
+    """
+    if not batch_records:
+        return
+    
+    # Process each record in the batch
+    for record in batch_records:
+        # Update per-image tracking for image-level processing
+        img_path = record.get("image_path", (None, None))[1]
+        if img_path:
+            # The record is already added to image_to_records in the main loop
+            pass
+    
+    # If image saving is enabled, process the current batch
+    if args.enable_save_image_results:
+        for record in batch_records:
+            try:
+                img_path = record.get("image_path", (None, None))[1]
+                if not img_path:
+                    continue
+                
+                coords = record.get("patch_coords", (None, []))[1]
+                if not (isinstance(coords, (list, tuple)) and len(coords) == 8):
+                    continue
+                
+                patch_x, patch_y = int(coords[0]), int(coords[1])
+                
+                # Build a single-patch record list
+                patch_records = [record]
+                
+                # Compute predicted set for this single patch
+                anomaly_map = record["anomaly_map_arithmetic_binary"][1]
+                anomaly_pixels = int(np.sum(anomaly_map)) if hasattr(anomaly_map, 'sum') else 0
+                patch_pred_set = set()
+                if anomaly_pixels > 0:
+                    grid_row = patch_y // args.patch_size
+                    grid_col = patch_x // args.patch_size
+                    patch_pred_set.add((grid_row, grid_col))
+                
+                # Get ground truth defective patches for this image
+                ground_truth_defective = ground_truth_map.get(img_path, set()) if isinstance(ground_truth_map, dict) else set()
+                overlapping = set()
+                
+                save_patch_results_from_records(
+                    checkpoint_manager,
+                    img_path,
+                    patch_records,
+                    patch_pred_set,
+                    ground_truth_defective,
+                    overlapping,
+                    enable_save_optional_image_results=args.enable_save_optional_image_results,
+                    patch_size=args.patch_size,
+                    patch_x=patch_x,
+                    patch_y=patch_y,
+                )
+            except Exception as e:
+                debug_print(f"⚠️  Failed to save patch-level result: {e}")
+
+def _finalize_incremental_processing(args, total_records, normal_records_count, defect_records_count, 
+                                   image_to_records, ground_truth_map, output_subdir):
+    """
+    Finalize the incremental processing by computing final metrics and saving results.
+    """
+    # Compute final metrics
+    metrics = {
+        "total_records": total_records,
+        "defective_records": defect_records_count,
+        "normal_records": normal_records_count
+    }
+    
+    # Try to compute more sophisticated metrics if possible
+    try:
+        # For confusion matrix and other detailed metrics, we need to process the accumulated image records
+        if args.enable_confusion_matrix:
+            # Convert image_to_records back to a flat list for confusion matrix
+            all_records = []
+            for img_records in image_to_records.values():
+                all_records.extend(img_records)
+            
+            create_confusion_matrix_from_records(
+                all_records,
+                output_subdir,
+                annotation_dir=args.annotation_dir,
+                patch_size=args.patch_size
+            )
+        
+        # Save JSON results if enabled
+        if args.enable_save_json_results:
+            debug_print("💾 Saving JSON results...")
+            # Convert image_to_records back to a flat list for JSON saving
+            all_records = []
+            for img_records in image_to_records.values():
+                all_records.extend(img_records)
+            
+            save_all_records_json(
+                all_records,
+                output_subdir,
+                filename="all_evaluation_records.json",
+                patch_size=args.patch_size,
+                sort_records=not args.no_sort_records_by_anomaly
+            )
+        
+        # Process whole image results if enabled
+        if args.enable_save_whole_image_results:
+            debug_print("🖼️ Processing whole image results...")
+            checkpoint_manager = CheckpointManager(args.results_dir, args.annotation_dir, args.force_rerun)
+            
+            for img_path, image_records in image_to_records.items():
+                # Predicted defective set from records (expects 8-value patch_coords)
+                predicted_defective_set = set()
+                for rec in image_records:
+                    try:
+                        is_def = rec.get("is_predicted_defective", (None, False))[1]
+                        if not is_def:
+                            continue
+                        coords = rec.get("patch_coords", (None, []))[1]
+                        if not (isinstance(coords, (list, tuple)) and len(coords) == 8):
+                            raise ValueError(f"Expected 8-value patch_coords in records, got: {coords}")
+                        x1, y1 = int(coords[0]), int(coords[1])
+                        row = y1 // args.patch_size
+                        col = x1 // args.patch_size
+                        predicted_defective_set.add((row, col))
+                    except Exception:
+                        continue
+
+                ground_truth_defective = ground_truth_map.get(img_path, set()) if isinstance(ground_truth_map, dict) else set()
+                overlapping = set()
+
+                try:
+                    save_image_results_from_records(
+                        checkpoint_manager,
+                        img_path,
+                        image_records,
+                        predicted_defective_set,
+                        ground_truth_defective,
+                        overlapping,
+                        enable_save_optional_image_results=args.enable_save_optional_image_results,
+                        patch_size=args.patch_size,
+                    )
+                except Exception as e:
+                    debug_print(f"⚠️  Failed to save image-level results for {img_path}: {e}")
+        
+        # Create Excel report if enabled
+        if args.enable_excel_report:
+            debug_print("📊 Creating Excel report...")
+            # Convert image_to_records back to a flat list for Excel report
+            all_records = []
+            for img_records in image_to_records.values():
+                all_records.extend(img_records)
+            
+            make_excel(all_records, output_subdir, args.split, args.object_class)
+            
+    except Exception as e:
+        debug_print(f"⚠️  Error in final processing: {e}")
+    
+    debug_print("✅ Incremental processing completed successfully!")
+    return metrics
 
 def validate_mode_arguments(args):
     """
@@ -2372,25 +3262,31 @@ def main():
         print(f"❌ Error: Invalid mode '{args.mode}'. Must be one of: save_only, process_only, save_and_process, full_pipeline")
         sys.exit(1)
     
-    # Handle input JSON if provided (BEFORE validation so JSON values are loaded)
+    # Handle input JSON if provided
     if args.input_json:
         with open(args.input_json, 'r') as f:
             test_configs = json.load(f)
             
         # Run processing for each test configuration
         for test_name, test_args in test_configs.items():
-            print(f"\n📄 Loading configuration for: {test_name}")
+            print(f"\n{'='*60}")
+            print(f"📄 Running configuration: {test_name}")
+            print(f"{'='*60}")
             print(f"🔧 Mode: {test_args.get('mode', args.mode)}")
             print(f"📂 Annotation dir: {test_args.get('annotation-dir', 'Not specified')}")
             print(f"🤖 Model: {test_args.get('pretrained', 'Not specified')}")
             print(f"⚙️  Loading {len(test_args)} configuration parameters...")
             
-            # Update args with test configuration
+            # Create a copy of args for this test configuration
+            import copy
+            test_args_obj = copy.deepcopy(args)
+            
+            # Update test_args_obj with test configuration
             for key, value in test_args.items():
                 key = key.replace('-', '_')
-                if hasattr(args, key):
+                if hasattr(test_args_obj, key):
                     if key in ['anomaly_binary_threshold', 'anomaly_pixel_num_threshold', 'patch_size', 
-                              'patch_size', 'batch_num', 'batch_size', 'reverse_steps', 'async_save_workers']:
+                              'batch_num', 'batch_size', 'reverse_steps', 'async_save_workers']:
                         value = int(value)
                     elif key in ['adaptive_threshold']:
                         value = float(value)
@@ -2406,76 +3302,90 @@ def main():
                     elif key in ['save_npy_dtype']:
                         value = value.lower() in ('float16', 'float32')
                     elif key == 'debug':
-                        DEBUG_ENABLED = value.lower() in ('yes', 'true', 't', 'y', '1') if isinstance(value, str) else bool(value)
-                    setattr(args, key, value)
-    
-    # Validate mode-specific arguments AFTER JSON is loaded
-    if not validate_mode_arguments(args):
-        print(f"\n❌ Argument validation failed. Please fix the issues above and try again.")
-        sys.exit(1)
-    
-    # Debug: Print final argument values
-    debug_print(f"🔍 Final argument values:")
-    debug_print(f"   mode: {args.mode}")
-    debug_print(f"   irregular_patch: {args.irregular_patch}")
-    debug_print(f"   batch_num: {args.batch_num}")
-    debug_print(f"   patch_size: {args.patch_size}")
-    debug_print(f"   annotation_dir: {args.annotation_dir}")
-    debug_print(f"   pretrained: {args.pretrained}")
-    
-    # Set up results directory with optional timestamp for modes that need it
-    base_name = f"DeCo-Diff_{args.dataset}_{args.object_class}_{args.model_size}_{args.patch_size}"
-    
-    if args.append_timestamp:
-        current_time = datetime.now().strftime("%y%m%d_%H%M%S")
-        if args.input_json:
-            # Use the test name from JSON
-            test_name = list(json.load(open(args.input_json, 'r')).keys())[0]
-            args.results_dir = f"results/{test_name}_{current_time}"
-        else:
-            args.results_dir = f"results/{base_name}_{current_time}"
+                        debug_value = value.lower() in ('yes', 'true', 't', 'y', '1') if isinstance(value, str) else bool(value)
+                        DEBUG_ENABLED = debug_value
+                        test_args_obj.debug = debug_value
+                    setattr(test_args_obj, key, value)
+            
+            # Validate mode-specific arguments for this test configuration
+            if not validate_mode_arguments(test_args_obj):
+                print(f"\n❌ Argument validation failed for {test_name}. Skipping this configuration.")
+                continue
+            
+            # Set up results directory for this test configuration
+            base_name = f"DeCo-Diff_{test_args_obj.dataset}_{test_args_obj.object_class}_{test_args_obj.model_size}_{test_args_obj.patch_size}"
+            
+            if test_args_obj.append_timestamp:
+                current_time = datetime.now().strftime("%y%m%d_%H%M%S")
+                test_args_obj.results_dir = f"results/{test_name}_{current_time}"
+            else:
+                test_args_obj.results_dir = f"results/{test_name}"
+            
+            os.makedirs(test_args_obj.results_dir, exist_ok=True)
+            
+            # Save config for this test
+            config_save_path = os.path.join(test_args_obj.results_dir, "config.json")
+            with open(config_save_path, "w") as config_file:
+                json.dump({test_name: test_args}, config_file, indent=2)
+            
+            # Debug: Print final argument values for this test
+            debug_print(f"🔍 Final argument values for {test_name}:")
+            debug_print(f"   mode: {test_args_obj.mode}")
+            debug_print(f"   batch_num: {test_args_obj.batch_num}")
+            debug_print(f"   patch_size: {test_args_obj.patch_size}")
+            debug_print(f"   annotation_dir: {test_args_obj.annotation_dir}")
+            debug_print(f"   pretrained: {test_args_obj.pretrained}")
+            debug_print(f"   results_dir: {test_args_obj.results_dir}")
+            
+            # Execute the selected mode for this test configuration
+            try:
+                if test_args_obj.mode == "save_only":
+                    mode_save_only(test_args_obj)
+                elif test_args_obj.mode == "process_only":
+                    mode_process_only(test_args_obj)
+                elif test_args_obj.mode == "save_and_process":
+                    mode_save_and_process(test_args_obj)
+                elif test_args_obj.mode == "full_pipeline":
+                    mode_full_pipeline(test_args_obj)
+                
+                print(f"✅ Configuration {test_name} completed successfully!")
+                
+            except Exception as e:
+                print(f"❌ Configuration {test_name} failed: {e}")
+                print(f"   Continuing with next configuration...")
+                continue
+        
+        print(f"\n🎉 All JSON configurations processed!")
+        
     else:
-        if args.input_json:
-            # Use the test name from JSON without timestamp
-            test_name = list(json.load(open(args.input_json, 'r')).keys())[0]
-            args.results_dir = f"results/{test_name}"
+        # Single mode execution (no JSON)
+        # Validate mode-specific arguments
+        if not validate_mode_arguments(args):
+            print(f"\n❌ Argument validation failed. Please fix the issues above and try again.")
+            sys.exit(1)
+        
+        # Set up results directory
+        base_name = f"DeCo-Diff_{args.dataset}_{args.object_class}_{args.model_size}_{args.patch_size}"
+        
+        if args.append_timestamp:
+            current_time = datetime.now().strftime("%y%m%d_%H%M%S")
+            args.results_dir = f"results/{base_name}_{current_time}"
         else:
             args.results_dir = f"results/{base_name}"
-    
-    os.makedirs(args.results_dir, exist_ok=True)
-    
-    # Save config if using JSON
-    if args.input_json:
-        config_save_path = os.path.join(args.results_dir, "config.json")
-        with open(args.input_json, 'r') as f:
-            config_data = json.load(f)
-        with open(config_save_path, "w") as config_file:
-            json.dump(config_data, config_file, indent=2)
-    
-    # Execute the selected mode
-    if args.mode == "save_only":
-        mode_save_only(args)
-    elif args.mode == "process_only":
-        mode_process_only(args)
-    elif args.mode == "save_and_process":
-        mode_save_and_process(args)
-    elif args.mode == "full_pipeline":
-        mode_full_pipeline(args)
-    
-    print(f"Mode {args.mode} completed successfully!")
-
-def _get_memory_usage():
-    """Get current memory usage for monitoring."""
-    if torch.cuda.is_available():
-        try:
-            allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-            reserved = torch.cuda.memory_reserved() / 1024**3    # GB
-            total = torch.cuda.get_device_properties(0).total_memory / 1024**3  # Total GPU memory in GB
-            return allocated, reserved, total
-        except Exception:
-            return 0, 0, 0
-    return 0, 0, 0
-
+        
+        os.makedirs(args.results_dir, exist_ok=True)
+        
+        # Execute the selected mode
+        if args.mode == "save_only":
+            mode_save_only(args)
+        elif args.mode == "process_only":
+            mode_process_only(args)
+        elif args.mode == "save_and_process":
+            mode_save_and_process(args)
+        elif args.mode == "full_pipeline":
+            mode_full_pipeline(args)
+        
+        print(f"Mode {args.mode} completed successfully!")
 
 
 if __name__ == "__main__":
