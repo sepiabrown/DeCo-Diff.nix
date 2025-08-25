@@ -1212,14 +1212,7 @@ class MixedFineTuningDataset(Dataset):
                     print(f"  - Patch coordinates: {patch_coords}")
                     print(f"  - Bounding box: min_x={min_x}, min_y={min_y}, max_x={max_x}, max_y={max_y}")
                     raise ValueError(f"Invalid crop dimensions: {img.shape}")
-                
-                # Ensure the cropped image is the expected size
-                if img.shape[:2] != (128, 128):
-                    print(f"Warning: Cropped image size {img.shape[:2]} != expected (128, 128)")
-                    print(f"  - Resizing to expected dimensions")
-                    # Resize to expected dimensions
-                    img = cv2.resize(img, (128, 128), interpolation=cv2.INTER_LINEAR)
-                
+
                 # Create transform info for the specific patch
                 transform_info = {
                     'crop_coords': patch_coords,  # Use the original 8-value patch coordinates
@@ -1252,12 +1245,6 @@ class MixedFineTuningDataset(Dataset):
                     print(f"ERROR: Invalid image dimensions for {img_path}: {img.shape}")
                     raise ValueError(f"Invalid image dimensions: {img.shape}")
                 
-                # Ensure the image is the expected size
-                if img.shape[:2] != (128, 128):
-                    print(f"Warning: CSV image size {img.shape[:2]} != expected (128, 128)")
-                    print(f"  - Resizing to expected dimensions")
-                    # Resize to expected dimensions
-                    img = cv2.resize(img, (128, 128), interpolation=cv2.INTER_LINEAR)
                 
             # Convert rectangle to 8-value format for consistency
             x1, y1, x2, y2 = 0, 0, img.shape[1], img.shape[0]

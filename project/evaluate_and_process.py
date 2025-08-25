@@ -9,6 +9,7 @@ to provide 4 different execution modes:
 2. process_only: Read existing .npy files and generate categorization results
 3. save_and_process: Save .npy files and immediately process them for categorization
 4. full_pipeline: Complete pipeline without saving intermediates (evaluation to categorization)
+5. full_pipeline_with_saving_npy: Complete pipeline with saving intermediate NPY files (needs: --annotation-dir, --pretrained)
 
 IMPORTANT: This script handles patch-level processing:
 - The dataset returns individual patches (each __getitem__ returns a single patch)
@@ -30,6 +31,9 @@ Usage examples:
 
   # Mode 4: Full pipeline
   python evaluate_and_process.py --mode full_pipeline --annotation-dir path/to/annotations --pretrained path/to/model.pt
+
+  # Mode 5: Full pipeline with saving NPY files
+  python evaluate_and_process.py --mode full_pipeline_with_saving_npy --annotation-dir path/to/annotations --pretrained path/to/model.pt
 
   # Using JSON configuration only (mode specified in JSON)
   python evaluate_and_process.py --input-json config.json
@@ -93,7 +97,7 @@ from utils import (
 from evaluation_DeCo_Diff2 import (
     make_record, add_metric_fields,
     _get_largest_connected_component_pixels, _create_contour_based_binary_mask_single,
-    CheckpointManager, save_image_results_from_records, save_patch_results_from_records,
+    CheckpointManager, save_patch_results_from_records,
     determine_image_status, compute_y_true_y_score, compute_metrics_from_y_true_y_score,
     make_excel, plot_accuracy_results, save_perturbation_results, draw_patch_rectangles_on_image,
     EvaluationMetrics
@@ -106,8 +110,6 @@ from process_raw_data_to_results import (
     parse_filename_to_info,
     load_raw_data_files,
     compute_simple_metrics,
-    save_image_results_from_raw_data,
-    save_json_results_from_raw_data
 )
 
 # Set up device
@@ -353,41 +355,6 @@ def _process_single_patch(
         debug_print(f"⚠️  Error processing patch for {current_image_path}: {e}")
         return None
 
-# Helper: create a safe filename component from an image path or string
-# Ensures no illegal characters (like ':' on Windows) and provides a fallback
-# when input is empty or invalid
-import re as _re_for_safe_name
-
-def _safe_filename_component(value: Any) -> str:
-    try:
-        # Normalize input
-        if isinstance(value, (list, tuple)):
-            value = value[0] if value else ""
-        value = str(value or "")
-
-        # First try provided utility to preserve mapping if available
-        if value:
-            try:
-                safe = path_to_safe_filename(value)
-            except Exception:
-                safe = ""
-        else:
-            safe = ""
-
-        # Fallback: sanitize basename or raw value; strip drive letters and illegal chars
-        if not safe or safe.strip() == "" or safe == ":":
-            base = os.path.basename(value) or value.split(":")[-1]
-            safe = _re_for_safe_name.sub(r"_", base)
-
-        # Final cleanup: remove any remaining illegal characters, especially ':'
-        safe = safe.replace(":", "_")
-        safe = safe.strip("._ ")
-        if not safe:
-            safe = "unknown"
-        return safe
-    except Exception:
-        return "unknown"
-
 class AnnotatedImageDataset(Dataset):
     """Dataset for images with JSON annotations for defective regions."""
     
@@ -395,11 +362,13 @@ class AnnotatedImageDataset(Dataset):
         self,
         annotation_dir: str,
         patch_size: int = 128,
+        stride: int = None,
         transform=None,
         object_class: str = "pcb",
     ):
         self.annotation_dir = annotation_dir
         self.patch_size = patch_size
+        self.stride = stride if stride is not None else patch_size
         self.transform = transform
         self.object_class = object_class
         
@@ -436,8 +405,8 @@ class AnnotatedImageDataset(Dataset):
             padded_width = width + pad_width
 
             # Generate 8-value coordinates for each patch on the padded image grid
-            for y in range(0, padded_height, self.patch_size):
-                for x in range(0, padded_width, self.patch_size):
+            for y in range(0, padded_height - self.patch_size + 1, self.stride):
+                for x in range(0, padded_width - self.patch_size + 1, self.stride):
                     # Standard parallel patch (aligned with image axes)
                     x1, y1 = x, y  # Top-left
                     x2, y2 = x + self.patch_size, y  # Top-right
@@ -668,16 +637,17 @@ class AnnotatedImageDataset(Dataset):
         coords = []
         
         height, width = img.shape[:2]
-        stride = self.patch_size  # No overlap - patches are adjacent
-        debug_print(f"  📐 Padded image dimensions: {height}x{width}, patch size: {self.patch_size}")
+        stride = self.stride
+        debug_print(f"  📐 Padded image dimensions: {height}x{width}, patch size: {self.patch_size}, stride: {stride}")
         
-        # Verify image dimensions are divisible by patch_size
-        assert height % self.patch_size == 0, f"Height {height} not divisible by patch_size {self.patch_size}"
-        assert width % self.patch_size == 0, f"Width {width} not divisible by patch_size {self.patch_size}"
+        # When stride equals patch_size, ensure dimensions are divisible
+        if stride == self.patch_size:
+            assert height % self.patch_size == 0, f"Height {height} not divisible by patch_size {self.patch_size}"
+            assert width % self.patch_size == 0, f"Width {width} not divisible by patch_size {self.patch_size}"
         
-        # Simple grid extraction - no edge handling needed
-        for y in range(0, height, stride):
-            for x in range(0, width, stride):
+        # Extract patches with configurable stride
+        for y in range(0, height - self.patch_size + 1, stride):
+            for x in range(0, width - self.patch_size + 1, stride):
                 # Extract patch (guaranteed to be exactly patch_size x patch_size)
                 patch = img[y:y + self.patch_size, x:x + self.patch_size]
                 
@@ -704,83 +674,6 @@ def _compute_abs_diff_mean(a: torch.Tensor, b: torch.Tensor, diff_scale: float =
 
 def _compute_abs_diff_max(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.abs(a - b).max(dim=1, keepdim=True)[0]
-
-
-def reconstruct_records_from_raw_data(
-    patch_data: Dict[str, Dict[str, np.ndarray]],
-    ground_truth_map: Dict[str, Set[Tuple[int, int]]] = None,
-    original_images: Dict[str, np.ndarray] = None,
-    anomaly_binary_threshold: int = 5,
-    anomaly_pixel_num_threshold: int = 0,
-    adaptive_threshold: float = 0.1,
-    patch_size: int = 128,
-    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-) -> List[Record]:
-    """
-    Reconstruct evaluation records from raw data.
-    """
-    records = []
-    
-    for patch_key, data in tqdm(patch_data.items(), desc="Processing patches"):
-        file_path = data['file_path']
-        patch_coords_8_values = data['patch_coords']  # Now contains 8 values
-        
-        # Debug: Print coordinate information for first few patches
-        if len(records) < 3:
-            print(f"\nDebug: Processing patch {len(records)+1}")
-            print(f"  File: {file_path}")
-            print(f"  Coordinates type: {type(patch_coords_8_values)}")
-            print(f"  Coordinates length: {len(patch_coords_8_values) if hasattr(patch_coords_8_values, '__len__') else 'N/A'}")
-            print(f"  First coordinate: {patch_coords_8_values[0] if hasattr(patch_coords_8_values, '__len__') and len(patch_coords_8_values) > 0 else 'N/A'}")
-            if hasattr(patch_coords_8_values, '__len__') and len(patch_coords_8_values) > 0:
-                print(f"  First coordinate type: {type(patch_coords_8_values[0])}")
-                if isinstance(patch_coords_8_values[0], (list, tuple)):
-                    print(f"  First coordinate length: {len(patch_coords_8_values[0])}")
-                    print(f"  First coordinate values: {patch_coords_8_values[0]}")
-        
-        # Additional debug: Check the data structure
-        if len(records) < 3:
-            print(f"  Data keys: {list(data.keys())}")
-            print(f"  patch_x from data: {data.get('patch_x', 'MISSING')} (type: {type(data.get('patch_x', 'MISSING'))})")
-            print(f"  patch_y from data: {data.get('patch_y', 'MISSING')} (type: {type(data.get('patch_y', 'MISSING'))})")
-            print(f"  patch_coords from data: {data.get('patch_coords', 'MISSING')} (type: {type(data.get('patch_coords', 'MISSING'))})")
-        
-        # Extract coordinates using shared function
-        try:
-            coords_8_values = _extract_patch_coordinates(
-                patch_coords_8_values, 0, patch_size
-            )
-        except Exception as e:
-            print(f"⚠️  Error extracting coordinates for {file_path}: {e}")
-            continue
-        
-        # Load the raw data arrays
-        encodedrecon_raw = data['encodedrecon']
-        latent_raw = data['latent']
-        anomaly_map_arithmetic_raw = data['anomaly_map_arithmetic']
-        
-        # Process the patch using shared function
-        record = _process_single_patch(
-            ground_truth_map=ground_truth_map,
-            original_images=original_images,
-            anomaly_binary_threshold=anomaly_binary_threshold,
-            anomaly_pixel_num_threshold=anomaly_pixel_num_threshold,
-            patch_size=patch_size,
-            current_image_path=file_path,
-            coords_8_values=coords_8_values,
-            encodedrecon_raw=encodedrecon_raw,
-            latent_raw=latent_raw,
-            anomaly_map_arithmetic_raw=anomaly_map_arithmetic_raw
-        )
-        
-        if record is not None:
-            # Update the split to match the function parameter
-            record["split"] = ("meta", "test")
-            records.append(record)
-        else:
-            print(f"⚠️  Failed to create record for {file_path}")
-    
-    return records
 
 def _process_batch_inference(x, object_cls, model, vae, diffusion, reverse_steps, device, epoch_metrics=None):
     """
@@ -958,462 +851,6 @@ def _process_batch_inference(x, object_cls, model, vae, diffusion, reverse_steps
         torch.cuda.empty_cache()
     
     return encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic
-
-
-def _validate_and_fix_coordinates(coords_8_values):
-    """
-    Validate and fix 8-value coordinates to ensure they are single integers.
-    
-    Args:
-        coords_8_values: List, tuple, or array of 8 coordinates
-        
-    Returns:
-        List of 8 integers representing the coordinates
-    """
-    if not isinstance(coords_8_values, (list, tuple)) or len(coords_8_values) != 8:
-        raise ValueError(f"Expected 8-value coordinates, got {type(coords_8_values)} with length {len(coords_8_values) if hasattr(coords_8_values, '__len__') else 'unknown'}")
-    
-    fixed_coords = []
-    for i, coord in enumerate(coords_8_values):
-        # Handle torch tensors explicitly
-        if 'torch' in globals() and isinstance(coord, torch.Tensor):
-            if coord.numel() == 0:
-                raise ValueError(f"Coordinate[{i}] is an empty tensor: {coord}")
-            fixed_value = int(coord.view(-1)[0].item())
-            fixed_coords.append(fixed_value)
-            debug_print(f"  🔧 Fixed coordinate[{i}] tensor -> {fixed_value}")
-        elif isinstance(coord, (list, tuple)):
-            # If coordinate is a list/array, take the first value
-            if len(coord) > 0:
-                fixed_coords.append(int(coord[0]))
-                debug_print(f"  🔧 Fixed coordinate[{i}]: {coord} -> {coord[0]}")
-            else:
-                raise ValueError(f"Coordinate[{i}] is empty list/array: {coord}")
-        else:
-            # If coordinate is already a single value, convert to int
-            fixed_coords.append(int(coord))
-    
-    debug_print(f"  ✅ Validated coordinates: {fixed_coords}")
-    return fixed_coords
-
-def _save_results(
-    args,
-    dataloader,
-    split: str,
-    diffusion,
-    model,
-    vae,
-    reverse_steps: int,
-    batch_num: int,
-    device: torch.device = torch.device("cpu"),
-    save_dir: str = "minimal_diff_results",
-    checkpoint_manager: "CheckpointManager" | None = None
-) -> None:
-    """
-    Save only .npy files and images without processing records.
-    This is mode 1: save_only
-    """
-    # Initialize epoch metrics if enabled
-    epoch_metrics = EvaluationMetrics() if args.enable_epoch_stats else None
-    
-    # Debug print checkpoint manager info
-    debug_print(f"🔍 Checkpoint Manager: {checkpoint_manager}")
-    debug_print(f"🔍 Checkpoint Manager type: {type(checkpoint_manager)}")
-    if checkpoint_manager:
-        debug_print(f"🔍 Checkpoint dir: {getattr(checkpoint_manager, 'base_checkpoint_dir', 'N/A')}")
-        debug_print(f"🔍 Force rerun: {getattr(checkpoint_manager, 'force_rerun', 'N/A')}")
-        # Check if checkpoint directory exists
-        checkpoint_dir = getattr(checkpoint_manager, 'base_checkpoint_dir', None)
-        if checkpoint_dir:
-            debug_print(f"🔍 Checkpoint dir exists: {os.path.exists(checkpoint_dir)}")
-            if os.path.exists(checkpoint_dir):
-                checkpoint_files = os.listdir(checkpoint_dir)
-                debug_print(f"🔍 Checkpoint files: {checkpoint_files}")
-            else:
-                debug_print(f"🔍 Checkpoint directory does not exist yet")
-        # Check checkpoint manager methods
-        debug_print(f"🔍 Has save_checkpoint method: {hasattr(checkpoint_manager, 'save_checkpoint')}")
-        debug_print(f"🔍 Has get_processed_images method: {hasattr(checkpoint_manager, 'get_processed_images')}")
-        # Try to get current processed images
-        try:
-            processed_images = checkpoint_manager.get_processed_images()
-            debug_print(f"🔍 Currently processed images count: {len(processed_images)}")
-            if processed_images:
-                debug_print(f"🔍 Sample processed images: {list(processed_images)[:3]}")
-        except Exception as e:
-            debug_print(f"🔍 Error getting processed images: {e}")
-    
-    # Create save directory
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # Check for existing checkpoints and resume from where we left off
-    start_idx = 0
-    if checkpoint_manager is not None:
-        try:
-            # Get already processed images
-            already_processed = checkpoint_manager.get_processed_images()
-            debug_print(f"🔍 Found {len(already_processed)} already processed images")
-            
-            # Determine checkpoint behavior based on command line arguments
-            if args.checkpoint_mode == "overwrite":
-                debug_print(f"🔍 Checkpoint mode: overwrite - ignoring existing checkpoints")
-                start_idx = 0
-            elif args.checkpoint_mode == "resume" or (args.checkpoint_mode == "auto" and already_processed and not args.force_rerun):
-                debug_print(f"🔍 Checkpoint mode: resume - attempting to resume from existing checkpoint")
-                
-                # Check if we have a checkpoint file with batch information
-                checkpoint_dir = getattr(checkpoint_manager, 'base_checkpoint_dir', None)
-                if checkpoint_dir and os.path.exists(checkpoint_dir):
-                    # Look for the latest checkpoint file
-                    checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('.json')]
-                    if checkpoint_files:
-                        # Sort by modification time to get the latest
-                        checkpoint_files.sort(key=lambda f: os.path.getmtime(os.path.join(checkpoint_dir, f)))
-                        latest_checkpoint = checkpoint_files[-1]
-                        checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
-                        
-                        try:
-                            with open(checkpoint_path, 'r') as f:
-                                checkpoint_data = json.load(f)
-                            
-                            # Extract the last processed batch index
-                            if 'current_image_index' in checkpoint_data:
-                                last_processed_batch = checkpoint_data['current_image_index']
-                                start_idx = max(0, last_processed_batch)
-                                debug_print(f"🔍 Found checkpoint with last processed batch: {last_processed_batch}")
-                                debug_print(f"🔍 Resuming from batch index: {start_idx}")
-                            else:
-                                debug_print(f"🔍 Checkpoint file doesn't contain batch index, estimating...")
-                                # Fallback to estimation
-                                estimated_batches = len(already_processed) // 16  # Assuming ~16 images per batch
-                                start_idx = max(0, estimated_batches - 1)
-                                debug_print(f"🔍 Estimated resume from batch index: {start_idx}")
-                        except Exception as e:
-                            debug_print(f"⚠️  Error reading checkpoint file: {e}, using estimation")
-                            estimated_batches = len(already_processed) // 16
-                            start_idx = max(0, estimated_batches - 1)
-                    else:
-                        debug_print(f"🔍 No checkpoint files found, using estimation")
-                        estimated_batches = len(already_processed) // 16
-                        start_idx = max(0, estimated_batches - 1)
-                else:
-                    debug_print(f"🔍 No checkpoint directory, using estimation")
-                    estimated_batches = len(already_processed) // 16
-                    start_idx = max(0, estimated_batches - 1)
-                
-                debug_print(f"🔍 This will skip approximately {start_idx * 16} already processed images")
-            else:
-                debug_print(f"🔍 Checkpoint mode: auto - no existing checkpoints found, starting fresh")
-        except Exception as e:
-            debug_print(f"⚠️  Error checking existing checkpoints: {e}, starting from beginning")
-            start_idx = 0
-    
-    idx = start_idx - 1  # Start from the batch before start_idx since we increment at the beginning
-    
-    # Setup async saving executor (Windows-safe). Default to 1 worker on Windows.
-    async_workers = getattr(args, "async_save_workers", None)
-    if async_workers is None:
-        # If not provided via CLI or JSON, set default: 1 for Windows, 4 otherwise
-        async_workers = 1 if platform.system().lower().startswith("win") else max(2, min(8, os.cpu_count() or 4))
-    # Ensure at least 1
-    async_workers = max(1, int(async_workers))
-
-    executor = ThreadPoolExecutor(max_workers=async_workers)
-    pending = deque()
-    # throttle pending tasks to avoid unbounded memory when disk is slow
-    # allow more queueing so we can exit the batch quickly and overlap with next batch
-    max_pending = max(8, async_workers * 8)
-
-    def _submit_save_job(save_dir_local, base_filename_local,
-                         encodedrecon_raw_local, latent_raw_local, anomaly_raw_local,
-                         coords_array_local, save_preview_local, save_dtype_is_f16_local):
-        def _job():
-            # Save npy arrays
-            if save_dtype_is_f16_local:
-                np.save(os.path.join(save_dir_local, f"{base_filename_local}_encodedrecon.npy"), encodedrecon_raw_local.astype(np.float16))
-                np.save(os.path.join(save_dir_local, f"{base_filename_local}_latent.npy"), latent_raw_local.astype(np.float16))
-                np.save(os.path.join(save_dir_local, f"{base_filename_local}_anomaly_map_arithmetic.npy"), anomaly_raw_local.astype(np.float16))
-            else:
-                np.save(os.path.join(save_dir_local, f"{base_filename_local}_encodedrecon.npy"), encodedrecon_raw_local.astype(np.float32))
-                np.save(os.path.join(save_dir_local, f"{base_filename_local}_latent.npy"), latent_raw_local.astype(np.float32))
-                np.save(os.path.join(save_dir_local, f"{base_filename_local}_anomaly_map_arithmetic.npy"), anomaly_raw_local.astype(np.float32))
-
-            # Save coords
-            np.save(os.path.join(save_dir_local, f"{base_filename_local}_coords.npy"), coords_array_local.astype(np.int32))
-
-            # Save previews if requested
-            if save_preview_local:
-                PILImage.fromarray((encodedrecon_raw_local * 255).astype(np.uint8)).save(os.path.join(save_dir_local, f"{base_filename_local}_encodedrecon.png"))
-                PILImage.fromarray((latent_raw_local * 255).astype(np.uint8)).save(os.path.join(save_dir_local, f"{base_filename_local}_latent.png"))
-                PILImage.fromarray((anomaly_raw_local * 255).astype(np.uint8)).save(os.path.join(save_dir_local, f"{base_filename_local}_anomaly_map_arithmetic.png"))
-
-        # throttle pending jobs
-        while len(pending) >= max_pending:
-            fut = pending.popleft()
-            fut.result()
-        fut = executor.submit(_job)
-        pending.append(fut)
-
-    try:
-        for idx, (x, seg, object_cls, anomaly_classes, image_path, patch_coords) in enumerate(
-            tqdm(dataloader, desc=f"{split} split")
-        ):
-            if idx >= batch_num:
-                break
-
-            # Skip batches that have already been processed
-            if idx < start_idx:
-                debug_print(f"⏭️  Skipping batch {idx+1} (already processed)")
-                continue
-
-            # Additional check: see if output files already exist for this batch
-            # This provides a more direct way to determine if we should skip processing
-            batch_already_processed = False
-            if checkpoint_manager is not None:
-                try:
-                    # Check if any output files exist for this batch
-                    # We'll check the first few patches to see if they're already processed
-                    sample_patch_count = min(3, x.size(0))  # Check first 3 patches
-                    for b in range(sample_patch_count):
-                        if b < len(image_path):
-                            sample_image_path = image_path[b] if isinstance(image_path[b], str) else str(image_path[b])
-                            file_info = path_to_safe_filename(sample_image_path)
-                            
-                            # Check if the output files exist
-                            base_filename = f"{file_info}__minimal_diff"
-                            encodedrecon_file = os.path.join(save_dir, f"{base_filename}_encodedrecon.npy")
-                            latent_file = os.path.join(save_dir, f"{base_filename}_latent.npy")
-                            anomaly_file = os.path.join(save_dir, f"{base_filename}_anomaly_map_arithmetic.npy")
-                            
-                            if os.path.exists(encodedrecon_file) and os.path.exists(latent_file) and os.path.exists(anomaly_file):
-                                batch_already_processed = True
-                                debug_print(f"🔍 Batch {idx+1} appears to be already processed (output files exist)")
-                                break
-                except Exception as e:
-                    debug_print(f"⚠️  Error checking existing output files: {e}")
-            
-            if batch_already_processed and not args.force_rerun:
-                debug_print(f"⏭️  Skipping batch {idx+1} (output files already exist)")
-                continue
-
-            debug_print(f"🔄 Processing batch {idx+1}/{min(batch_num, len(dataloader))}")
-            debug_print(f"📊 Batch size: {x.size(0)} patches")
-            debug_print(f"🖼️  Patch shape: {x.shape}")
-            debug_print(f"🏷️  Object classes shape: {object_cls.shape}")
-            
-            # Validate tensor dimensions before processing
-            if len(x.shape) != 4:
-                raise ValueError(f"Expected 4D input tensor, got shape: {x.shape}. Expected: [batch, channels, height, width]")
-            
-            if x.shape[1] != 3:
-                raise ValueError(f"Expected 3 channels (RGB), got {x.shape[1]} channels")
-            
-            debug_print(f"✅ Tensor shape validation passed")
-            
-            with torch.no_grad():
-                debug_print(f"🧠 Starting inference...")
-                
-                # Final validation: ensure tensor is 4D before inference
-                if len(x.shape) != 4:
-                    debug_print(f"⚠️  CRITICAL: Tensor has wrong shape {x.shape} before inference, attempting to fix")
-                    if len(x.shape) == 5:
-                        # Flatten first two dimensions
-                        batch_size = x.shape[0] * x.shape[1]
-                        x = x.view(batch_size, *x.shape[2:])
-                        debug_print(f"🔧 Fixed 5D tensor to: {x.shape}")
-                    elif len(x.shape) == 3:
-                        # Add batch dimension
-                        x = x.unsqueeze(0)
-                        debug_print(f"🔧 Added batch dimension to 3D tensor: {x.shape}")
-                    else:
-                        raise ValueError(f"Cannot fix tensor with shape {x.shape}")
-                
-                # Validate final shape
-                if len(x.shape) != 4:
-                    raise ValueError(f"Failed to create 4D tensor before inference. Final shape: {x.shape}")
-                
-                if x.shape[1] != 3:
-                    raise ValueError(f"Expected 3 channels (RGB), got {x.shape[1]} channels")
-                
-                debug_print(f"✅ Tensor validated before inference: {x.shape}")
-                
-                # Direct inference on the batch (no chunking needed since dataset returns individual patches)
-                encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic = _process_batch_inference(
-                    x, object_cls, model, vae, diffusion, reverse_steps, device, epoch_metrics=epoch_metrics
-                )
-                debug_print(f"✅ Inference completed")
-            
-            # ---------------------------------------------------------------------
-            # Per‑sample aggregation and async saving (Windows-safe threading)
-            # ---------------------------------------------------------------------
-            batch_size = x.size(0)
-            save_f16 = getattr(args, "save_npy_dtype", "float16") == "float16"
-            save_preview = getattr(args, "save_preview_images", False)
-            
-            for b in range(batch_size):
-                # Get the image path directly from the batch
-                if b < len(image_path):
-                    if isinstance(image_path[b], str):
-                        current_image_path = image_path[b]
-                    elif isinstance(image_path[b], (list, tuple)):
-                        current_image_path = image_path[b][0] if image_path[b] else ""
-                    else:
-                        current_image_path = str(image_path[b])
-                else:
-                    current_image_path = str(image_path[-1]) if image_path else ""
-                
-                # Get the 8-value coordinates directly from the batch
-                if isinstance(patch_coords, torch.Tensor) and len(patch_coords.shape) == 2:
-                    if b < patch_coords.size(0):
-                        coords_8_values = patch_coords[b].tolist()  # Get [8] tensor for this batch item
-                    else:
-                        coords_8_values = patch_coords[-1].tolist() if patch_coords.size(0) > 0 else [0, 0, args.patch_size, 0, args.patch_size, args.patch_size, 0, args.patch_size]
-                else:
-                    raise ValueError(f"Expected patch_coords to be [batch_size, 8] tensor, got {type(patch_coords)} with shape {patch_coords.shape if hasattr(patch_coords, 'shape') else 'unknown'}")
-                
-                # Extract individual coordinates from the 8-value format
-                x1, y1, x2, y2, x3, y3, x4, y4 = coords_8_values
-                
-                # Debug: Log the image path extraction
-                debug_print(f"🔍 Patch {b}: current_image_path = '{current_image_path}'")
-                
-                # Ensure we have a valid file_info, fallback to "unknown" if empty
-                file_info = _safe_filename_component(current_image_path)
-                if file_info == "unknown":
-                    debug_print(f"⚠️  Warning: Empty/invalid image path for patch {b}, using fallback filename")
-                
-                patch_info = f"x{x1}_y{y1}_x{x2}_y{y2}_x{x3}_y{y3}_x{x4}_y{y4}"
-                base_filename = f"{file_info}__{patch_info}__minimal_diff"
-                
-                # Save difference maps using PIL for robust tensor handling
-                # Convert to uint8 for maximum I/O performance and remove single dimensions
-                # Get raw values in [0,1] range for efficient storage
-                encodedrecon_raw = _to_numpy(encodedrecon_dodrecon_diff[b])
-                latent_raw = _to_numpy(encoded_latent_diff_resized[b])
-                anomaly_map_arithmetic_raw = _to_numpy(anomaly_map_arithmetic[b])
-                
-                # Remove single dimensions
-                encodedrecon_raw = encodedrecon_raw.squeeze()
-                latent_raw = latent_raw.squeeze()
-                anomaly_map_arithmetic_raw = anomaly_map_arithmetic_raw.squeeze()
-
-                # Prepare coords as numpy and submit async save
-                validated_coords = _validate_and_fix_coordinates(coords_8_values)
-                debug_print(f"🔍 Saving coordinates for patch {b}: {validated_coords}")
-                debug_print(f"  Coordinate types: {[type(coord) for coord in validated_coords]}")
-                debug_print(f"  All integers: {all(isinstance(coord, int) for coord in validated_coords)}")
-                patch_coords_array = np.array(validated_coords, dtype=np.int32)
-                if len(patch_coords_array.shape) > 1:
-                    debug_print(f"  ⚠️  Warning: Coordinates have unexpected shape {patch_coords_array.shape}, flattening...")
-                    patch_coords_array = patch_coords_array.flatten()
-                    debug_print(f"  Flattened shape: {patch_coords_array.shape}")
-
-                _submit_save_job(
-                    save_dir,
-                    base_filename,
-                    encodedrecon_raw,
-                    latent_raw,
-                    anomaly_map_arithmetic_raw,
-                    patch_coords_array,
-                    save_preview,
-                    save_f16,
-                )
-            
-            # After finishing all patches for this image, update checkpoint
-            if checkpoint_manager is not None:
-                # Only save checkpoint at specified intervals to avoid excessive I/O
-                if (idx + 1) % args.checkpoint_interval == 0:
-                    debug_print(f"🔍 Saving checkpoint for batch {idx + 1}")
-                    try:
-                        # Collect valid image paths (deduplicated)
-                        processed_image_paths = []
-                        for p in image_path:
-                            if isinstance(p, str) and p:
-                                processed_image_paths.append(p)
-                            elif isinstance(p, (list, tuple)) and len(p) > 0:
-                                first = p[0]
-                                if isinstance(first, str) and first:
-                                    processed_image_paths.append(first)
-                        unique_processed = sorted(set(processed_image_paths))
-                        debug_print(f"🔍 Unique processed image paths: {unique_processed}")
-
-                        # Merge with previously processed images (from latest checkpoint)
-                        previously_processed = checkpoint_manager.get_processed_images()
-                        debug_print(f"🔍 Previously processed images count: {len(previously_processed)}")
-                        merged = list(set(previously_processed).union(set(unique_processed)))
-                        debug_print(f"🔍 Merged processed images count: {len(merged)}")
-
-                        # Save a new checkpoint reflecting progress up to current image index
-                        debug_print(f"🔍 Calling save_checkpoint with image_index={idx + 1}")
-                        checkpoint_manager.save_checkpoint(
-                            current_image_index=idx + 1,
-                            processed_images=merged,
-                        )
-                        debug_print(f"🔍 ✅ Checkpoint saved successfully for batch {idx + 1}")
-                    except Exception as e:
-                        print(f"Warning: failed to save checkpoint after image {idx + 1}: {e}")
-                        debug_print(f"🔍 ❌ Checkpoint save failed: {e}")
-                else:
-                    debug_print(f"🔍 Skipping checkpoint save for batch {idx + 1} (interval: {args.checkpoint_interval})")
-
-            # Memory optimization: Clear cache every 10 batches
-            if idx % 10 == 0 and idx > 0:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                import gc
-                gc.collect()
-
-    except KeyboardInterrupt:
-        print("\nProcess interrupted.")
-        raise
-    except Exception as e:
-        print(f"\nError occurred: {e}")
-        raise
-    finally:
-        # Drain pending save jobs and shutdown executor
-        while pending:
-            fut = pending.popleft()
-            try:
-                fut.result()
-            except Exception as e:
-                debug_print(f"❌ Error in async save job: {e}")
-        executor.shutdown(wait=True)
-
-    # Print summary of processing
-    total_batches = min(batch_num, len(dataloader))
-    processed_batches = idx + 1 - start_idx
-    skipped_batches = start_idx
-    
-    print(f"\n📊 Processing Summary:")
-    print(f"   Total batches in dataset: {len(dataloader)}")
-    print(f"   Target batches to process: {batch_num}")
-    print(f"   Batches skipped (already processed): {skipped_batches}")
-    print(f"   Batches newly processed: {processed_batches}")
-    print(f"   Total batches handled: {skipped_batches + processed_batches}")
-    
-    # Save final checkpoint
-    if checkpoint_manager is not None:
-        try:
-            debug_print(f"🔍 Saving final checkpoint after completion")
-            final_processed = checkpoint_manager.get_processed_images()
-            checkpoint_manager.save_checkpoint(
-                current_image_index=idx + 1,
-                processed_images=final_processed,
-            )
-            debug_print(f"🔍 ✅ Final checkpoint saved successfully")
-            print(f"   Total images processed (including previous runs): {len(final_processed)}")
-        except Exception as e:
-            print(f"   Could not save final checkpoint: {e}")
-            debug_print(f"🔍 ❌ Final checkpoint save failed: {e}")
-
-    print(f"Raw data saving completed. Results saved to {save_dir}")
-    
-    # Print epoch statistics if enabled
-    if epoch_metrics is not None:
-        epoch_metrics.print_epoch_stats()
-    else:
-        debug_print("Skipping epoch statistics (disabled)")
-
 
 def create_confusion_matrix_from_records(
     records: List[Record],
@@ -1758,6 +1195,7 @@ def _before_saving_results(args):
     dataset = AnnotatedImageDataset(
         annotation_dir=args.annotation_dir,
         patch_size=args.patch_size,
+        stride=args.stride,
         transform=get_transform(),
         object_class=args.object_class,
     )
@@ -1787,358 +1225,6 @@ def _before_saving_results(args):
     
     return vae, model, diffusion, dataset, loader, evaluation_results_dir, checkpoint_manager
 
-
-def _reading_saved_results(args):
-    """
-    Read saved .npy files and reconstruct records with 8-value coordinates.
-    Returns: (records, ground_truth_map, original_images)
-    """
-    import glob
-    import re
-    
-    debug_print("📂 Reading saved .npy files...")
-    
-    # Load ground truth information using existing dataset functionality
-    dataset = AnnotatedImageDataset(
-        annotation_dir=args.annotation_dir,
-        patch_size=args.patch_size,
-        transform=get_transform(),
-        object_class=args.object_class
-    )
-    
-    # Create empty ground truth map for compatibility
-    ground_truth_map = {}
-    original_images = {}
-    
-    # Find all .npy files
-    npy_pattern = os.path.join(args.results_dir, "evaluation_results", "*_encodedrecon.npy")
-    npy_files = glob.glob(npy_pattern)
-    debug_print(f"📁 Found {len(npy_files)} .npy files")
-    
-    records = []
-    
-    for npy_file in npy_files:
-        # Load coordinates from dedicated .npy file (much more efficient than filename parsing)
-        base_name = npy_file.replace("_encodedrecon.npy", "")
-        coords_file = f"{base_name}_coords.npy"
-        latent_file = f"{base_name}_latent.npy"
-        anomaly_file = f"{base_name}_anomaly_map_arithmetic.npy"
-        
-        if os.path.exists(coords_file) and os.path.exists(latent_file) and os.path.exists(anomaly_file):
-            # Load 8-value coordinates directly from .npy file
-            patch_coords_8_values = np.load(coords_file).tolist()  # Convert to list for consistency
-            debug_print(f"🔍 Loaded coords from .npy: {patch_coords_8_values} (len: {len(patch_coords_8_values)})")
-            
-            # Extract image path from filename (before first __)
-            filename = os.path.basename(npy_file)
-            file_info = filename.split("__")[0]
-            image_path = safe_filename_to_path(file_info)
-            
-            # Load data
-            encodedrecon_data = np.load(npy_file)
-            latent_data = np.load(latent_file)
-            anomaly_data = np.load(anomaly_file)
-            
-            # Create record with 8-value coordinates
-            record = make_record(
-                split=("meta", args.split),
-                image_path=("meta", image_path),
-                image_path_original=("meta", file_info),
-                anomaly_class=("meta", "all"),
-                patch_coords=("meta", patch_coords_8_values),  # 8 values from .npy file
-                encodedrecon_dodrecon_diff=("tensor", torch.from_numpy(encodedrecon_data)),
-                encoded_latent_diff_resized=("tensor", torch.from_numpy(latent_data)),
-                anomaly_map_arithmetic=("tensor", torch.from_numpy(anomaly_data))
-            )
-            
-            # Debug: Check what make_record actually created
-            debug_print(f"🔍 make_record created patch_coords: {record.get('patch_coords', 'MISSING')} (type: {type(record.get('patch_coords', [None, None])[1]) if 'patch_coords' in record else 'N/A'})")
-            
-            records.append(record)
-            debug_print(f"✅ Loaded record with 8-value coords from .npy: {patch_coords_8_values}")
-        else:
-            # Fallback: try to extract from filename for backward compatibility with old data
-            filename = os.path.basename(npy_file)
-            debug_print(f"🔍 No _coords.npy found, trying filename parsing for: {filename}")
-            coord_pattern = r"__x(\d+)_y(\d+)_x(\d+)_y(\d+)_x(\d+)_y(\d+)_x(\d+)_y(\d+)__minimal_diff"
-            match = re.search(coord_pattern, filename)
-            
-            if match and os.path.exists(latent_file) and os.path.exists(anomaly_file):
-                x1, y1, x2, y2, x3, y3, x4, y4 = map(int, match.groups())
-                patch_coords_8_values = [x1, y1, x2, y2, x3, y3, x4, y4]
-                debug_print(f"🔍 Extracted coords from filename: {patch_coords_8_values}")
-                
-                file_info = filename.split("__")[0]
-                image_path = safe_filename_to_path(file_info)
-                
-                # Load data
-                encodedrecon_data = np.load(npy_file)
-                latent_data = np.load(latent_file)
-                anomaly_data = np.load(anomaly_file)
-                
-                # Create record with 8-value coordinates
-                record = make_record(
-                    split=("meta", args.split),
-                    image_path=("meta", image_path),
-                    image_path_original=("meta", file_info),
-                    anomaly_class=("meta", "all"),
-                    patch_coords=("meta", patch_coords_8_values),  # 8 values from filename
-                    encodedrecon_dodrecon_diff=("tensor", torch.from_numpy(encodedrecon_data)),
-                    encoded_latent_diff_resized=("tensor", torch.from_numpy(latent_data)),
-                    anomaly_map_arithmetic=("tensor", torch.from_numpy(anomaly_data))
-                )
-                
-                # Debug: Check what make_record actually created (filename path)
-                debug_print(f"🔍 make_record (filename) created patch_coords: {record.get('patch_coords', 'MISSING')} (type: {type(record.get('patch_coords', [None, None])[1]) if 'patch_coords' in record else 'N/A'})")
-                
-                records.append(record)
-                debug_print(f"✅ Loaded record with 8-value coords from filename: {patch_coords_8_values}")
-            else:
-                debug_print(f"⚠️  Missing required files for {npy_file}")
-                debug_print(f"     coords.npy: {os.path.exists(coords_file)}")
-                debug_print(f"     latent.npy: {os.path.exists(latent_file)}")
-                debug_print(f"     anomaly.npy: {os.path.exists(anomaly_file)}")
-                debug_print(f"     regex match: {match is not None}")
-                if not match:
-                    debug_print(f"     filename pattern expected: file__x0_y0_x128_y0_x128_y128_x0_y128__minimal_diff_*")
-    
-    debug_print(f"📊 Loaded {len(records)} records from saved data")
-    return records, ground_truth_map, original_images
-
-
-def _after_reading_saved_results(
-    args,
-    records,
-    ground_truth_map,
-    original_images,
-    output_subdir_name: str = "processed_results",
-):
-    """
-    Process records after reading from saved data and generate outputs.
-    Returns: (metrics, output_dir)
-    """
-    
-    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join(args.results_dir, f"{current_time}")
-    os.makedirs(output_dir, exist_ok=True)
-    output_subdir = os.path.join(output_dir, f"{output_subdir_name}")
-    os.makedirs(output_subdir, exist_ok=True)
-    debug_print(f"📁 Output directory: {output_subdir}")
-    
-    # Calculate metrics from records
-    debug_print("📊 Computing evaluation metrics...")
-    
-    # compute_y_true_y_score expects a list of (records, records_defect) tuples
-    # Since we have a single list of records, we'll separate them based on defect status
-    normal_records = [r for r in records if not r.get('is_predicted_defective', [False, False])[1]]
-    defect_records = [r for r in records if r.get('is_predicted_defective', [False, False])[1]]
-    
-    # Format as expected by compute_y_true_y_score
-    all_records = [(normal_records, defect_records)]
-    
-    try:
-        y_true, y_score = compute_y_true_y_score(all_records)
-        metrics = compute_metrics_from_y_true_y_score(y_true, y_score)
-    except Exception as e:
-        debug_print(f"⚠️  Error computing metrics: {e}")
-        # Fallback to simple metrics calculation
-        metrics = {
-            "total_records": len(records),
-            "defective_records": len(defect_records),
-            "normal_records": len(normal_records)
-        }
-    
-    if args.enable_confusion_matrix:
-        create_confusion_matrix_from_records(
-            records,
-            output_subdir,
-            annotation_dir=args.annotation_dir,
-            patch_size=args.patch_size
-        )
-    # Save results in various formats
-    if args.enable_save_json_results:
-        debug_print("💾 Saving JSON results...")
-        debug_print("📄 Saving comprehensive JSON with all records...")
-        save_all_records_json(
-            records,
-            output_subdir,
-            filename="all_evaluation_records.json",
-            patch_size=args.patch_size,
-            sort_records=not args.no_sort_records_by_anomaly
-        )
-
-    if args.enable_save_image_results or args.enable_save_whole_image_results:
-        debug_print("🖼️ Saving image results...")
-        # Build per-image groupings and compute predicted/ground-truth sets
-        checkpoint_manager = CheckpointManager(args.results_dir, args.annotation_dir, args.force_rerun)
-        from collections import defaultdict
-        image_to_records = defaultdict(list)
-        for rec in records:
-            img_path = rec.get("image_path", (None, None))[1]
-            if img_path:
-                image_to_records[img_path].append(rec)
-
-        for img_path, image_records in image_to_records.items():
-            # Predicted defective set from records (expects 8-value patch_coords)
-            predicted_defective_set = set()
-            for rec in image_records:
-                try:
-                    is_def = rec.get("is_predicted_defective", (None, False))[1]
-                    if not is_def:
-                        continue
-                    coords = rec.get("patch_coords", (None, []))[1]
-                    if not (isinstance(coords, (list, tuple)) and len(coords) == 8):
-                        raise ValueError(f"Expected 8-value patch_coords in records, got: {coords}")
-                    x1, y1 = int(coords[0]), int(coords[1])
-                    row = y1 // args.patch_size
-                    col = x1 // args.patch_size
-                    predicted_defective_set.add((row, col))
-                except Exception:
-                    continue
-
-            ground_truth_defective = ground_truth_map.get(img_path, set()) if isinstance(ground_truth_map, dict) else set()
-            overlapping = set()
-
-            # Patch-level image save per patch (same as in evaluation_DeCo_Diff2)
-            if args.enable_save_image_results:
-                for rec in image_records:
-                    coords = rec.get("patch_coords", (None, []))[1]
-                    if not (isinstance(coords, (list, tuple)) and len(coords) == 8):
-                        continue
-                    patch_x, patch_y = int(coords[0]), int(coords[1])
-                    # Build a single-patch record list
-                    patch_records = [rec]
-                    # Compute predicted set for this single patch
-                    anomaly_map = rec["anomaly_map_arithmetic_binary"][1]
-                    anomaly_pixels = int(np.sum(anomaly_map)) if hasattr(anomaly_map, 'sum') else 0
-                    patch_pred_set = set()
-                    if anomaly_pixels > 0:
-                        grid_row = patch_y // args.patch_size
-                        grid_col = patch_x // args.patch_size
-                        patch_pred_set.add((grid_row, grid_col))
-                    try:
-                        save_patch_results_from_records(
-                            checkpoint_manager,
-                            img_path,
-                            patch_records,
-                            patch_pred_set,
-                            ground_truth_defective,
-                            overlapping,
-                            enable_save_optional_image_results=args.enable_save_optional_image_results,
-                            patch_size=args.patch_size,
-                            patch_x=patch_x,
-                            patch_y=patch_y,
-                        )
-                    except Exception as e:
-                        debug_print(f"⚠️  Failed to save patch-level result for {img_path}: {e}")
-
-            # Image-level image save (only when explicitly enabled)
-            if args.enable_save_whole_image_results:
-                try:
-                    save_image_results_from_records(
-                        checkpoint_manager,
-                        img_path,
-                        image_records,
-                        predicted_defective_set,
-                        ground_truth_defective,
-                        overlapping,
-                        enable_save_optional_image_results=args.enable_save_optional_image_results,
-                        patch_size=args.patch_size,
-                    )
-                except Exception as e:
-                    debug_print(f"⚠️  Failed to save image-level results for {img_path}: {e}")
-    
-    if args.enable_excel_report:
-        debug_print("📊 Creating Excel report...")
-        make_excel(records, output_subdir, args.split, args.object_class)
-    
-    debug_print("✅ Processing completed successfully!")
-    return metrics, output_subdir
-
-
-def mode_save_only(args):
-    """Mode 1: Save .npy files and diff images only."""
-    print("=== Mode 1: Save Only ===")
-    
-    # Before saving results
-    vae, model, diffusion, dataset, loader, evaluation_results_dir, checkpoint_manager = _before_saving_results(args)
-    
-    # Save raw data directly
-    _save_results(
-        args=args,
-        dataloader=loader,
-        split=args.split,
-        diffusion=diffusion,
-        model=model,
-        vae=vae,
-        reverse_steps=args.reverse_steps,
-        batch_num=args.batch_num,
-        device=device,
-        save_dir=evaluation_results_dir,
-        checkpoint_manager=checkpoint_manager
-    )
-    
-    print(f"Raw data saved to: {evaluation_results_dir}")
-
-def _reading_saved_results(args):
-    """
-    Shared logic for loading and reconstructing records from saved .npy files.
-    Returns: (records, ground_truth_map, original_images)
-    """
-    # Load ground truth map
-    ground_truth_map = load_ground_truth_map(args.annotation_dir)
-    print(f"Loaded ground truth for {len(ground_truth_map)} images")
-    # Load all raw data files
-    patch_data = load_raw_data_files(args.results_dir, visualize=False)
-    
-    if not patch_data:
-        print("No complete patch data found!")
-        return [], ground_truth_map, {}
-    
-    # Extract unique image paths from patch data
-    image_paths = set(data['file_path'] for data in patch_data.values())
-    
-    # Load original images
-    original_images = load_original_images(image_paths)
-    print(f"Loaded {len(original_images)} original images")
-    
-    print(f"Reconstructing records from {len(patch_data)} patches...")
-    
-    # Debug: Check patch_data coordinates before reconstruction
-    debug_print("🔍 Checking patch_data coordinates...")
-    for key, data in list(patch_data.items())[:3]:  # Check first 3 items
-        coords = data.get('patch_coords', 'MISSING')
-        debug_print(f"   {key}: patch_coords = {coords} (type: {type(coords)}, len: {len(coords) if hasattr(coords, '__len__') else 'N/A'})")
-    
-    # Verify coordinates are now 8-value format
-    debug_print("🔍 Verifying 8-value coordinates from fixed load_raw_data_files...")
-    for key, data in list(patch_data.items())[:3]:  # Check first 3 items
-        coords = data.get('patch_coords', 'MISSING')
-        debug_print(f"   {key}: patch_coords = {coords} (type: {type(coords)}, len: {len(coords) if hasattr(coords, '__len__') else 'N/A'})")
-    
-    # Reconstruct records
-    debug_print("🔍 Calling reconstruct_records_from_raw_data...")
-    records = reconstruct_records_from_raw_data(
-        patch_data,
-        ground_truth_map=ground_truth_map,
-        original_images=original_images,
-        anomaly_binary_threshold=args.anomaly_binary_threshold,
-        anomaly_pixel_num_threshold=args.anomaly_pixel_num_threshold,
-        adaptive_threshold=args.adaptive_threshold,
-        patch_size=args.patch_size,
-        device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    
-    # Debug: Check the first few records that were created
-    debug_print("🔍 Checking created records...")
-    for i, record in enumerate(records[:3]):  # Check first 3 records
-        coords = record.get('patch_coords', 'MISSING')
-        debug_print(f"   Record {i}: patch_coords = {coords} (value: {coords[1] if coords != 'MISSING' and len(coords) > 1 else 'N/A'})")
-    
-    print(f"Generated {len(records)} records")
-    return records, ground_truth_map, original_images
-
-
 # === Shared streaming helpers (for both incremental eval and process_only) ===
 def _process_records_stream_incrementally(
     args,
@@ -2157,7 +1243,10 @@ def _process_records_stream_incrementally(
     Returns: (metrics, output_subdir)
     """
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join(args.results_dir, f"{current_time}")
+    if args.tag:
+        output_dir = os.path.join(args.results_dir, f"{args.tag}_{current_time}")
+    else:
+        output_dir = os.path.join(args.results_dir, f"{current_time}")
     os.makedirs(output_dir, exist_ok=True)
     output_subdir = os.path.join(output_dir, output_subdir_name)
     os.makedirs(output_subdir, exist_ok=True)
@@ -2349,15 +1438,17 @@ def _iterate_saved_patch_items(args):
                 continue
 
 
-def _iterate_eval_patch_items(args, vae, model, diffusion, loader):
+def _process_eval_batches_core(args, vae, model, diffusion, loader):
     """
-    Iterate evaluation batches and yield patch items compatible with the shared streaming pipeline.
+    Core function to process evaluation batches and yield batch data.
+    This is a shared component that can be used by different iteration strategies.
+    
     Yields tuples:
-      (current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw)
+      (batch_index, x, image_paths_batch, patch_coords, encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic)
     """
     idx = -1
     for idx, (x, seg, object_cls, anomaly_classes, image_paths_batch, patch_coords) in enumerate(
-        tqdm(loader, desc="Processing patches (eval iterator)")
+        tqdm(loader, desc="Processing patches (core iterator)")
     ):
         if idx >= args.batch_num:
             break
@@ -2366,6 +1457,30 @@ def _iterate_eval_patch_items(args, vae, model, diffusion, loader):
                 x, object_cls, model, vae, diffusion, args.reverse_steps, device, epoch_metrics=None
             )
 
+        yield (
+            idx,
+            x,
+            image_paths_batch,
+            patch_coords,
+            encodedrecon_dodrecon_diff,
+            encoded_latent_diff_resized,
+            anomaly_map_arithmetic,
+        )
+
+
+def _iterate_eval_patch_items(args, vae, model, diffusion, loader):
+    """
+    Iterate evaluation batches and yield patch items compatible with the shared streaming pipeline.
+    Uses the shared core function for processing.
+    
+    Yields tuples:
+      (current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw)
+    """
+    for (batch_idx, x, image_paths_batch, patch_coords, 
+         encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic) in _process_eval_batches_core(
+            args, vae, model, diffusion, loader
+        ):
+        
         batch_size = x.size(0)
         for b in range(batch_size):
             # Extract image path using shared helper
@@ -2389,422 +1504,371 @@ def _iterate_eval_patch_items(args, vae, model, diffusion, loader):
                 anomaly_map_arithmetic_raw,
             )
 
-def mode_process_only(args):
-    """Mode 2: Read existing .npy files and generate categorization results using the incremental streaming pipeline."""
-    print("=== Mode 2: Process Only ===")
-    
-    # Load ground truth and original images based on annotations, mirroring the incremental path
-    ground_truth_map = load_ground_truth_map(args.annotation_dir)
-    print(f"Loaded ground truth for {len(ground_truth_map)} images")
 
-    # To load original images, we need the set of image paths referenced by saved results
-    # Scan saved .npy items to collect image paths without loading all into memory
-    image_paths_set = set()
-    for image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw in _iterate_saved_patch_items(args):
-        if image_path:
-            image_paths_set.add(image_path)
-    # Reload iterator after scan (it is a generator)
-    patch_item_iter = _iterate_saved_patch_items(args)
-
-    # Load original images
-    original_images = load_original_images(image_paths_set)
-    print(f"Loaded {len(original_images)} original images")
-
-    # Process incrementally via shared pipeline
-    metrics, output_dir = _process_records_stream_incrementally(
-        args,
-        patch_item_iter,
-        ground_truth_map,
-        original_images,
-        output_subdir_name="processed_results",
-    )
-
-    return metrics
-
-def _generate_records_directly(args, vae, model, diffusion, loader):
+def _iterate_eval_patch_items_with_saving(args, vae, model, diffusion, loader, save_dir):
     """
-    Generate records directly from evaluation without saving intermediate files.
-    This combines the "before saving results" logic with direct record generation.
-    Returns: (records, ground_truth_map, original_images)
+    Iterate evaluation batches, save intermediate products as NPY files, and yield patch items.
+    This efficiently saves the 4 intermediate products while yielding data for the streaming pipeline.
+    
+    Args:
+        args: Arguments object
+        vae, model, diffusion, loader: Model components and data loader
+        save_dir: Directory to save NPY files
+        
+    Yields tuples:
+      (current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw)
     """
-    # Initialize epoch metrics if enabled
-    epoch_metrics = EvaluationMetrics() if args.enable_epoch_stats else None
-    # Load ground truth map
-    ground_truth_map = load_ground_truth_map(args.annotation_dir)
-    print(f"Loaded ground truth for {len(ground_truth_map)} images")
+    # Create save directory
+    os.makedirs(save_dir, exist_ok=True)
     
-    # Extract unique image paths from dataset (dataset is patch-level now)
-    image_paths = set(loader.dataset.get_all_image_paths())
+    # Determine save dtype
+    save_dtype_is_f16 = getattr(args, 'save_dtype_f16', False)
     
-    # Load original images
-    original_images = load_original_images(image_paths)
-    print(f"Loaded {len(original_images)} original images")
-    
-    # Process data directly without saving intermediates
-    records = []
-    
-    idx = -1
-    try:
-        for idx, (x, seg, object_cls, anomaly_classes, image_paths_batch, patch_coords) in enumerate(
-            tqdm(loader, desc="Processing patches")
-        ):
-            if idx >= args.batch_num:
-                break
-            debug_print(f"!!!!!!🔍 idx: {idx}")
-            debug_print(f"!!!!!!🔍 Input tensor x shape: {x.shape}")
-            debug_print(f"!!!!!!🔍 Input tensor x type: {type(x)}")
-            debug_print(f"!!!!!!🔍 Input tensor x dtype: {x.dtype}")
-            debug_print(f"!!!!!!🔍 Input tensor x device: {x.device}")
-            with torch.no_grad():
-                # Direct inference on the batch (no chunking needed since dataset returns individual patches)
-                encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic = _process_batch_inference(
-                    x, object_cls, model, vae, diffusion, args.reverse_steps, device, epoch_metrics=epoch_metrics
-                )
-            
-            # Process each patch to create records
-            batch_size = x.size(0)
-            
-            for b in range(batch_size):
-                # Get the image path directly from the batch
-                if b < len(image_paths_batch):
-                    if isinstance(image_paths_batch[b], str):
-                        current_image_path = image_paths_batch[b]
-                    elif isinstance(image_paths_batch[b], (list, tuple)):
-                        current_image_path = image_paths_batch[b][0] if image_paths_batch[b] else ""
-                    else:
-                        current_image_path = str(image_paths_batch[b])
-                else:
-                    current_image_path = str(image_paths_batch[-1]) if image_paths_batch else ""
-                
-                # Extract x_coord and y_coord from the patch coordinates
-                if isinstance(patch_coords, torch.Tensor) and len(patch_coords.shape) == 2:
-                    if b < patch_coords.size(0):
-                        coords_8_values = patch_coords[b].tolist()
-                    else:
-                        coords_8_values = patch_coords[-1].tolist() if patch_coords.size(0) > 0 else [0, 0, args.patch_size, 0, args.patch_size, args.patch_size, 0, args.patch_size]
-                else:
-                    raise ValueError(f"Expected patch_coords to be [batch_size, 8] tensor, got {type(patch_coords)} with shape {patch_coords.shape if hasattr(patch_coords, 'shape') else 'unknown'}")
-                
-                # Extract x_coord and y_coord from the first two values (top-left corner)
-                x_coord, y_coord = coords_8_values[0], coords_8_values[1]
-                
-                # We already have coords_8_values from above
-                debug_print(f"  ✅ Using 8-value coordinates: {coords_8_values}")
-                
-                # Convert tensors to numpy
-                encodedrecon_raw = _to_numpy(encodedrecon_dodrecon_diff[b]).squeeze()
-                latent_raw = _to_numpy(encoded_latent_diff_resized[b]).squeeze()
-                anomaly_map_arithmetic_raw = _to_numpy(anomaly_map_arithmetic[b]).squeeze()
-                
-                # Convert to torch tensors for processing
-                anomaly_map_arithmetic_tensor = torch.from_numpy(anomaly_map_arithmetic_raw).float().unsqueeze(0).unsqueeze(0)
-                
-                # Create binary mask
-                anomaly_map_arithmetic_binary = _binary_mask(
-                    anomaly_map_arithmetic_tensor, 
-                    args.anomaly_binary_threshold
-                )
-                #anomaly_map_arithmetic_binary = _binary_mask_exclude_boundary3(
-                #    anomaly_map_arithmetic_tensor, 
-                #    args.anomaly_binary_threshold, 
-                #    visualize=False, 
-                #    debug=False, 
-                #    filename=image_path
-                #)
-                
-                # Calculate metrics
-                anomaly_max = int(round(anomaly_map_arithmetic_tensor.max().item() * 255))
-                
-                # Get actual patch dimensions for consistent cropping
-                if current_image_path in original_images:
-                    original_image = original_images[current_image_path]
-                    h, w = original_image.shape[:2]
-                    actual_patch_height = min(args.patch_size, h - y_coord)
-                    actual_patch_width = min(args.patch_size, w - x_coord)
-                    
-                    # Crop the binary mask tensor to match the actual patch size
-                    anomaly_binary_cropped = anomaly_map_arithmetic_binary[:, :, :actual_patch_height, :actual_patch_width]
-                    anomaly_pixels = torch.sum(anomaly_binary_cropped).item()
-                    is_predicted_defective = anomaly_pixels > args.anomaly_pixel_num_threshold
-                    
-                    # Get ground truth defective patches for this image
-                    ground_truth_defective = ground_truth_map.get(current_image_path, set()) if ground_truth_map else set()
-                    
-                    # Convert pixel coordinates to grid coordinates (simple division since no overlapping)
-                    # With padded images, all patches are regular grid-aligned patches
-                    grid_row = y_coord // args.patch_size
-                    grid_col = x_coord // args.patch_size
-                    
-                    # Determine status
-                    status = "TP" if is_predicted_defective and (grid_row, grid_col) in ground_truth_defective else \
-                             "FP" if is_predicted_defective else \
-                             "FN" if (grid_row, grid_col) in ground_truth_defective else "TN"
-                    
-                    # Get original patch
-                    original_patch = original_image[y_coord:y_coord + actual_patch_height, x_coord:x_coord + actual_patch_width]
-                    
-                    # Store the binary map with proper shape
-                    binary_map_numpy = _to_numpy(anomaly_binary_cropped).squeeze()
-                    
-                    # Create record
-                    debug_print(f"🔍 Creating record with patch_coords_8_values: {coords_8_values}")
-                    record = make_record(
-                        split=("meta", args.split),
-                        image_path=("meta", current_image_path),
-                        image_path_original=("meta", path_to_safe_filename(current_image_path)),
-                        anomaly_class=("meta", "all"),
-                        patch_coords=("meta", coords_8_values),
-                        anomaly_max=("meta", anomaly_max),
-                        anomaly_pixels=("meta", anomaly_pixels),
-                        is_predicted_defective=("meta", is_predicted_defective),
-                        status=("meta", status),
-                        orig=("image", original_patch),
-                        dod_recon=("image", encodedrecon_raw),
-                        encoded_recon=("image", encodedrecon_raw),
-                        anomaly_map_arithmetic=("image", anomaly_map_arithmetic_raw),
-                        anomaly_map_arithmetic_binary=("image", binary_map_numpy),
-                        anomaly_map_geometric=("image", anomaly_map_arithmetic_raw),
-                        anomaly_map_geometric_binary=("image", binary_map_numpy),
-                        encoded=("image", latent_raw),
-                    )
-                    
-                    # Add metric fields
-                    record["lpips"] = ("metric", 0.0)
-                    record["ssim"] = ("metric", 0.0)
-                    record["mse"] = ("metric", 0.0)
-                    
-                    # Debug: Check what make_record actually stored
-                    debug_print(f"🔍 make_record result patch_coords: {record.get('patch_coords', 'MISSING')} (value: {record.get('patch_coords', [None, None])[1] if 'patch_coords' in record else 'N/A'})")
-                    
-                    records.append(record)
+    # Setup async saving executor for efficient NPY saving
+    async_workers = getattr(args, "async_save_workers", None)
+    if async_workers is None:
+        async_workers = 1 if platform.system().lower().startswith("win") else max(2, min(8, os.cpu_count() or 4))
+    async_workers = max(1, int(async_workers))
 
-            # Memory optimization
-            if idx % 10 == 0 and idx > 0:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                import gc
-                gc.collect()
+    executor = ThreadPoolExecutor(max_workers=async_workers)
+    pending = deque()
+    max_pending = max(8, async_workers * 8)
 
-    except KeyboardInterrupt:
-        print("\nProcess interrupted.")
-        raise
-    except Exception as e:
-        print(f"\nError occurred: {e}")
-        raise
+    def _submit_npy_save_job(save_dir_local, base_filename_local,
+                           encodedrecon_raw_local, latent_raw_local, anomaly_raw_local,
+                           coords_array_local, save_dtype_is_f16_local):
+        def _job():
+            # Save npy arrays
+            if save_dtype_is_f16_local:
+                np.save(os.path.join(save_dir_local, f"{base_filename_local}_encodedrecon.npy"), encodedrecon_raw_local.astype(np.float16))
+                np.save(os.path.join(save_dir_local, f"{base_filename_local}_latent.npy"), latent_raw_local.astype(np.float16))
+                np.save(os.path.join(save_dir_local, f"{base_filename_local}_anomaly_map_arithmetic.npy"), anomaly_raw_local.astype(np.float16))
+            else:
+                np.save(os.path.join(save_dir_local, f"{base_filename_local}_encodedrecon.npy"), encodedrecon_raw_local.astype(np.float32))
+                np.save(os.path.join(save_dir_local, f"{base_filename_local}_latent.npy"), latent_raw_local.astype(np.float32))
+                np.save(os.path.join(save_dir_local, f"{base_filename_local}_anomaly_map_arithmetic.npy"), anomaly_raw_local.astype(np.float32))
 
-    print(f"Generated {len(records)} records")
-    
-    # Print epoch statistics if enabled
-    if epoch_metrics is not None:
-        epoch_metrics.print_epoch_stats()
-    else:
-        debug_print("Skipping epoch statistics (disabled)")
-    
-    return records, ground_truth_map, original_images
+            # Save coords
+            np.save(os.path.join(save_dir_local, f"{base_filename_local}_coords.npy"), coords_array_local.astype(np.int32))
 
+        return executor.submit(_job)
 
-def mode_save_and_process(args):
-    """Mode 3: Save .npy files and immediately process them for categorization."""
-    print("=== Mode 3: Save and Process ===")
-    
-    # First save the raw data (Mode 1)
-    mode_save_only(args)
-    
-    # Then process the saved data (Mode 2)
-    return mode_process_only(args)
-
-def mode_full_pipeline(args):
-    """
-    Mode 4: Complete pipeline without saving intermediates.
-    Composed from shared components: _before_saving_results + _generate_records_incrementally + _after_reading_saved_results
-    """
-    print("=== Mode 4: Full Pipeline ===")
-    
-    # Before saving results: Load model components and prepare evaluation setup
-    vae, model, diffusion, dataset, loader, evaluation_results_dir, checkpoint_manager = _before_saving_results(args)
-    
-    # Prepare maps used by the shared streaming pipeline
-    ground_truth_map = load_ground_truth_map(args.annotation_dir)
-    print(f"Loaded ground truth for {len(ground_truth_map)} images")
-
-    image_paths = set(loader.dataset.get_all_image_paths())
-    original_images = load_original_images(image_paths)
-    print(f"Loaded {len(original_images)} original images")
-
-    # Create an iterator that yields patch items directly from evaluation
-    patch_item_iter = _iterate_eval_patch_items(args, vae, model, diffusion, loader)
-
-    # Process via shared streaming pipeline
-    metrics, output_dir = _process_records_stream_incrementally(
-        args,
-        patch_item_iter,
-        ground_truth_map,
-        original_images,
-        output_subdir_name="processed_results",
-    )
-
-    return metrics, output_dir
-
-def _generate_and_process_records_incrementally(args, vae, model, diffusion, loader):
-    """
-    Generate records incrementally and process them in batches to avoid memory issues.
-    This combines record generation with immediate processing without accumulating all records in memory.
-    Returns: (metrics, output_dir)
-    """
-    # Initialize epoch metrics if enabled
-    epoch_metrics = EvaluationMetrics() if args.enable_epoch_stats else None
-    
-    # Load ground truth map
-    ground_truth_map = load_ground_truth_map(args.annotation_dir)
-    print(f"Loaded ground truth for {len(ground_truth_map)} images")
-    
-    # Extract unique image paths from dataset (dataset is patch-level now)
-    image_paths = set(loader.dataset.get_all_image_paths())
-    
-    # Load original images
-    original_images = load_original_images(image_paths)
-    print(f"Loaded {len(original_images)} original images")
-    
-    # Initialize output directory
-    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join(args.results_dir, f"{current_time}")
-    os.makedirs(output_dir, exist_ok=True)
-    output_subdir = os.path.join(output_dir, "processed_results")
-    os.makedirs(output_subdir, exist_ok=True)
-    debug_print(f"📁 Output directory: {output_subdir}")
-    
-    # Initialize metrics tracking
-    all_metrics = []
-    total_records = 0
-    normal_records_count = 0
-    defect_records_count = 0
-    
-    # Initialize checkpoint manager for image saving
-    checkpoint_manager = CheckpointManager(args.results_dir, args.annotation_dir, args.force_rerun)
-    
-    # Initialize per-image record tracking for image-level processing
-    from collections import defaultdict
-    image_to_records = defaultdict(list)
-    
-    idx = -1
-    try:
-        for idx, (x, seg, object_cls, anomaly_classes, image_paths_batch, patch_coords) in enumerate(
-            tqdm(loader, desc="Processing patches incrementally")
-        ):
-            if idx >= args.batch_num:
-                break
-            debug_print(f"!!!!!!🔍 idx: {idx}")
-            debug_print(f"!!!!!!🔍 Input tensor x shape: {x.shape}")
-            debug_print(f"!!!!!!🔍 Input tensor x type: {type(x)}")
-            debug_print(f"!!!!!!🔍 Input tensor x dtype: {x.dtype}")
-            debug_print(f"!!!!!!🔍 Input tensor x device: {x.device}")
-            
-            with torch.no_grad():
-                # Direct inference on the batch (no chunking needed since dataset returns individual patches)
-                encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic = _process_batch_inference(
-                    x, object_cls, model, vae, diffusion, args.reverse_steps, device, epoch_metrics=epoch_metrics
-                )
-            
-            # Process each patch to create records
-            batch_size = x.size(0)
-            batch_records = []
-            
-            for b in range(batch_size):
-                # Get the image path directly from the batch
-                if b < len(image_paths_batch):
-                    if isinstance(image_paths_batch[b], str):
-                        current_image_path = image_paths_batch[b]
-                    elif isinstance(image_paths_batch[b], (list, tuple)):
-                        current_image_path = image_paths_batch[b][0] if image_paths_batch[b] else ""
-                    else:
-                        current_image_path = str(image_paths_batch[b])
-                else:
-                    current_image_path = str(image_paths_batch[-1]) if image_paths_batch else ""
-                
-                # Extract coordinates using shared function
+    def _wait_for_pending_saves():
+        """Wait for and clean up completed save jobs."""
+        while pending:
+            job = pending.popleft()
+            if job.done():
                 try:
-                    coords_8_values = _extract_patch_coordinates(
-                        patch_coords, b, args.patch_size
-                    )
-                    debug_print(f"  ✅ Using 8-value coordinates: {coords_8_values}")
+                    job.result()  # Check for exceptions
                 except Exception as e:
-                    debug_print(f"⚠️  Error extracting coordinates: {e}")
-                    continue
-                
-                # Convert tensors to numpy
+                    debug_print(f"⚠️  Save job failed: {e}")
+            else:
+                pending.appendleft(job)  # Put it back if not done
+                break
+
+    try:
+        for (batch_idx, x, image_paths_batch, patch_coords, 
+             encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic) in _process_eval_batches_core(
+                args, vae, model, diffusion, loader
+            ):
+            
+            batch_size = x.size(0)
+            for b in range(batch_size):
+                # Extract image path using shared helper
+                current_image_path = _extract_image_path_from_batch(image_paths_batch, b)
+
+                # Extract coordinates using shared helper
+                coords_8_values = _extract_patch_coordinates(
+                    patch_coords, b, args.patch_size
+                )
+
+                # Numpy arrays
                 encodedrecon_raw = _to_numpy(encodedrecon_dodrecon_diff[b]).squeeze()
                 latent_raw = _to_numpy(encoded_latent_diff_resized[b]).squeeze()
                 anomaly_map_arithmetic_raw = _to_numpy(anomaly_map_arithmetic[b]).squeeze()
+
+                # Generate filename for saving
+                safe_filename = path_to_safe_filename(current_image_path)
+                # Use the expected 8-value coordinate format: __x1_y1_x2_y2_x3_y3_x4_y4__
+                coords_filename_part = f"x{coords_8_values[0]}_y{coords_8_values[1]}_x{coords_8_values[2]}_y{coords_8_values[3]}_x{coords_8_values[4]}_y{coords_8_values[5]}_x{coords_8_values[6]}_y{coords_8_values[7]}"
+                base_filename = f"{safe_filename}__{coords_filename_part}__minimal_diff"
                 
-                # Process the patch using shared function
-                record = _process_single_patch(
-                    ground_truth_map=ground_truth_map,
-                    original_images=original_images,
-                    anomaly_binary_threshold=args.anomaly_binary_threshold,
-                    anomaly_pixel_num_threshold=args.anomaly_pixel_num_threshold,
-                    patch_size=args.patch_size,
-                    current_image_path=current_image_path,
-                    coords_8_values=coords_8_values,
-                    encodedrecon_raw=encodedrecon_raw,
-                    latent_raw=latent_raw,
-                    anomaly_map_arithmetic_raw=anomaly_map_arithmetic_raw
+                # Convert coordinates to numpy array for saving
+                coords_array = np.array(coords_8_values)
+
+                # Submit async save job
+                job = _submit_npy_save_job(
+                    save_dir, base_filename,
+                    encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw,
+                    coords_array, save_dtype_is_f16
                 )
-                
-                if record is not None:
-                    # Add to batch records and update counters
-                    batch_records.append(record)
-                    total_records += 1
-                    
-                    # Update counters based on prediction
-                    is_predicted_defective = record.get("is_predicted_defective", (None, False))[1]
-                    if is_predicted_defective:
-                        defect_records_count += 1
-                    else:
-                        normal_records_count += 1
-                    
-                    # Add to per-image tracking for image-level processing
-                    image_to_records[current_image_path].append(record)
-                else:
-                    debug_print(f"⚠️  Failed to create record for patch {b} in batch {idx}")
-            
-            # Process batch records immediately (save images, update metrics, etc.)
-            _process_batch_records_immediately(
-                args, batch_records, ground_truth_map, original_images, 
-                checkpoint_manager, output_subdir, image_to_records
-            )
-            
-            # Clear batch records to free memory
-            del batch_records
-            
-            # Memory optimization
-            if idx % 10 == 0 and idx > 0:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                import gc
-                gc.collect()
+                pending.append(job)
 
-    except KeyboardInterrupt:
-        print("\nProcess interrupted.")
-        raise
-    except Exception as e:
-        print(f"\nError occurred: {e}")
-        raise
+                # Throttle pending jobs to avoid memory issues
+                if len(pending) >= max_pending:
+                    _wait_for_pending_saves()
 
-    print(f"Generated and processed {total_records} records incrementally")
+                # Yield the same data as the original function
+                yield (
+                    current_image_path,
+                    coords_8_values,
+                    encodedrecon_raw,
+                    latent_raw,
+                    anomaly_map_arithmetic_raw,
+                )
+
+    finally:
+        # Wait for all pending saves to complete
+        debug_print(f"🔄 Waiting for {len(pending)} remaining save jobs to complete...")
+        while pending:
+            job = pending.popleft()
+            try:
+                job.result()  # Wait for completion and check for exceptions
+            except Exception as e:
+                debug_print(f"⚠️  Save job failed: {e}")
+        
+        executor.shutdown(wait=True)
+        debug_print("✅ All NPY saves completed")
+
+def save_image_results_from_records(checkpoint_manager: CheckpointManager, image_path: str, 
+                                  image_records: list, 
+                                  predicted_defective_set: set, ground_truth_defective: set, overlapping: set,
+                                  enable_save_optional_image_results: bool = False, patch_size: int = 256, 
+                                  use_mean_aggregation: bool = False):
+    """Save all results for a single image immediately using records."""
+    safe_name = path_to_safe_filename(image_path)
     
-    # Print epoch statistics if enabled
-    if epoch_metrics is not None:
-        epoch_metrics.print_epoch_stats()
-    else:
-        debug_print("Skipping epoch statistics (disabled)")
+    # Create status-based subfolders
+    status_folders = {}
+    for status in ['TP', 'FN', 'FP', 'TN']:
+        status_dir = os.path.join(checkpoint_manager.marked_images_dir, status)
+        os.makedirs(status_dir, exist_ok=True)
+        status_folders[status] = status_dir
     
-    # Final processing and metrics computation
-    final_metrics = _finalize_incremental_processing(
-        args, total_records, normal_records_count, defect_records_count, 
-        image_to_records, ground_truth_map, output_subdir
+    # Determine the overall status of this image based on its patches
+    image_status = determine_image_status(image_records)
+    
+    # Debug: Print status information
+    status_counts = {'TP': 0, 'FN': 0, 'FP': 0, 'TN': 0}
+    for record in image_records:
+        status = record["status"][1]
+        if status in status_counts:
+            status_counts[status] += 1
+    #print(f"Image {os.path.basename(image_path)} status: {image_status} (TP:{status_counts['TP']}, FN:{status_counts['FN']}, FP:{status_counts['FP']}, TN:{status_counts['TN']})")
+    
+    # Load original image
+    original_img = np.array(PILImage.open(image_path).convert('RGB'))
+    h, w, _ = original_img.shape
+    
+    # Save marked image (always saved) in the appropriate status folder
+    marked_img = draw_patch_rectangles_on_image(
+        original_img, predicted_defective_set, ground_truth_defective, overlapping, patch_size=patch_size, grid_thickness=1
     )
+    marked_path = os.path.join(status_folders[image_status], f"{safe_name}__marked.png")
+    PILImage.fromarray(marked_img).save(marked_path)
     
-    return final_metrics, output_subdir
+    # Also save image-level images without classification
+    image_level_dir = os.path.join(checkpoint_manager.marked_images_dir, "image_level")
+    os.makedirs(image_level_dir, exist_ok=True)
+    image_level_path = os.path.join(image_level_dir, f"{safe_name}__marked.png")
+    PILImage.fromarray(marked_img).save(image_level_path)
+    
+    # Initialize anomaly maps based on flag
+    anomaly_maps = {
+        'required': {
+            'arithmetic': np.zeros((h, w), dtype=np.float32),
+            'arithmetic_binary': np.zeros((h, w), dtype=np.float32),
+            'geometric': np.zeros((h, w), dtype=np.float32),
+            'geometric_binary': np.zeros((h, w), dtype=np.float32),
+        }
+    }
+    
+    # Initialize count maps for mean aggregation if enabled
+    count_maps = {}
+    if use_mean_aggregation:
+        count_maps = {
+            'required': {
+                'arithmetic': np.zeros((h, w), dtype=np.float32),
+                'arithmetic_binary': np.zeros((h, w), dtype=np.float32),
+                'geometric': np.zeros((h, w), dtype=np.float32),
+                'geometric_binary': np.zeros((h, w), dtype=np.float32),
+            }
+        }
+    
+    # Initialize optional maps only when flag is enabled
+    if enable_save_optional_image_results:
+        anomaly_maps['optional'] = {
+            'arithmetic_binary_style1': np.zeros((h, w), dtype=np.float32),
+            'arithmetic_binary_style2': np.zeros((h, w), dtype=np.float32),
+            'arithmetic_binary_style3': np.zeros((h, w), dtype=np.float32),
+            'geometric_binary_style1': np.zeros((h, w), dtype=np.float32),
+            'geometric_binary_style2': np.zeros((h, w), dtype=np.float32),
+            'geometric_binary_style3': np.zeros((h, w), dtype=np.float32),
+        }
+        
+        if use_mean_aggregation:
+            count_maps['optional'] = {
+                'arithmetic_binary_style1': np.zeros((h, w), dtype=np.float32),
+                'arithmetic_binary_style2': np.zeros((h, w), dtype=np.float32),
+                'arithmetic_binary_style3': np.zeros((h, w), dtype=np.float32),
+                'geometric_binary_style1': np.zeros((h, w), dtype=np.float32),
+                'geometric_binary_style2': np.zeros((h, w), dtype=np.float32),
+                'geometric_binary_style3': np.zeros((h, w), dtype=np.float32),
+            }
+    
+    def _get_xy_from_patch_coords(rec) -> tuple:
+        coords = rec.get("patch_coords", (None, []))[1]
+        if isinstance(coords, (list, tuple)) and len(coords) == 8:
+            return int(coords[0]), int(coords[1])  # top-left from 8-value
+        raise ValueError(f"Expected 8-value patch_coords, got: {coords}")
+
+    for record in image_records:
+        # Extract coordinates from record (supports 8- or 2-value formats)
+        x_coord, y_coord = _get_xy_from_patch_coords(record)
+        
+        # Calculate actual patch dimensions for this position
+        patch_width = min(patch_size, w - x_coord)
+        patch_height = min(patch_size, h - y_coord)
+        
+        # Extract required anomaly maps from record
+        patch_arithmetic = record["anomaly_map_arithmetic"][1]
+        patch_arithmetic_binary = record["anomaly_map_arithmetic_binary"][1]
+        patch_geometric = record["anomaly_map_geometric"][1]
+        patch_geometric_binary = record["anomaly_map_geometric_binary"][1]
+        
+        # Extract patch regions
+        patch_regions = {
+            'arithmetic': patch_arithmetic.squeeze()[:patch_height, :patch_width],
+            'arithmetic_binary': patch_arithmetic_binary.squeeze()[:patch_height, :patch_width],
+            'geometric': patch_geometric.squeeze()[:patch_height, :patch_width],
+            'geometric_binary': patch_geometric_binary.squeeze()[:patch_height, :patch_width],
+        }
+        
+        # Extract optional patch regions if flag is enabled
+        if enable_save_optional_image_results:
+            # Use default binary maps as fallback for style fields
+            patch_regions.update({
+                'arithmetic_binary_style1': record.get("anomaly_map_arithmetic_binary_style1", [None, patch_arithmetic_binary])[1].squeeze()[:patch_height, :patch_width],
+                'arithmetic_binary_style2': record.get("anomaly_map_arithmetic_binary_style2", [None, patch_arithmetic_binary])[1].squeeze()[:patch_height, :patch_width],
+                'arithmetic_binary_style3': record.get("anomaly_map_arithmetic_binary_style3", [None, patch_arithmetic_binary])[1].squeeze()[:patch_height, :patch_width],
+                'geometric_binary_style1': record.get("anomaly_map_geometric_binary_style1", [None, patch_geometric_binary])[1].squeeze()[:patch_height, :patch_width],
+                'geometric_binary_style2': record.get("anomaly_map_geometric_binary_style2", [None, patch_geometric_binary])[1].squeeze()[:patch_height, :patch_width],
+                'geometric_binary_style3': record.get("anomaly_map_geometric_binary_style3", [None, patch_geometric_binary])[1].squeeze()[:patch_height, :patch_width],
+            })
+        
+        # Assign or accumulate regions to anomaly maps
+        if use_mean_aggregation:
+            # Accumulate values and counts for mean aggregation
+            for map_name, region in patch_regions.items():
+                if map_name in anomaly_maps['required']:
+                    anomaly_maps['required'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] += region
+                    count_maps['required'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] += 1
+                elif enable_save_optional_image_results and map_name in anomaly_maps['optional']:
+                    anomaly_maps['optional'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] += region
+                    count_maps['optional'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] += 1
+        else:
+            # Direct assignment (original behavior)
+            for map_name, region in patch_regions.items():
+                if map_name in anomaly_maps['required']:
+                    anomaly_maps['required'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] = region
+                elif enable_save_optional_image_results and map_name in anomaly_maps['optional']:
+                    anomaly_maps['optional'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] = region
+    
+    # Compute mean if using aggregation
+    if use_mean_aggregation:
+        # Compute mean for required maps
+        for map_name in anomaly_maps['required']:
+            count_map = count_maps['required'][map_name]
+            # Avoid division by zero
+            valid_mask = count_map > 0
+            anomaly_maps['required'][map_name][valid_mask] /= count_map[valid_mask]
+        
+        # Compute mean for optional maps if enabled
+        if enable_save_optional_image_results:
+            for map_name in anomaly_maps['optional']:
+                count_map = count_maps['optional'][map_name]
+                # Avoid division by zero
+                valid_mask = count_map > 0
+                anomaly_maps['optional'][map_name][valid_mask] /= count_map[valid_mask]
+    
+    # Define image configurations
+    image_configs = {
+        'required': [
+            (anomaly_maps['required']['arithmetic'], "am_ar", False),
+            (anomaly_maps['required']['arithmetic_binary'], "am_ar_bin", True),
+            (anomaly_maps['required']['geometric'], "am_ge", False),
+            (anomaly_maps['required']['geometric_binary'], "am_ge_bin", True),
+        ]
+    }
+    
+    # Add optional configurations if flag is enabled
+    if enable_save_optional_image_results:
+        image_configs['optional'] = [
+            (anomaly_maps['optional']['arithmetic_binary_style1'], "am_ar_bin_st1", True),
+            (anomaly_maps['optional']['arithmetic_binary_style2'], "am_ar_bin_st2", True),
+            (anomaly_maps['optional']['arithmetic_binary_style3'], "am_ar_bin_st3", True),
+            (anomaly_maps['optional']['geometric_binary_style1'], "am_ge_bin_st1", True),
+            (anomaly_maps['optional']['geometric_binary_style2'], "am_ge_bin_st2", True),
+            (anomaly_maps['optional']['geometric_binary_style3'], "am_ge_bin_st3", True),
+        ]
+    
+    # Save all configured images in the appropriate status folder
+    for _config_type, configs in image_configs.items():
+        for anomaly_map, suffix, is_binary in configs:
+            # Save anomaly map image
+            anomaly_map_img = ImageProcessor.create_anomaly_map_image(
+                anomaly_map, patch_size=patch_size, add_grid=True, 
+                predicted_defective_set=predicted_defective_set, ground_truth_defective=ground_truth_defective, 
+                overlapping=overlapping, is_binary=is_binary
+            )
+            anomaly_map_path = os.path.join(status_folders[image_status], f"{safe_name}__{suffix}.png")
+            PILImage.fromarray(anomaly_map_img).save(anomaly_map_path)
+            
+            # Save overlay image
+            overlay_img = ImageProcessor.create_anomaly_overlay(original_img, anomaly_map, alpha=0.8, is_binary=is_binary)
+            overlay_path = os.path.join(status_folders[image_status], f"{safe_name}__ao_{suffix}.png")
+            PILImage.fromarray(overlay_img).save(overlay_path)
+            
+            # Save marked overlay image
+            marked_overlay_img = draw_patch_rectangles_on_image(overlay_img, predicted_defective_set, ground_truth_defective, overlapping, patch_size=patch_size, grid_thickness=1)
+            marked_overlay_path = os.path.join(status_folders[image_status], f"{safe_name}__mo_{suffix}.png")
+            PILImage.fromarray(marked_overlay_img).save(marked_overlay_path)
+            
+            # Also save to image_level directory (without classification)
+            image_level_anomaly_path = os.path.join(image_level_dir, f"{safe_name}__{suffix}.png")
+            PILImage.fromarray(anomaly_map_img).save(image_level_anomaly_path)
+            
+            image_level_overlay_path = os.path.join(image_level_dir, f"{safe_name}__ao_{suffix}.png")
+            PILImage.fromarray(overlay_img).save(image_level_overlay_path)
+            
+            image_level_marked_overlay_path = os.path.join(image_level_dir, f"{safe_name}__mo_{suffix}.png")
+            PILImage.fromarray(marked_overlay_img).save(image_level_marked_overlay_path)
+    
+    # Save evaluation results
+    patch_analysis = []
+    for record in image_records:
+        x, y = _get_xy_from_patch_coords(record)
+        anomaly_map = record["anomaly_map_arithmetic_binary"][1]
+        anomaly_pixels = int(np.sum(anomaly_map))
+        grid_row = y // patch_size
+        grid_col = x // patch_size
+        patch_analysis.append({
+            "grid_row": grid_row,
+            "grid_col": grid_col,
+            "anomaly_max": record["anomaly_max"][1],
+            "anomaly_pixels":record["anomaly_pixels"][1],
+            "status": record["status"][1]
+        })
+    
+    result_filename = f"{safe_name}__evaluation.json"
+    result_path = os.path.join(checkpoint_manager.evaluation_results_dir, result_filename)
+    evaluation_result = {
+        "image_path": image_path,
+        "patch_analysis": patch_analysis,
+        "grid_size": patch_size
+    }
+    with open(result_path, 'w') as f:
+        json.dump(evaluation_result, f, indent=2)
 
 def _process_batch_records_immediately(args, batch_records, ground_truth_map, original_images, 
                                      checkpoint_manager, output_subdir, image_to_records):
@@ -2939,6 +2003,8 @@ def _finalize_incremental_processing(args, total_records, normal_records_count, 
                 overlapping = set()
 
                 try:
+                    # Use mean aggregation when stride is smaller than patch_size
+                    use_mean_aggregation = args.stride is not None and args.stride < args.patch_size
                     save_image_results_from_records(
                         checkpoint_manager,
                         img_path,
@@ -2948,6 +2014,7 @@ def _finalize_incremental_processing(args, total_records, normal_records_count, 
                         overlapping,
                         enable_save_optional_image_results=args.enable_save_optional_image_results,
                         patch_size=args.patch_size,
+                        use_mean_aggregation=use_mean_aggregation,
                     )
                 except Exception as e:
                     debug_print(f"⚠️  Failed to save image-level results for {img_path}: {e}")
@@ -2988,7 +2055,6 @@ def validate_mode_arguments(args):
             ("patch_size", "Center size for model"),
             ("reverse_steps", "Number of reverse steps"),
             ("batch_num", "Number of batches to process"),
-            ("append_timestamp", "Append timestamp to output directories (use --append-timestamp)"),
             ("enable_epoch_stats", "Enable detailed epoch-wise statistics (use --enable-epoch-stats)"),
             
             ("debug", "Enable detailed debug logging (use --debug)"),
@@ -3007,7 +2073,6 @@ def validate_mode_arguments(args):
             ("enable_save_image_results", "Save image results (use --enable-save-image-results)"),
             ("enable_save_optional-image-results", "Save optional image results (use --enable-save-optional-image-results)"),
             ("enable_save_whole-image-results", "Save whole image results (use --enable-save-whole-image-results)"),
-            ("append_timestamp", "Append timestamp to output directories (use --append-timestamp)"),
             ("enable_epoch_stats", "Enable detailed epoch-wise statistics (use --enable-epoch-stats)"),
             ("debug", "Enable detailed debug logging (use --debug)"),
         ]
@@ -3025,7 +2090,6 @@ def validate_mode_arguments(args):
             ("batch_num", "Number of batches to process"),
             ("anomaly_binary_threshold", "Binary threshold for anomaly detection"),
             ("enable_excel_report", "Generate Excel report (use --enable-excel-report)"),
-            ("append_timestamp", "Append timestamp to output directories (use --append-timestamp)"),
             ("enable_epoch_stats", "Enable detailed epoch-wise statistics (use --enable-epoch-stats)"),
             ("debug", "Enable detailed debug logging (use --debug)"),
         ]
@@ -3043,9 +2107,27 @@ def validate_mode_arguments(args):
             ("batch_num", "Number of batches to process"),
             ("anomaly_binary_threshold", "Binary threshold for anomaly detection"),
             ("enable_excel_report", "Generate Excel report (use --enable-excel-report)"),
-            ("append_timestamp", "Append timestamp to output directories (use --append-timestamp)"),
             ("enable_epoch_stats", "Enable detailed epoch-wise statistics (use --enable-epoch-stats)"),
             ("debug", "Enable detailed debug logging (use --debug)"),
+        ]
+        
+    elif mode == "full_pipeline_with_saving_npy":
+        # Mode 5: Complete pipeline with saving intermediate NPY files
+        required_args = [
+            ("annotation_dir", "Directory containing annotation files"),
+            ("pretrained", "Path to pretrained model (use --pretrained)"),
+        ]
+        optional_but_recommended = [
+            ("model_size", "Model size"),
+            ("patch_size", "Center size for model"),
+            ("reverse_steps", "Number of reverse steps"),
+            ("batch_num", "Number of batches to process"),
+            ("anomaly_binary_threshold", "Binary threshold for anomaly detection"),
+            ("enable_excel_report", "Generate Excel report (use --enable-excel-report)"),
+            ("enable_epoch_stats", "Enable detailed epoch-wise statistics (use --enable-epoch-stats)"),
+            ("debug", "Enable detailed debug logging (use --debug)"),
+            ("save_dir", "Directory to save NPY files (use --save-dir)"),
+            ("save_dtype_f16", "Save NPY files as float16 for space efficiency (use --save-dtype-f16)"),
         ]
     
     # Check required arguments
@@ -3059,7 +2141,8 @@ def validate_mode_arguments(args):
         "save_only": "Save raw .npy files and diff images without processing",
         "process_only": "Process existing .npy files to generate evaluation results", 
         "save_and_process": "Save raw files AND process them immediately",
-        "full_pipeline": "Complete evaluation pipeline without saving intermediate files"
+        "full_pipeline": "Complete evaluation pipeline without saving intermediate files",
+        "full_pipeline_with_saving_npy": "Complete evaluation pipeline WITH saving intermediate NPY files"
     }
     
     if errors:
@@ -3081,14 +2164,12 @@ def validate_mode_arguments(args):
             print(f"       --annotation-dir path/to/annotations \\")
             print(f"       --pretrained path/to/model.pt \\")
             print(f"       --results-dir ./results \\")
-            print(f"       --append-timestamp \\")
             print(f"       --debug")
             
         elif mode == "process_only":
             print(f"   python evaluate_and_process.py --mode process_only \\")
             print(f"       --annotation-dir path/to/annotations \\")
             print(f"       --enable-excel-report \\")
-            print(f"       --append-timestamp \\")
             print(f"       --debug")
             print(f"   # Or with explicit results directory:")
             print(f"   python evaluate_and_process.py --mode process_only \\")
@@ -3100,7 +2181,6 @@ def validate_mode_arguments(args):
             print(f"       --annotation-dir path/to/annotations \\")
             print(f"       --pretrained path/to/model.pt \\")
             print(f"       --enable-excel-report \\")
-            print(f"       --append-timestamp \\")
             print(f"       --debug")
             
         elif mode == "full_pipeline":
@@ -3108,7 +2188,13 @@ def validate_mode_arguments(args):
             print(f"       --annotation-dir path/to/annotations \\")
             print(f"       --pretrained path/to/model.pt \\")
             print(f"       --enable-excel-report \\")
-            print(f"       --append-timestamp \\")
+            print(f"       --debug")
+        
+        elif mode == "full_pipeline_with_saving_npy":
+            print(f"   python evaluate_and_process.py --mode full_pipeline_with_saving_npy \\")
+            print(f"       --annotation-dir path/to/annotations \\")
+            print(f"       --pretrained path/to/model.pt \\")
+            print(f"       --enable-excel-report \\")
             print(f"       --debug")
         
         print(f"\n💭 Need help? Check the script header comments for detailed usage information.")
@@ -3120,6 +2206,150 @@ def validate_mode_arguments(args):
     return True
 
 
+def mode_save_only(args):
+    """Mode 1: Save .npy files and diff images only."""
+    print("=== Mode 1: Save Only ===")
+    
+    # Before saving results: Load model components and prepare evaluation setup
+    vae, model, diffusion, dataset, loader, evaluation_results_dir, checkpoint_manager = _before_saving_results(args)
+    
+    # Create save directory for NPY files
+    if hasattr(args, 'save_dir') and args.save_dir:
+        npy_save_dir = args.save_dir
+    else:
+        # Use evaluation_results_dir directly for save_only mode
+        npy_save_dir = evaluation_results_dir
+    
+    print(f"NPY files will be saved to: {npy_save_dir}")
+
+    # Use the saving iterator but only consume it to trigger the saving, don't process
+    patch_item_iter = _iterate_eval_patch_items_with_saving(
+        args, vae, model, diffusion, loader, npy_save_dir
+    )
+
+    # Consume the iterator to trigger saving (without processing)
+    patch_count = 0
+    for patch_item in patch_item_iter:
+        patch_count += 1
+        # Just consume the iterator to trigger saving, no processing needed
+
+    print(f"✅ Saved {patch_count} patches as NPY files to: {npy_save_dir}")
+    return None
+
+def mode_process_only(args):
+    """Mode 2: Read existing .npy files and generate categorization results using the incremental streaming pipeline."""
+    print("=== Mode 2: Process Only ===")
+    
+    # Load ground truth and original images based on annotations, mirroring the incremental path
+    ground_truth_map = load_ground_truth_map(args.annotation_dir)
+    print(f"Loaded ground truth for {len(ground_truth_map)} images")
+
+    # To load original images, we need the set of image paths referenced by saved results
+    # Scan saved .npy items to collect image paths without loading all into memory
+    image_paths_set = set()
+    for image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw in _iterate_saved_patch_items(args):
+        if image_path:
+            image_paths_set.add(image_path)
+    # Reload iterator after scan (it is a generator)
+    patch_item_iter = _iterate_saved_patch_items(args)
+
+    # Load original images
+    original_images = load_original_images(image_paths_set)
+    print(f"Loaded {len(original_images)} original images")
+
+    # Process incrementally via shared pipeline
+    metrics, output_dir = _process_records_stream_incrementally(
+        args,
+        patch_item_iter,
+        ground_truth_map,
+        original_images,
+        output_subdir_name="processed_results",
+    )
+
+    return metrics
+
+def mode_save_and_process(args):
+    """Mode 3: Save .npy files and immediately process them for categorization."""
+    print("=== Mode 3: Save and Process ===")
+    
+    # First save the raw data (Mode 1)
+    mode_save_only(args)
+    
+    # Then process the saved data (Mode 2)
+    return mode_process_only(args)
+
+def mode_full_pipeline(args):
+    """
+    Mode 4: Complete pipeline without saving intermediates.
+    Composed from shared components: _before_saving_results + _generate_records_incrementally + _after_reading_saved_results
+    """
+    print("=== Mode 4: Full Pipeline ===")
+    
+    # Before saving results: Load model components and prepare evaluation setup
+    vae, model, diffusion, dataset, loader, evaluation_results_dir, checkpoint_manager = _before_saving_results(args)
+    
+    # Prepare maps used by the shared streaming pipeline
+    ground_truth_map = load_ground_truth_map(args.annotation_dir)
+    print(f"Loaded ground truth for {len(ground_truth_map)} images")
+
+    image_paths = set(loader.dataset.get_all_image_paths())
+    original_images = load_original_images(image_paths)
+    print(f"Loaded {len(original_images)} original images")
+
+    # Create an iterator that yields patch items directly from evaluation
+    patch_item_iter = _iterate_eval_patch_items(args, vae, model, diffusion, loader)
+
+    # Process via shared streaming pipeline
+    metrics, output_dir = _process_records_stream_incrementally(
+        args,
+        patch_item_iter,
+        ground_truth_map,
+        original_images,
+        output_subdir_name="processed_results",
+    )
+
+    return metrics, output_dir
+
+def mode_full_pipeline_with_saving_npy(args):
+    """
+    Mode 5: Complete pipeline with saving intermediate NPY files.
+    Follows exactly all the process of mode_full_pipeline but also saves the 4 intermediate products
+    (coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw) as NPY files.
+    """
+    print("=== Mode 5: Full Pipeline with NPY Saving ===")
+    
+    # Before saving results: Load model components and prepare evaluation setup
+    vae, model, diffusion, dataset, loader, evaluation_results_dir, checkpoint_manager = _before_saving_results(args)
+    
+    # Prepare maps used by the shared streaming pipeline
+    ground_truth_map = load_ground_truth_map(args.annotation_dir)
+    print(f"Loaded ground truth for {len(ground_truth_map)} images")
+
+    image_paths = set(loader.dataset.get_all_image_paths())
+    original_images = load_original_images(image_paths)
+    print(f"Loaded {len(original_images)} original images")
+
+    print(f"NPY files will be saved to: {evaluation_results_dir}")
+
+    # Create an iterator that yields patch items directly from evaluation AND saves NPY files
+    patch_item_iter = _iterate_eval_patch_items_with_saving(
+        args, vae, model, diffusion, loader, evaluation_results_dir
+    )
+
+    # Process via shared streaming pipeline
+    metrics, output_dir = _process_records_stream_incrementally(
+        args,
+        patch_item_iter,
+        ground_truth_map,
+        original_images,
+        output_subdir_name="processed_results",
+    )
+
+    print(f"✅ Complete pipeline finished. Results saved to: {output_dir}")
+    print(f"✅ NPY intermediate files saved to: {evaluation_results_dir}")
+
+    return metrics, output_dir
+
 def main():
     global DEBUG_ENABLED
     
@@ -3129,30 +2359,33 @@ def main():
     parser.add_argument(
         "--mode", 
         type=str, 
-        choices=["save_only", "process_only", "save_and_process", "full_pipeline"],
+        choices=["save_only", "process_only", "save_and_process", "full_pipeline", "full_pipeline_with_saving_npy"],
         required=False,  # Made optional when using --input-json
         help="""Execution mode:
         save_only: Save .npy files and diff images only (needs: --annotation-dir, --pretrained)
         process_only: Process existing .npy files to generate results (needs: --annotation-dir)
         save_and_process: Save AND process immediately (needs: --annotation-dir, --pretrained)
         full_pipeline: Complete pipeline without saving intermediates (needs: --annotation-dir, --pretrained)
+        full_pipeline_with_saving_npy: Complete pipeline WITH saving intermediate NPY files (needs: --annotation-dir, --pretrained)
         Note: Can be omitted if specified in --input-json file"""
     )
     
     # Common arguments
     parser.add_argument("--results-dir", type=str, default="./results", 
                        help="Results directory (optional for process_only mode - can be specified in JSON)")
+    parser.add_argument("--tag", type=str, default=None,
+                       help="Custom tag for output directory. If provided, output directory will be 'tag_current_time' instead of just 'current_time'")
     parser.add_argument("--annotation-dir", type=str, 
                        help="Directory containing annotation files (REQUIRED for all modes)")
     parser.add_argument("--patch-size", type=int, default=128, help="Patch size for image processing")
+    parser.add_argument("--stride", type=int, default=None, help="Stride for patch extraction. If None, uses patch_size (no overlap). If smaller than patch_size, creates overlapping patches.")
     parser.add_argument("--irregular-patch", action="store_true", help="Use irregular patch for image processing")
-    # Model arguments (REQUIRED for modes: save_only, save_and_process, full_pipeline)
     parser.add_argument("--dataset", type=str, choices=["mvtec", "visa", "pcb"], default="pcb",
                        help="Dataset type (for model loading modes)")
     parser.add_argument("--model-size", type=str, choices=["UNet_XS", "UNet_S", "UNet_M", "UNet_L", "UNet_XL"], default="UNet_L",
                        help="Model size (for model loading modes)")
     parser.add_argument("--pretrained", type=str, default="", 
-                       help="Path to pretrained model (REQUIRED for save_only, save_and_process, full_pipeline)")
+                       help="Path to pretrained model (REQUIRED for save_only, save_and_process, full_pipeline, full_pipeline_with_saving_npy)")
     parser.add_argument("--reverse-steps", type=int, default=5,
                        help="Number of reverse steps (for model loading modes)")
     parser.add_argument("--batch-size", type=int, default=64,
@@ -3167,8 +2400,6 @@ def main():
                        help="VAE type (for model loading modes)")
     parser.add_argument("--force-rerun", action="store_true", 
                        help="Force rerun evaluation (for save_only mode)")
-    
-    # Processing arguments (used in modes: process_only, save_and_process, full_pipeline)
     parser.add_argument("--anomaly-binary-threshold", type=int, default=5, 
                        help="Binary threshold for anomaly detection (for processing modes)")
     parser.add_argument("--anomaly-pixel-num-threshold", type=int, default=0, 
@@ -3194,10 +2425,6 @@ def main():
                        help="""JSON file with test configurations. Can be used instead of --mode.
                        Example format: {"test_name": {"mode": "save_only", "annotation-dir": "path/to/annotations", ...}}
                        Or simple format: {"mode": "save_only", "annotation-dir": "path/to/annotations", ...}""")
-    
-    # Timestamp control
-    parser.add_argument("--append-timestamp", action="store_true", 
-                       help="Append timestamp to output directory names (default: False)")
     
     # Debug control
     parser.add_argument("--debug", action="store_true",
@@ -3258,8 +2485,8 @@ def main():
             sys.exit(1)
     
     # Validate that mode is valid
-    if args.mode not in ["save_only", "process_only", "save_and_process", "full_pipeline"]:
-        print(f"❌ Error: Invalid mode '{args.mode}'. Must be one of: save_only, process_only, save_and_process, full_pipeline")
+    if args.mode not in ["save_only", "process_only", "save_and_process", "full_pipeline", "full_pipeline_with_saving_npy"]:
+        print(f"❌ Error: Invalid mode '{args.mode}'. Must be one of: save_only, process_only, save_and_process, full_pipeline, full_pipeline_with_saving_npy")
         sys.exit(1)
     
     # Handle input JSON if provided
@@ -3286,7 +2513,7 @@ def main():
                 key = key.replace('-', '_')
                 if hasattr(test_args_obj, key):
                     if key in ['anomaly_binary_threshold', 'anomaly_pixel_num_threshold', 'patch_size', 
-                              'batch_num', 'batch_size', 'reverse_steps', 'async_save_workers']:
+                              'batch_num', 'batch_size', 'reverse_steps', 'async_save_workers', 'stride']:
                         value = int(value)
                     elif key in ['adaptive_threshold']:
                         value = float(value)
@@ -3297,7 +2524,7 @@ def main():
                             value = os.path.abspath(value)
                     elif key in ['irregular_patch', 'enable_excel_report', 'enable_save_optional_image_results', 
                                'enable_save_image_results', 'enable_save_json_results', 'enable_save_whole_image_results',
-                               'enable_confusion_matrix', 'force_rerun', 'append_timestamp', 'enable_epoch_stats', 'save_preview_images']:
+                               'enable_confusion_matrix', 'force_rerun', 'enable_epoch_stats', 'save_preview_images']:
                         value = value.lower() in ('yes', 'true', 't', 'y', '1')
                     elif key in ['save_npy_dtype']:
                         value = value.lower() in ('float16', 'float32')
@@ -3313,13 +2540,7 @@ def main():
                 continue
             
             # Set up results directory for this test configuration
-            base_name = f"DeCo-Diff_{test_args_obj.dataset}_{test_args_obj.object_class}_{test_args_obj.model_size}_{test_args_obj.patch_size}"
-            
-            if test_args_obj.append_timestamp:
-                current_time = datetime.now().strftime("%y%m%d_%H%M%S")
-                test_args_obj.results_dir = f"results/{test_name}_{current_time}"
-            else:
-                test_args_obj.results_dir = f"results/{test_name}"
+            test_args_obj.results_dir = f"results/{test_name}"
             
             os.makedirs(test_args_obj.results_dir, exist_ok=True)
             
@@ -3333,6 +2554,7 @@ def main():
             debug_print(f"   mode: {test_args_obj.mode}")
             debug_print(f"   batch_num: {test_args_obj.batch_num}")
             debug_print(f"   patch_size: {test_args_obj.patch_size}")
+            debug_print(f"   stride: {test_args_obj.stride}")
             debug_print(f"   annotation_dir: {test_args_obj.annotation_dir}")
             debug_print(f"   pretrained: {test_args_obj.pretrained}")
             debug_print(f"   results_dir: {test_args_obj.results_dir}")
@@ -3347,6 +2569,8 @@ def main():
                     mode_save_and_process(test_args_obj)
                 elif test_args_obj.mode == "full_pipeline":
                     mode_full_pipeline(test_args_obj)
+                elif test_args_obj.mode == "full_pipeline_with_saving_npy":
+                    mode_full_pipeline_with_saving_npy(test_args_obj)
                 
                 print(f"✅ Configuration {test_name} completed successfully!")
                 
@@ -3367,11 +2591,7 @@ def main():
         # Set up results directory
         base_name = f"DeCo-Diff_{args.dataset}_{args.object_class}_{args.model_size}_{args.patch_size}"
         
-        if args.append_timestamp:
-            current_time = datetime.now().strftime("%y%m%d_%H%M%S")
-            args.results_dir = f"results/{base_name}_{current_time}"
-        else:
-            args.results_dir = f"results/{base_name}"
+        args.results_dir = f"results/{base_name}"
         
         os.makedirs(args.results_dir, exist_ok=True)
         
@@ -3384,6 +2604,8 @@ def main():
             mode_save_and_process(args)
         elif args.mode == "full_pipeline":
             mode_full_pipeline(args)
+        elif args.mode == "full_pipeline_with_saving_npy":
+            mode_full_pipeline_with_saving_npy(args)
         
         print(f"Mode {args.mode} completed successfully!")
 
