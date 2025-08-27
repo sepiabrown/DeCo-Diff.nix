@@ -138,10 +138,7 @@ Record = OrderedDict[str, Kinded]
 # Global debug flag (will be set from args)
 DEBUG_ENABLED = False
 
-def debug_print(*args, **kwargs):
-    """Print debug messages only if debug mode is enabled."""
-    if DEBUG_ENABLED:
-        print(*args, **kwargs)
+from utils import debug_print
 
 # Shared utility functions for record creation and processing
 def _extract_patch_coordinates(patch_coords, batch_index=0, patch_size=128):
@@ -314,7 +311,7 @@ def _process_single_patch(
         
         # Check if image exists in original images
         if current_image_path not in original_images:
-            debug_print(f"⚠️  Image not found in original_images: {current_image_path}")
+            debug_print(f"⚠️  Image not found in original_images: {current_image_path}", debug=DEBUG_ENABLED)
             return None
         
         original_image = original_images[current_image_path]
@@ -352,7 +349,7 @@ def _process_single_patch(
         return record
         
     except Exception as e:
-        debug_print(f"⚠️  Error processing patch for {current_image_path}: {e}")
+        debug_print(f"⚠️  Error processing patch for {current_image_path}: {e}", debug=DEBUG_ENABLED)
         return None
 
 class AnnotatedImageDataset(Dataset):
@@ -428,7 +425,7 @@ class AnnotatedImageDataset(Dataset):
         return len(self.patch_items)
         
     def __getitem__(self, index):
-        debug_print(f"!!!!!!🔍 starting __getitem__ index: {index}")
+        debug_print(f"🔍 Starting __getitem__ index: {index}", debug=DEBUG_ENABLED)
 
         # Retrieve per-patch unit: (image_path, coords_8_values)
         image_path, coords_8_values = self.patch_items[index]
@@ -463,9 +460,9 @@ class AnnotatedImageDataset(Dataset):
         # Convert patch coordinates to tensor for proper batching
         patch_coords = torch.tensor(coords_8_values, dtype=torch.long)
 
-        debug_print(f"🔍 Dataset[{index}]: Final shapes - x: {x.shape}, seg: {seg.shape}, object_cls: {object_cls.shape}")
-        debug_print(f"🔍 Dataset[{index}]: patch_coords shape: {patch_coords.shape}, dtype: {patch_coords.dtype}")
-        debug_print(f"!!!!!!🔍 ending __getitem__ index: {index}")
+        debug_print(f"🔍 Dataset[{index}]: Final shapes - x: {x.shape}, seg: {seg.shape}, object_cls: {object_cls.shape}", debug=DEBUG_ENABLED)
+        debug_print(f"🔍 Dataset[{index}]: patch_coords shape: {patch_coords.shape}, dtype: {patch_coords.dtype}", debug=DEBUG_ENABLED)
+        debug_print(f"🔍 Ending __getitem__ index: {index}", debug=DEBUG_ENABLED)
         return x, seg, object_cls, anomaly_classes, image_path, patch_coords
 
     def _resolve_image_path(self, annotation_file, image_path):
@@ -534,12 +531,12 @@ class AnnotatedImageDataset(Dataset):
                 patch_pil = patch_pil.resize((self.patch_size, self.patch_size), PILImage.Resampling.LANCZOS)
                 patch = np.array(patch_pil)
             
-            debug_print(f"🔧 Fast parallel patch extraction: {patch.shape}")
+            debug_print(f"🔧 Fast parallel patch extraction: {patch.shape}", debug=DEBUG_ENABLED)
             return patch
         else:
             # Slow path: non-parallel patch requires perspective transform
             # This is more computationally expensive but handles rotated patches
-            debug_print(f"🔧 Slow non-parallel patch extraction (perspective transform)")
+            debug_print(f"🔧 Slow non-parallel patch extraction (perspective transform)", debug=DEBUG_ENABLED)
             
             # Convert coordinates to numpy arrays for OpenCV
             src_points = np.float32([[x1, y1], [x2, y2], [x3, y3], [x4, y4]])
@@ -561,11 +558,11 @@ class AnnotatedImageDataset(Dataset):
         Implements LRU-style cache management to prevent memory issues.
         """
         if image_path in self._image_cache:
-            debug_print(f"🔧 Using cached image: {image_path}")
+            debug_print(f"🔧 Using cached image: {image_path}", debug=DEBUG_ENABLED)
             return self._image_cache[image_path]
         
         # Load and cache new image
-        debug_print(f"🔧 Loading new image into cache: {image_path}")
+        debug_print(f"🔧 Loading new image into cache: {image_path}", debug=DEBUG_ENABLED)
         image = PILImage.open(image_path).convert('RGB')
         image_np = np.array(image)
         
@@ -577,11 +574,11 @@ class AnnotatedImageDataset(Dataset):
             # Remove oldest entry (simple FIFO for now)
             oldest_key = next(iter(self._image_cache))
             del self._image_cache[oldest_key]
-            debug_print(f"🔧 Removed oldest image from cache: {oldest_key}")
+            debug_print(f"🔧 Removed oldest image from cache: {oldest_key}", debug=DEBUG_ENABLED)
         
         # Add to cache
         self._image_cache[image_path] = image_np
-        debug_print(f"🔧 Cached image: {image_path} (cache size: {len(self._image_cache)})")
+        debug_print(f"🔧 Cached image: {image_path} (cache size: {len(self._image_cache)})", debug=DEBUG_ENABLED)
         
         return image_np
     
@@ -604,7 +601,7 @@ class AnnotatedImageDataset(Dataset):
         
         if pad_height == 0 and pad_width == 0:
             # No padding needed
-            debug_print(f"  📐 No padding needed. Image dimensions: {height}x{width}")
+            debug_print(f"  📐 No padding needed. Image dimensions: {height}x{width}", debug=DEBUG_ENABLED)
             return img
         
         # Calculate padding for each side (distribute evenly, with extra on bottom/right if odd)
@@ -626,8 +623,8 @@ class AnnotatedImageDataset(Dataset):
                               mode='reflect')
         
         new_height, new_width = padded_img.shape[:2]
-        debug_print(f"  📐 Padded image from {height}x{width} to {new_height}x{new_width}")
-        debug_print(f"  📐 Padding applied: top={pad_top}, bottom={pad_bottom}, left={pad_left}, right={pad_right}")
+        debug_print(f"  📐 Padded image from {height}x{width} to {new_height}x{new_width}", debug=DEBUG_ENABLED)
+        debug_print(f"  📐 Padding applied: top={pad_top}, bottom={pad_bottom}, left={pad_left}, right={pad_right}", debug=DEBUG_ENABLED)
         
         return padded_img
     
@@ -638,7 +635,7 @@ class AnnotatedImageDataset(Dataset):
         
         height, width = img.shape[:2]
         stride = self.stride
-        debug_print(f"  📐 Padded image dimensions: {height}x{width}, patch size: {self.patch_size}, stride: {stride}")
+        debug_print(f"  📐 Padded image dimensions: {height}x{width}, patch size: {self.patch_size}, stride: {stride}", debug=DEBUG_ENABLED)
         
         # When stride equals patch_size, ensure dimensions are divisible
         if stride == self.patch_size:
@@ -659,14 +656,14 @@ class AnnotatedImageDataset(Dataset):
                 coords_8_values = (x1, y1, x2, y2, x3, y3, x4, y4)
                 
                 # Debug: Check coordinate types
-                debug_print(f"  🔍 Created coordinates: {coords_8_values}")
-                debug_print(f"  🔍 Coordinate types: {[type(coord) for coord in coords_8_values]}")
-                debug_print(f"  🔍 All integers: {all(isinstance(coord, int) for coord in coords_8_values)}")
+                debug_print(f"  🔍 Created coordinates: {coords_8_values}", debug=DEBUG_ENABLED)
+                debug_print(f"  🔍 Coordinate types: {[type(coord) for coord in coords_8_values]}", debug=DEBUG_ENABLED)
+                debug_print(f"  🔍 All integers: {all(isinstance(coord, int) for coord in coords_8_values)}", debug=DEBUG_ENABLED)
                 
                 patches.append(patch)
                 coords.append(coords_8_values)
         
-        debug_print(f"  ✅ Extracted {len(patches)} non-overlapping patches from padded image")
+        debug_print(f"  ✅ Extracted {len(patches)} non-overlapping patches from padded image", debug=DEBUG_ENABLED)
         return patches, coords
 
 def _compute_abs_diff_mean(a: torch.Tensor, b: torch.Tensor, diff_scale: float = 1.0) -> torch.Tensor:
@@ -680,9 +677,9 @@ def _process_batch_inference(x, object_cls, model, vae, diffusion, reverse_steps
     Shared inference logic for processing a batch.
     Returns the computed difference tensors.
     """
-    debug_print(f"   🔄 Moving {x.size(0)} patches to device: {device}")
-    debug_print(f"   🔍 x shape before device move: {x.shape}")
-    debug_print(f"   🔍 object_cls shape: {object_cls.shape}")
+    debug_print(f"   🔄 Moving {x.size(0)} patches to device: {device}", debug=DEBUG_ENABLED)
+    debug_print(f"   🔍 x shape before device move: {x.shape}", debug=DEBUG_ENABLED)
+    debug_print(f"   🔍 object_cls shape: {object_cls.shape}", debug=DEBUG_ENABLED)
     
     # Validate tensor dimensions before processing
     if len(x.shape) != 4:
@@ -695,9 +692,9 @@ def _process_batch_inference(x, object_cls, model, vae, diffusion, reverse_steps
     x_device = x.to(device)
     object_cls_device = object_cls.to(device)
     
-    debug_print(f"   🔍 x_device shape after device move: {x_device.shape}")
+    debug_print(f"   🔍 x_device shape after device move: {x_device.shape}", debug=DEBUG_ENABLED)
     
-    debug_print(f"   🎨 VAE encoding...")
+    debug_print(f"   🎨 VAE encoding...", debug=DEBUG_ENABLED)
     # Forward pass through VAE encoder (to latent space)
     if torch.cuda.is_available():
         with torch.cuda.amp.autocast(dtype=torch.float16):
@@ -706,7 +703,7 @@ def _process_batch_inference(x, object_cls, model, vae, diffusion, reverse_steps
         encoded = encoded.float()
     else:
         encoded = vae.encode(x_device).latent_dist.mean * _LATENT_SCALE
-    debug_print(f"   ✅ VAE encoding completed, latent shape: {encoded.shape}")
+    debug_print(f"   ✅ VAE encoding completed, latent shape: {encoded.shape}", debug=DEBUG_ENABLED)
 
     # Reverse DDIM sampling conditioned on encoder latents
     # Ensure object_cls has the correct shape and dtype for the model's class embedder
@@ -723,7 +720,7 @@ def _process_batch_inference(x, object_cls, model, vae, diffusion, reverse_steps
         if context.shape[1] != 1:
             context = context[:, :1]
     
-    debug_print(f"   🔍 Context tensor shape (indices): {context.shape}")
+    debug_print(f"   🔍 Context tensor shape (indices): {context.shape}", debug=DEBUG_ENABLED)
     
     # Validate context tensor shape for embedding: must be 2D [batch_size, 1]
     if len(context.shape) != 2 or context.shape[1] != 1:
@@ -734,49 +731,49 @@ def _process_batch_inference(x, object_cls, model, vae, diffusion, reverse_steps
         context = context.long()
     
     # Additional validation: ensure the input tensor has the correct shape for the model
-    debug_print(f"   🔍 Input tensor x_device shape: {x_device.shape}")
-    debug_print(f"   🔍 Input tensor x_device dtype: {x_device.dtype}")
-    debug_print(f"   🔍 Input tensor x_device device: {x_device.device}")
+    debug_print(f"   🔍 Input tensor x_device shape: {x_device.shape}", debug=DEBUG_ENABLED)
+    debug_print(f"   🔍 Input tensor x_device dtype: {x_device.dtype}", debug=DEBUG_ENABLED)
+    debug_print(f"   🔍 Input tensor x_device device: {x_device.device}", debug=DEBUG_ENABLED)
     
     # The model might expect a specific input format
     # Try to ensure the input tensor is in the right format
     if len(x_device.shape) == 4:
         # Standard format: [batch, channels, height, width]
-        debug_print(f"   ✅ Input tensor has correct 4D format: {x_device.shape}")
+        debug_print(f"   ✅ Input tensor has correct 4D format: {x_device.shape}", debug=DEBUG_ENABLED)
         
         # The model architecture might have specific input requirements
         # Let's check if there's a mismatch between what we're providing and what the model expects
-        debug_print(f"   🔍 Model type: {type(model)}")
-        debug_print(f"   🔍 Model device: {next(model.parameters()).device}")
+        debug_print(f"   🔍 Model type: {type(model)}", debug=DEBUG_ENABLED)
+        debug_print(f"   🔍 Model device: {next(model.parameters()).device}", debug=DEBUG_ENABLED)
         
         # Check if the model has any specific input requirements
         if hasattr(model, 'config'):
-            debug_print(f"   🔍 Model config: {model.config}")
+            debug_print(f"   🔍 Model config: {model.config}", debug=DEBUG_ENABLED)
         
         # The issue might be that the model expects a different input format
         # Let's try to understand what the model actually expects
-        debug_print(f"   🔍 Input tensor shape: {x_device.shape}")
-        debug_print(f"   🔍 Context tensor shape: {context.shape}")
+        debug_print(f"   🔍 Input tensor shape: {x_device.shape}", debug=DEBUG_ENABLED)
+        debug_print(f"   🔍 Context tensor shape: {context.shape}", debug=DEBUG_ENABLED)
     else:
-        debug_print(f"   ⚠️  Warning: Input tensor has unexpected shape: {x_device.shape}")
+        debug_print(f"   ⚠️  Warning: Input tensor has unexpected shape: {x_device.shape}", debug=DEBUG_ENABLED)
     
     model_kwargs = {"context": context, "mask": None}
     
-    debug_print(f"   🔄 Starting DDIM sampling with {reverse_steps} steps...")
-    debug_print(f"   🔍 Encoded latent shape: {encoded.shape}")
-    debug_print(f"   🔍 Model kwargs: {model_kwargs}")
+    debug_print(f"   🔄 Starting DDIM sampling with {reverse_steps} steps...", debug=DEBUG_ENABLED)
+    debug_print(f"   🔍 Encoded latent shape: {encoded.shape}", debug=DEBUG_ENABLED)
+    debug_print(f"   🔍 Model kwargs: {model_kwargs}", debug=DEBUG_ENABLED)
     
     # Try to catch the error earlier by testing the model with a simple forward pass
     try:
-        debug_print(f"   🔍 Testing model forward pass...")
+        debug_print(f"   🔍 Testing model forward pass...", debug=DEBUG_ENABLED)
         with torch.no_grad():
             # Create a simple test input with the same shape as encoded
             test_input = torch.randn_like(encoded)
             test_output = model(test_input, torch.zeros(1, device=device), **model_kwargs)
-            debug_print(f"   ✅ Model forward pass successful, output shape: {test_output.shape}")
+            debug_print(f"   ✅ Model forward pass successful, output shape: {test_output.shape}", debug=DEBUG_ENABLED)
     except Exception as e:
-        debug_print(f"   ❌ Model forward pass failed: {e}")
-        debug_print(f"   🔍 This suggests the model has input format requirements we're not meeting")
+        debug_print(f"   ❌ Model forward pass failed: {e}", debug=DEBUG_ENABLED)
+        debug_print(f"   🔍 This suggests the model has input format requirements we're not meeting", debug=DEBUG_ENABLED)
         # Continue anyway to see the full error
     
     latent_samples_list = []
@@ -794,12 +791,12 @@ def _process_batch_inference(x, object_cls, model, vae, diffusion, reverse_steps
     ):
         step_count += 1
         if step_count % max(1, reverse_steps // 5) == 0:  # Print every 20% of steps
-            debug_print(f"     📈 DDIM step {step_count}/{reverse_steps}")
+            debug_print(f"     📈 DDIM step {step_count}/{reverse_steps}", debug=DEBUG_ENABLED)
         latent_samples_list.append(samples["sample"])
     latent_samples_final = latent_samples_list[-1]
-    debug_print(f"   ✅ DDIM sampling completed after {step_count} steps")
+    debug_print(f"   ✅ DDIM sampling completed after {step_count} steps", debug=DEBUG_ENABLED)
 
-    debug_print(f"   🎨 VAE decoding...")
+    debug_print(f"   🎨 VAE decoding...", debug=DEBUG_ENABLED)
     # Decode final latent samples
     if torch.cuda.is_available():
         with torch.cuda.amp.autocast(dtype=torch.float16):
@@ -811,9 +808,9 @@ def _process_batch_inference(x, object_cls, model, vae, diffusion, reverse_steps
     else:
         image_samples = vae.decode(latent_samples_final / _LATENT_SCALE).sample
         x0 = vae.decode(encoded / _LATENT_SCALE).sample
-    debug_print(f"   ✅ VAE decoding completed")
+    debug_print(f"   ✅ VAE decoding completed", debug=DEBUG_ENABLED)
     
-    debug_print(f"   📊 Computing differences...")
+    debug_print(f"   📊 Computing differences...", debug=DEBUG_ENABLED)
     # Core difference computations
     encodedrecon_dodrecon_diff_raw = _compute_abs_diff_max(x0, image_samples)
     encodedrecon_dodrecon_diff = torch.clamp(encodedrecon_dodrecon_diff_raw, 0.0, 0.05) * 20
@@ -830,11 +827,11 @@ def _process_batch_inference(x, object_cls, model, vae, diffusion, reverse_steps
         align_corners=False,
     )
     anomaly_map_arithmetic = 0.5 * (encodedrecon_dodrecon_diff + encoded_latent_diff_resized)
-    debug_print(f"   ✅ Difference computation completed")
+    debug_print(f"   ✅ Difference computation completed", debug=DEBUG_ENABLED)
     
     # Collect epoch-wise statistics if enabled
     if epoch_metrics is not None:
-        debug_print(f"   📊 Collecting epoch statistics...")
+        debug_print(f"   📊 Collecting epoch statistics...", debug=DEBUG_ENABLED)
         # Use the same logic as in evaluation_DeCo_Diff2.py
         epoch_metrics.add_batch_stats(
             encodedrecon_dodrecon_diff_raw, 
@@ -842,7 +839,7 @@ def _process_batch_inference(x, object_cls, model, vae, diffusion, reverse_steps
             anomaly_map_arithmetic, 
             anomaly_map_arithmetic  # Use same for geometric since we don't compute separate geometric
         )
-        debug_print(f"   ✅ Epoch statistics collected")
+        debug_print(f"   ✅ Epoch statistics collected", debug=DEBUG_ENABLED)
     
     # Clear memory
     del x_device, object_cls_device, encoded, latent_samples_list, latent_samples_final
@@ -1010,14 +1007,14 @@ def save_all_records_json(records: List[Record], output_dir: str, filename: str 
         # Add computed grid coordinates (simple division since images are padded)
         if record_data["patch_coords"]:
             patch_coords = record_data["patch_coords"]
-            debug_print(f"🔍 Processing patch_coords: {patch_coords} (type: {type(patch_coords)}, len: {len(patch_coords)})")
+            debug_print(f"🔍 Processing patch_coords: {patch_coords} (type: {type(patch_coords)}, len: {len(patch_coords)})", debug=DEBUG_ENABLED)
             if len(patch_coords) == 8:
                 # 8-value format: (x1, y1, x2, y2, x3, y3, x4, y4)
                 x1, y1, x2, y2, x3, y3, x4, y4 = patch_coords
                 patch_x, patch_y = x1, y1  # Top-left corner
             elif len(patch_coords) == 2:
                 # Legacy 2-value format detected - convert to 8-value format
-                debug_print(f"⚠️  Converting 2-value coordinates {patch_coords} to 8-value format")
+                debug_print(f"⚠️  Converting 2-value coordinates {patch_coords} to 8-value format", debug=DEBUG_ENABLED)
                 x1, y1 = patch_coords[0], patch_coords[1]
                 x2, y2 = x1 + patch_size, y1  # Top-right
                 x3, y3 = x1 + patch_size, y1 + patch_size  # Bottom-right
@@ -1026,7 +1023,7 @@ def save_all_records_json(records: List[Record], output_dir: str, filename: str 
                 # Update the record with converted 8-value coordinates
                 record_data["patch_coords"] = [x1, y1, x2, y2, x3, y3, x4, y4]
                 patch_x, patch_y = x1, y1
-                debug_print(f"✅ Converted to 8-value coordinates: {record_data['patch_coords']}")
+                debug_print(f"✅ Converted to 8-value coordinates: {record_data['patch_coords']}", debug=DEBUG_ENABLED)
             else:
                 raise ValueError(f"Expected 8-value patch coordinates, got {len(patch_coords)} values. All coordinates should be 8-value format: (x1, y1, x2, y2, x3, y3, x4, y4)")
             
@@ -1144,24 +1141,24 @@ def load_model_and_components(args):
     model.cuda()
     
     # Debug: Check model configuration
-    debug_print(f"🔍 Model loaded successfully")
-    debug_print(f"🔍 Model type: {type(model)}")
-    debug_print(f"🔍 Model device: {next(model.parameters()).device}")
+    debug_print(f"🔍 Model loaded successfully", debug=DEBUG_ENABLED)
+    debug_print(f"🔍 Model type: {type(model)}", debug=DEBUG_ENABLED)
+    debug_print(f"🔍 Model device: {next(model.parameters()).device}", debug=DEBUG_ENABLED)
     
     # Check if the model has any specific input requirements
     if hasattr(model, 'config'):
-        debug_print(f"🔍 Model config: {model.config}")
+        debug_print(f"🔍 Model config: {model.config}", debug=DEBUG_ENABLED)
     
     # Check the model's expected input format
-    debug_print(f"🔍 Model latent_size: {latent_size}")
-    debug_print(f"🔍 Model patch_size: {args.patch_size}")
+    debug_print(f"🔍 Model latent_size: {latent_size}", debug=DEBUG_ENABLED)
+    debug_print(f"🔍 Model patch_size: {args.patch_size}", debug=DEBUG_ENABLED)
     
     # Check if there's a mismatch between the model architecture and input
     if hasattr(model, 'image_size'):
-        debug_print(f"🔍 Model expected image_size: {model.image_size}")
+        debug_print(f"🔍 Model expected image_size: {model.image_size}", debug=DEBUG_ENABLED)
     
     if hasattr(model, 'in_channels'):
-        debug_print(f"🔍 Model expected in_channels: {model.in_channels}")
+        debug_print(f"🔍 Model expected in_channels: {model.in_channels}", debug=DEBUG_ENABLED)
     
     print("model loaded")
 
@@ -1250,7 +1247,7 @@ def _process_records_stream_incrementally(
     os.makedirs(output_dir, exist_ok=True)
     output_subdir = os.path.join(output_dir, output_subdir_name)
     os.makedirs(output_subdir, exist_ok=True)
-    debug_print(f"📁 Output directory: {output_subdir}")
+    debug_print(f"📁 Output directory: {output_subdir}", debug=DEBUG_ENABLED)
 
     checkpoint_manager = CheckpointManager(args.results_dir, args.annotation_dir, args.force_rerun)
 
@@ -1263,7 +1260,21 @@ def _process_records_stream_incrementally(
     batch_records = []
     flush_every = max(1, int(getattr(args, "batch_size", 64)))
 
-    for i, (current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw) in enumerate(patch_item_iter):
+    # Check if we need to aggregate overlapping patches back to grid positions
+    # This happens when stride < patch_size was used during evaluation
+    use_patch_aggregation = (hasattr(args, 'stride') and args.stride is not None and 
+                           args.stride < args.patch_size)
+    
+    if use_patch_aggregation:
+        debug_print(f"🔧 Using patch aggregation: stride={args.stride}, patch_size={args.patch_size}")
+        # Collect and aggregate overlapping patches
+        patch_groups = _aggregate_overlapping_patches(patch_item_iter, args.stride, args.patch_size, original_images)
+        debug_print(f"🔧 Aggregated patches into {len(patch_groups)} grid positions")
+    else:
+        patch_groups = patch_item_iter
+
+    # Process aggregated patches
+    for i, (current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw) in enumerate(patch_groups):
         record = _process_single_patch(
             ground_truth_map=ground_truth_map,
             original_images=original_images,
@@ -1278,7 +1289,6 @@ def _process_records_stream_incrementally(
         )
         if record is None:
             continue
-
         batch_records.append(record)
         total_records += 1
         is_predicted_defective = record.get("is_predicted_defective", (None, False))[1]
@@ -1287,7 +1297,7 @@ def _process_records_stream_incrementally(
         else:
             normal_records_count += 1
         image_to_records[current_image_path].append(record)
-
+        
         if len(batch_records) >= flush_every:
             _process_batch_records_immediately(
                 args,
@@ -1304,7 +1314,7 @@ def _process_records_stream_incrementally(
                 torch.cuda.empty_cache()
             import gc
             gc.collect()
-
+    
     if batch_records:
         _process_batch_records_immediately(
             args,
@@ -1327,6 +1337,160 @@ def _process_records_stream_incrementally(
         output_subdir,
     )
     return metrics, output_subdir
+
+
+def _aggregate_overlapping_patches(patch_item_iter, stride, patch_size, original_images):
+    """
+    Reconstruct equal-spaced grid patches by averaging overlapping regions from stride-based patches.
+    
+    Example: 
+    - Grid patch (0,0,128,0,128,128,0,128) 
+    - Gets contributions from stride patches like (0,0), (64,0), (0,64), (64,64)
+    - Average the overlapping (64,64,128,64,128,128,64,128) region
+    - Drop non-grid-aligned patches like (64,64,192,64,192,192,64,192)
+    
+    Args:
+        patch_item_iter: Iterator yielding (image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw)
+        stride: Stride used during patch extraction  
+        patch_size: Size of patches
+        original_images: Dictionary of original images for dimension calculation
+        
+    Returns:
+        List of reconstructed grid patches: [(image_path, grid_coords_8_values, reconstructed_encodedrecon, reconstructed_latent, reconstructed_anomaly), ...]
+    """
+    from collections import defaultdict
+    import numpy as np
+    
+    debug_print(f"🔧 Reconstructing equal-spaced grid patches from overlapping stride patches...")
+    
+    # Collect all stride patches by image
+    stride_patches_by_image = defaultdict(list)
+    
+    for patch_data in patch_item_iter:
+        image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw = patch_data
+        stride_x, stride_y = coords_8_values[0], coords_8_values[1]
+        
+        stride_patches_by_image[image_path].append({
+            'coords': (stride_x, stride_y),
+            'encodedrecon_raw': encodedrecon_raw,
+            'latent_raw': latent_raw,
+            'anomaly_map_arithmetic_raw': anomaly_map_arithmetic_raw
+        })
+    
+    reconstructed_patches = []
+    
+    for image_path, stride_patches in stride_patches_by_image.items():
+        debug_print(f"🔧 Processing {len(stride_patches)} stride patches for {image_path}")
+        
+        # Get image dimensions to determine grid positions
+        if image_path not in original_images:
+            debug_print(f"⚠️  Image not found: {image_path}")
+            continue
+            
+        original_image = original_images[image_path]
+        img_height, img_width = original_image.shape[:2]
+        
+        # Calculate padded dimensions (same as in patch extraction)
+        pad_height = (patch_size - (img_height % patch_size)) % patch_size
+        pad_width = (patch_size - (img_width % patch_size)) % patch_size
+        padded_height = img_height + pad_height
+        padded_width = img_width + pad_width
+        
+        # Generate equal-spaced grid positions (what we want to reconstruct)
+        grid_positions = []
+        for grid_y in range(0, padded_height, patch_size):
+            for grid_x in range(0, padded_width, patch_size):
+                # Ensure we don't go beyond padded boundaries
+                if grid_y + patch_size <= padded_height and grid_x + patch_size <= padded_width:
+                    grid_positions.append((grid_x, grid_y))
+        
+        debug_print(f"🔧 Reconstructing {len(grid_positions)} grid patches from stride patches")
+        
+        # For each grid position, reconstruct the patch by averaging overlapping regions
+        for grid_x, grid_y in grid_positions:
+            # Initialize accumulation arrays
+            patch_shape = stride_patches[0]['encodedrecon_raw'].shape
+            accumulated_encodedrecon = np.zeros(patch_shape, dtype=np.float64)
+            accumulated_latent = np.zeros(stride_patches[0]['latent_raw'].shape, dtype=np.float64)
+            accumulated_anomaly = np.zeros(stride_patches[0]['anomaly_map_arithmetic_raw'].shape, dtype=np.float64)
+            count_map = np.zeros((patch_size, patch_size), dtype=np.int32)
+            
+            # Find all stride patches that overlap with this grid patch
+            contributing_patches = 0
+            for stride_patch in stride_patches:
+                stride_x, stride_y = stride_patch['coords']
+                
+                # Check if this stride patch overlaps with the grid patch
+                # Overlap exists if: stride_x < grid_x + patch_size AND stride_x + patch_size > grid_x
+                #                   AND stride_y < grid_y + patch_size AND stride_y + patch_size > grid_y
+                if (stride_x < grid_x + patch_size and stride_x + patch_size > grid_x and
+                    stride_y < grid_y + patch_size and stride_y + patch_size > grid_y):
+                    
+                    # Calculate overlap region in both patches
+                    overlap_x_start = max(0, grid_x - stride_x)  # Start in stride patch
+                    overlap_y_start = max(0, grid_y - stride_y)  # Start in stride patch
+                    overlap_x_end = min(patch_size, grid_x + patch_size - stride_x)  # End in stride patch
+                    overlap_y_end = min(patch_size, grid_y + patch_size - stride_y)  # End in stride patch
+                    
+                    # Calculate corresponding region in grid patch
+                    grid_x_start = max(0, stride_x - grid_x)  # Start in grid patch
+                    grid_y_start = max(0, stride_y - grid_y)  # Start in grid patch
+                    grid_x_end = grid_x_start + (overlap_x_end - overlap_x_start)
+                    grid_y_end = grid_y_start + (overlap_y_end - overlap_y_start)
+                    
+                    # Extract overlapping regions from stride patch
+                    stride_encodedrecon_region = stride_patch['encodedrecon_raw'][..., overlap_y_start:overlap_y_end, overlap_x_start:overlap_x_end]
+                    stride_latent_region = stride_patch['latent_raw'][..., overlap_y_start:overlap_y_end, overlap_x_start:overlap_x_end]
+                    stride_anomaly_region = stride_patch['anomaly_map_arithmetic_raw'][overlap_y_start:overlap_y_end, overlap_x_start:overlap_x_end]
+                    
+                    # Accumulate in grid patch
+                    accumulated_encodedrecon[..., grid_y_start:grid_y_end, grid_x_start:grid_x_end] += stride_encodedrecon_region
+                    accumulated_latent[..., grid_y_start:grid_y_end, grid_x_start:grid_x_end] += stride_latent_region
+                    accumulated_anomaly[grid_y_start:grid_y_end, grid_x_start:grid_x_end] += stride_anomaly_region
+                    count_map[grid_y_start:grid_y_end, grid_x_start:grid_x_end] += 1
+                    
+                    contributing_patches += 1
+            
+            if contributing_patches > 0:
+                # Compute mean where count > 0
+                count_map_expanded = np.expand_dims(count_map, axis=tuple(range(len(accumulated_encodedrecon.shape) - 2)))
+                count_map_expanded = np.broadcast_to(count_map_expanded, accumulated_encodedrecon.shape)
+                
+                # Avoid division by zero
+                valid_mask = count_map_expanded > 0
+                reconstructed_encodedrecon = np.zeros_like(accumulated_encodedrecon)
+                reconstructed_encodedrecon[valid_mask] = accumulated_encodedrecon[valid_mask] / count_map_expanded[valid_mask]
+                
+                count_map_expanded_latent = np.expand_dims(count_map, axis=tuple(range(len(accumulated_latent.shape) - 2)))
+                count_map_expanded_latent = np.broadcast_to(count_map_expanded_latent, accumulated_latent.shape)
+                valid_mask_latent = count_map_expanded_latent > 0
+                reconstructed_latent = np.zeros_like(accumulated_latent)
+                reconstructed_latent[valid_mask_latent] = accumulated_latent[valid_mask_latent] / count_map_expanded_latent[valid_mask_latent]
+                
+                valid_mask_anomaly = count_map > 0
+                reconstructed_anomaly = np.zeros_like(accumulated_anomaly)
+                reconstructed_anomaly[valid_mask_anomaly] = accumulated_anomaly[valid_mask_anomaly] / count_map[valid_mask_anomaly]
+                
+                # Create grid coordinates (8-value format)
+                grid_coords_8_values = [
+                    grid_x, grid_y,                           # Top-left
+                    grid_x + patch_size, grid_y,              # Top-right  
+                    grid_x + patch_size, grid_y + patch_size, # Bottom-right
+                    grid_x, grid_y + patch_size               # Bottom-left
+                ]
+                
+                reconstructed_patches.append((
+                    image_path,
+                    grid_coords_8_values,
+                    reconstructed_encodedrecon.astype(stride_patches[0]['encodedrecon_raw'].dtype),
+                    reconstructed_latent.astype(stride_patches[0]['latent_raw'].dtype),
+                    reconstructed_anomaly.astype(stride_patches[0]['anomaly_map_arithmetic_raw'].dtype)
+                ))
+                
+                debug_print(f"🔧 Reconstructed grid patch ({grid_x},{grid_y}) from {contributing_patches} stride patches")
+    
+    debug_print(f"🔧 Final reconstruction: {len(reconstructed_patches)} equal-spaced grid patches")
+    return reconstructed_patches
 
 
 def _extract_image_path_from_batch(image_paths_batch, batch_index):
@@ -1395,7 +1559,7 @@ def _iterate_saved_patch_items(args):
                     anomaly_data.squeeze(),
                 )
             except Exception as e:
-                debug_print(f"⚠️  Failed reading saved patch: {npy_file}: {e}")
+                debug_print(f"⚠️  Failed reading saved patch: {npy_file}: {e}", debug=DEBUG_ENABLED)
                 continue
         else:
             # Legacy fallback: parse filename
@@ -1434,7 +1598,7 @@ def _iterate_saved_patch_items(args):
                     anomaly_data.squeeze(),
                 )
             except Exception as e:
-                debug_print(f"⚠️  Legacy load failed for {npy_file}: {e}")
+                debug_print(f"⚠️  Legacy load failed for {npy_file}: {e}", debug=DEBUG_ENABLED)
                 continue
 
 
@@ -1561,7 +1725,7 @@ def _iterate_eval_patch_items_with_saving(args, vae, model, diffusion, loader, s
                 try:
                     job.result()  # Check for exceptions
                 except Exception as e:
-                    debug_print(f"⚠️  Save job failed: {e}")
+                    debug_print(f"⚠️  Save job failed: {e}", debug=DEBUG_ENABLED)
             else:
                 pending.appendleft(job)  # Put it back if not done
                 break
@@ -1619,22 +1783,21 @@ def _iterate_eval_patch_items_with_saving(args, vae, model, diffusion, loader, s
 
     finally:
         # Wait for all pending saves to complete
-        debug_print(f"🔄 Waiting for {len(pending)} remaining save jobs to complete...")
+        debug_print(f"🔄 Waiting for {len(pending)} remaining save jobs to complete...", debug=DEBUG_ENABLED)
         while pending:
             job = pending.popleft()
             try:
                 job.result()  # Wait for completion and check for exceptions
             except Exception as e:
-                debug_print(f"⚠️  Save job failed: {e}")
+                debug_print(f"⚠️  Save job failed: {e}", debug=DEBUG_ENABLED)
         
         executor.shutdown(wait=True)
-        debug_print("✅ All NPY saves completed")
+        debug_print("✅ All NPY saves completed", debug=DEBUG_ENABLED)
 
-def save_image_results_from_records(checkpoint_manager: CheckpointManager, image_path: str, 
+def save_image_results_from_records2(checkpoint_manager: CheckpointManager, image_path: str, 
                                   image_records: list, 
                                   predicted_defective_set: set, ground_truth_defective: set, overlapping: set,
-                                  enable_save_optional_image_results: bool = False, patch_size: int = 256, 
-                                  use_mean_aggregation: bool = False):
+                                  enable_save_optional_image_results: bool = False, patch_size: int = 256):
     """Save all results for a single image immediately using records."""
     safe_name = path_to_safe_filename(image_path)
     
@@ -1683,18 +1846,6 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
         }
     }
     
-    # Initialize count maps for mean aggregation if enabled
-    count_maps = {}
-    if use_mean_aggregation:
-        count_maps = {
-            'required': {
-                'arithmetic': np.zeros((h, w), dtype=np.float32),
-                'arithmetic_binary': np.zeros((h, w), dtype=np.float32),
-                'geometric': np.zeros((h, w), dtype=np.float32),
-                'geometric_binary': np.zeros((h, w), dtype=np.float32),
-            }
-        }
-    
     # Initialize optional maps only when flag is enabled
     if enable_save_optional_image_results:
         anomaly_maps['optional'] = {
@@ -1705,16 +1856,6 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
             'geometric_binary_style2': np.zeros((h, w), dtype=np.float32),
             'geometric_binary_style3': np.zeros((h, w), dtype=np.float32),
         }
-        
-        if use_mean_aggregation:
-            count_maps['optional'] = {
-                'arithmetic_binary_style1': np.zeros((h, w), dtype=np.float32),
-                'arithmetic_binary_style2': np.zeros((h, w), dtype=np.float32),
-                'arithmetic_binary_style3': np.zeros((h, w), dtype=np.float32),
-                'geometric_binary_style1': np.zeros((h, w), dtype=np.float32),
-                'geometric_binary_style2': np.zeros((h, w), dtype=np.float32),
-                'geometric_binary_style3': np.zeros((h, w), dtype=np.float32),
-            }
     
     def _get_xy_from_patch_coords(rec) -> tuple:
         coords = rec.get("patch_coords", (None, []))[1]
@@ -1756,40 +1897,12 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
                 'geometric_binary_style3': record.get("anomaly_map_geometric_binary_style3", [None, patch_geometric_binary])[1].squeeze()[:patch_height, :patch_width],
             })
         
-        # Assign or accumulate regions to anomaly maps
-        if use_mean_aggregation:
-            # Accumulate values and counts for mean aggregation
-            for map_name, region in patch_regions.items():
-                if map_name in anomaly_maps['required']:
-                    anomaly_maps['required'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] += region
-                    count_maps['required'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] += 1
-                elif enable_save_optional_image_results and map_name in anomaly_maps['optional']:
-                    anomaly_maps['optional'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] += region
-                    count_maps['optional'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] += 1
-        else:
-            # Direct assignment (original behavior)
-            for map_name, region in patch_regions.items():
-                if map_name in anomaly_maps['required']:
-                    anomaly_maps['required'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] = region
-                elif enable_save_optional_image_results and map_name in anomaly_maps['optional']:
-                    anomaly_maps['optional'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] = region
-    
-    # Compute mean if using aggregation
-    if use_mean_aggregation:
-        # Compute mean for required maps
-        for map_name in anomaly_maps['required']:
-            count_map = count_maps['required'][map_name]
-            # Avoid division by zero
-            valid_mask = count_map > 0
-            anomaly_maps['required'][map_name][valid_mask] /= count_map[valid_mask]
-        
-        # Compute mean for optional maps if enabled
-        if enable_save_optional_image_results:
-            for map_name in anomaly_maps['optional']:
-                count_map = count_maps['optional'][map_name]
-                # Avoid division by zero
-                valid_mask = count_map > 0
-                anomaly_maps['optional'][map_name][valid_mask] /= count_map[valid_mask]
+        # Assign required regions to anomaly maps
+        for map_name, region in patch_regions.items():
+            if map_name in anomaly_maps['required']:
+                anomaly_maps['required'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] = region
+            elif enable_save_optional_image_results and map_name in anomaly_maps['optional']:
+                anomaly_maps['optional'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] = region
     
     # Define image configurations
     image_configs = {
@@ -1870,6 +1983,7 @@ def save_image_results_from_records(checkpoint_manager: CheckpointManager, image
     with open(result_path, 'w') as f:
         json.dump(evaluation_result, f, indent=2)
 
+
 def _process_batch_records_immediately(args, batch_records, ground_truth_map, original_images, 
                                      checkpoint_manager, output_subdir, image_to_records):
     """
@@ -1930,7 +2044,7 @@ def _process_batch_records_immediately(args, batch_records, ground_truth_map, or
                     patch_y=patch_y,
                 )
             except Exception as e:
-                debug_print(f"⚠️  Failed to save patch-level result: {e}")
+                debug_print(f"⚠️  Failed to save patch-level result: {e}", debug=DEBUG_ENABLED)
 
 def _finalize_incremental_processing(args, total_records, normal_records_count, defect_records_count, 
                                    image_to_records, ground_truth_map, output_subdir):
@@ -1962,7 +2076,7 @@ def _finalize_incremental_processing(args, total_records, normal_records_count, 
         
         # Save JSON results if enabled
         if args.enable_save_json_results:
-            debug_print("💾 Saving JSON results...")
+            debug_print("💾 Saving JSON results...", debug=DEBUG_ENABLED)
             # Convert image_to_records back to a flat list for JSON saving
             all_records = []
             for img_records in image_to_records.values():
@@ -1978,7 +2092,7 @@ def _finalize_incremental_processing(args, total_records, normal_records_count, 
         
         # Process whole image results if enabled
         if args.enable_save_whole_image_results:
-            debug_print("🖼️ Processing whole image results...")
+            debug_print("🖼️ Processing whole image results...", debug=DEBUG_ENABLED)
             checkpoint_manager = CheckpointManager(args.results_dir, args.annotation_dir, args.force_rerun)
             
             for img_path, image_records in image_to_records.items():
@@ -2003,9 +2117,7 @@ def _finalize_incremental_processing(args, total_records, normal_records_count, 
                 overlapping = set()
 
                 try:
-                    # Use mean aggregation when stride is smaller than patch_size
-                    use_mean_aggregation = args.stride is not None and args.stride < args.patch_size
-                    save_image_results_from_records(
+                    save_image_results_from_records2(
                         checkpoint_manager,
                         img_path,
                         image_records,
@@ -2014,14 +2126,13 @@ def _finalize_incremental_processing(args, total_records, normal_records_count, 
                         overlapping,
                         enable_save_optional_image_results=args.enable_save_optional_image_results,
                         patch_size=args.patch_size,
-                        use_mean_aggregation=use_mean_aggregation,
                     )
                 except Exception as e:
-                    debug_print(f"⚠️  Failed to save image-level results for {img_path}: {e}")
+                    debug_print(f"⚠️  Failed to save image-level results for {img_path}: {e}", debug=DEBUG_ENABLED)
         
         # Create Excel report if enabled
         if args.enable_excel_report:
-            debug_print("📊 Creating Excel report...")
+            debug_print("📊 Creating Excel report...", debug=DEBUG_ENABLED)
             # Convert image_to_records back to a flat list for Excel report
             all_records = []
             for img_records in image_to_records.values():
@@ -2030,9 +2141,9 @@ def _finalize_incremental_processing(args, total_records, normal_records_count, 
             make_excel(all_records, output_subdir, args.split, args.object_class)
             
     except Exception as e:
-        debug_print(f"⚠️  Error in final processing: {e}")
+        debug_print(f"⚠️  Error in final processing: {e}", debug=DEBUG_ENABLED)
     
-    debug_print("✅ Incremental processing completed successfully!")
+    debug_print("✅ Incremental processing completed successfully!", debug=DEBUG_ENABLED)
     return metrics
 
 def validate_mode_arguments(args):
@@ -2550,14 +2661,13 @@ def main():
                 json.dump({test_name: test_args}, config_file, indent=2)
             
             # Debug: Print final argument values for this test
-            debug_print(f"🔍 Final argument values for {test_name}:")
-            debug_print(f"   mode: {test_args_obj.mode}")
-            debug_print(f"   batch_num: {test_args_obj.batch_num}")
-            debug_print(f"   patch_size: {test_args_obj.patch_size}")
-            debug_print(f"   stride: {test_args_obj.stride}")
-            debug_print(f"   annotation_dir: {test_args_obj.annotation_dir}")
-            debug_print(f"   pretrained: {test_args_obj.pretrained}")
-            debug_print(f"   results_dir: {test_args_obj.results_dir}")
+            debug_print(f"🔍 Final argument values for {test_name}:", debug=DEBUG_ENABLED)
+            debug_print(f"   mode: {test_args_obj.mode}", debug=DEBUG_ENABLED)
+            debug_print(f"   patch_size: {test_args_obj.patch_size}", debug=DEBUG_ENABLED)
+            debug_print(f"   stride: {test_args_obj.stride}", debug=DEBUG_ENABLED)
+            debug_print(f"   annotation_dir: {test_args_obj.annotation_dir}", debug=DEBUG_ENABLED)
+            debug_print(f"   pretrained: {test_args_obj.pretrained}", debug=DEBUG_ENABLED)
+            debug_print(f"   results_dir: {test_args_obj.results_dir}", debug=DEBUG_ENABLED)
             
             # Execute the selected mode for this test configuration
             try:

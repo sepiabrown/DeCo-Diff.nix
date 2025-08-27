@@ -591,3 +591,14 @@ def load_original_images(image_paths: Set[str]) -> Dict[str, np.ndarray]:
             print(f"Warning: Error loading original image {image_path}: {e}")
     
     return original_images
+
+def debug_print(*args, debug: bool = False, **kwargs):
+    """Print debug messages only if debug mode is enabled.
+    
+    Args:
+        *args: Arguments to print
+        debug: Enable debug output (default: False)
+        **kwargs: Additional keyword arguments for print function
+    """
+    if debug:
+        print(*args, **kwargs)
