@@ -43,6 +43,19 @@ Usage examples:
 
   # Enable debug logging for troubleshooting
   python evaluate_and_process.py --mode save_only --annotation-dir path/to/annotations --pretrained model.pt --debug
+
+DISTRIBUTED FOLDER STRUCTURE:
+This script automatically distributes .npy files across multiple folders to avoid Windows performance issues
+with too many files in a single folder. When saving intermediate NPY files:
+
+- Files are distributed across folders: results/evaluation_results/part_0000/, part_0001/, etc.
+- Each folder contains approximately 100,000 files total (adaptive based on files per patch set)
+- Each patch set typically consists of 4 files: _encodedrecon.npy, _latent.npy, _anomaly_map_arithmetic.npy, _coords.npy
+- The file count per patch set is dynamically calculated at runtime for flexibility
+- The loading functions automatically search across all distributed folders
+- For small datasets, files are saved in the base evaluation_results folder (no distribution needed)
+
+This optimization ensures optimal performance on Windows systems while maintaining full compatibility.
 """
 
 from __future__ import annotations
@@ -90,14 +103,15 @@ from utils import (
     _to_numpy,
     _binary_mask,
     _binary_mask_exclude_boundary3,
-    load_original_images
+    load_original_images,
+    load_ground_truth_map
 )
 
 # Import from process_raw_data_to_results.py
 from evaluation_DeCo_Diff2 import (
     make_record, add_metric_fields,
     _get_largest_connected_component_pixels, _create_contour_based_binary_mask_single,
-    CheckpointManager, save_patch_results_from_records,
+    save_patch_results_from_records,
     determine_image_status, compute_y_true_y_score, compute_metrics_from_y_true_y_score,
     make_excel, plot_accuracy_results, save_perturbation_results, draw_patch_rectangles_on_image,
     EvaluationMetrics
@@ -105,12 +119,541 @@ from evaluation_DeCo_Diff2 import (
 
 # Import from process_raw_data_to_results.py
 from process_raw_data_to_results import (
-    load_ground_truth_map,
-    load_original_images,
     parse_filename_to_info,
     load_raw_data_files,
     compute_simple_metrics,
 )
+
+# ============================================================================
+# INLINED CLASSES AND FUNCTIONS FROM evaluation_DeCo_Diff2.py
+# ============================================================================
+
+class CheckpointManager:
+    """Manages checkpoint/resume functionality for evaluation."""
+    
+    def __init__(self, results_dir: str, annotation_dir: str | None = None, force_rerun: bool = False):
+        self.results_dir = results_dir
+        self.annotation_dir = annotation_dir
+        self.force_rerun = force_rerun
+        
+        # Extract base name without timestamp for consistent checkpoint location
+        base_name = self._extract_base_name(results_dir)
+        self.base_checkpoint_dir = os.path.join(os.path.dirname(results_dir), f"{base_name}_checkpoints")
+        
+        # Create checkpoint directory
+        os.makedirs(self.base_checkpoint_dir, exist_ok=True)
+        
+        self.checkpoint_file = os.path.join(self.base_checkpoint_dir, "evaluation_checkpoint.json")
+
+        # Create evaluation_results directory at the base results level (shared across all runs)
+        base_results_dir = os.path.dirname(results_dir) if os.path.basename(results_dir) != "results" else results_dir
+        self.evaluation_results_dir = os.path.join(base_results_dir, "evaluation_results")
+        os.makedirs(self.evaluation_results_dir, exist_ok=True)
+        
+        # Clear checkpoint files if force rerun is enabled
+        if self.force_rerun:
+            self.clear_checkpoint_files()
+            print("Force rerun enabled: Cleared existing checkpoint files")
+        
+        # Cache for processed images to avoid frequent file I/O
+        self._processed_images_cache = None
+        self._cache_timestamp = 0
+    
+    def _extract_base_name(self, results_dir: str) -> str:
+        """Extract base name from timestamped directory."""
+        # Handle patterns like "test_name_250708_143022" -> "test_name"
+        dir_name = os.path.basename(results_dir)
+        
+        # Try to find the last underscore followed by timestamp pattern
+        import re
+        # Pattern for timestamp: YYMMDD_HHMMSS
+        timestamp_pattern = r'_\d{6}_\d{6}$'
+        match = re.search(timestamp_pattern, dir_name)
+        
+        if match:
+            # Remove the timestamp part
+            base_name = dir_name[:match.start()]
+            return base_name
+        else:
+            # If no timestamp pattern found, use the original name
+            return dir_name
+    
+    def find_latest_checkpoint(self) -> str:
+        """Find the latest checkpoint file from the specific checkpoint directory."""
+        if os.path.exists(self.checkpoint_file):
+            return self.checkpoint_file
+        
+        # Look for checkpoint in the specific directory based on base name
+        # e.g., if results_dir is "test_250711_162955", look for "test_checkpoints"
+        base_name = self._extract_base_name(self.results_dir)
+        specific_checkpoint_dir = os.path.join(os.path.dirname(self.results_dir), f"{base_name}_checkpoints")
+        specific_checkpoint_file = os.path.join(specific_checkpoint_dir, "evaluation_checkpoint.json")
+        
+        if os.path.exists(specific_checkpoint_file):
+            print(f"Found existing checkpoint: {specific_checkpoint_file}")
+            return specific_checkpoint_file
+        
+        return self.checkpoint_file
+    
+    def get_checkpoint_data(self) -> dict:
+        """Load checkpoint data if it exists."""
+        checkpoint_file = self.find_latest_checkpoint()
+        if os.path.exists(checkpoint_file):
+            try:
+                with open(checkpoint_file, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError):
+                pass
+        return {"current_image_index": 0, "processed_images": []}
+    
+    def _get_processed_images_with_cache(self) -> set:
+        """Get processed images with caching to avoid frequent file I/O."""
+        # Check if cache is valid (file hasn't been modified since last cache)
+        checkpoint_file = self.find_latest_checkpoint()
+        if os.path.exists(checkpoint_file):
+            current_timestamp = os.path.getmtime(checkpoint_file)
+            if (self._processed_images_cache is not None and 
+                self._cache_timestamp == current_timestamp):
+                return self._processed_images_cache
+        
+        # Load from file and update cache
+        checkpoint_data = self.get_checkpoint_data()
+        processed_images = set(checkpoint_data.get("processed_images", []))
+        
+        # Update cache
+        self._processed_images_cache = processed_images
+        self._cache_timestamp = current_timestamp if os.path.exists(checkpoint_file) else 0
+        
+        return processed_images
+    
+    def save_checkpoint(self, current_image_index: int, processed_images: list):
+        """Save current progress to checkpoint file."""
+        # Get existing checkpoint data to preserve processed_images
+        existing_data = self.get_checkpoint_data()
+        
+        # Merge processed images from both sources (optimized)
+        existing_processed = set(existing_data.get("processed_images", []))
+        new_processed = set(processed_images)
+        
+        # Only merge if there are actually new images to add
+        if new_processed - existing_processed:
+            merged_processed = list(existing_processed.union(new_processed))
+        else:
+            merged_processed = list(existing_processed)
+        
+        # Sort for consistent, predictable order (only when writing to file)
+        merged_processed.sort()
+        
+        checkpoint_data = {
+            "current_image_index": current_image_index,
+            "processed_images": merged_processed,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        with open(self.checkpoint_file, 'w') as f:
+            json.dump(checkpoint_data, f, indent=2)
+        
+        # Invalidate cache since we just wrote to the file
+        self._processed_images_cache = None
+    
+    def get_processed_images(self) -> set:
+        """Get set of already processed images from checkpoint file."""
+        return self._get_processed_images_with_cache()
+    
+    def mark_image_processed(self, image_path: str):
+        """Mark an image as processed by updating the checkpoint file."""
+        # Use cache to avoid reading file again
+        processed_images = self._get_processed_images_with_cache()
+        
+        # Only update if image is not already processed
+        if image_path not in processed_images:
+            processed_images.add(image_path)
+            
+            # Get current checkpoint data
+            checkpoint_data = self.get_checkpoint_data()
+            # Sort for consistent, predictable order (only when writing to file)
+            checkpoint_data["processed_images"] = sorted(processed_images)
+            checkpoint_data["timestamp"] = datetime.now().isoformat()
+            
+            with open(self.checkpoint_file, 'w') as f:
+                json.dump(checkpoint_data, f, indent=2)
+            
+            # Update cache
+            self._processed_images_cache = processed_images
+            self._cache_timestamp = os.path.getmtime(self.checkpoint_file)
+    
+    def is_image_processed(self, image_path: str) -> bool:
+        """Check if an image has been fully processed."""
+        # If force rerun is enabled, no image is considered processed
+        if self.force_rerun:
+            return False
+        return image_path in self.get_processed_images()
+    
+    def get_resume_info(self, all_image_paths: list) -> tuple[int, list]:
+        """Get resume information for evaluation."""
+        # If force rerun is enabled, start from the beginning
+        if self.force_rerun:
+            print("Force rerun enabled: Starting from the beginning")
+            return 0, []
+        
+        checkpoint_data = self.get_checkpoint_data()
+        processed_images = self.get_processed_images()
+        
+        # Find the first unprocessed image
+        current_index = 0
+        for i, image_path in enumerate(all_image_paths):
+            if image_path not in processed_images:
+                current_index = i
+                break
+        else:
+            # All images processed
+            current_index = len(all_image_paths)
+        
+        return current_index, sorted(processed_images)
+    
+    def cleanup_checkpoint(self):
+        """Clean up checkpoint files after successful completion."""
+        if os.path.exists(self.checkpoint_file):
+            os.remove(self.checkpoint_file)
+        
+        # Also clean up the checkpoint directory if it's empty
+        try:
+            if os.path.exists(self.base_checkpoint_dir) and not os.listdir(self.base_checkpoint_dir):
+                os.rmdir(self.base_checkpoint_dir)
+        except OSError:
+            pass  # Directory not empty or already removed
+
+    def clear_checkpoint_files(self):
+        """Clear all checkpoint files to force a fresh start."""
+        if os.path.exists(self.checkpoint_file):
+            os.remove(self.checkpoint_file)
+            print(f"Removed checkpoint file: {self.checkpoint_file}")
+        
+        # Clear cache
+        self._processed_images_cache = None
+        self._cache_timestamp = 0
+    
+    def batch_mark_images_processed(self, image_paths: list):
+        """Mark multiple images as processed in a single operation for better performance."""
+        if not image_paths:
+            return
+        
+        # Use cache to avoid reading file again
+        processed_images = self._get_processed_images_with_cache()
+        
+        # Find new images to add
+        new_images = [img for img in image_paths if img not in processed_images]
+        
+        if new_images:
+            # Add new images
+            processed_images.update(new_images)
+            
+            # Get current checkpoint data
+            checkpoint_data = self.get_checkpoint_data()
+            # Sort for consistent, predictable order (only when writing to file)
+            checkpoint_data["processed_images"] = sorted(processed_images)
+            checkpoint_data["timestamp"] = datetime.now().isoformat()
+            
+            with open(self.checkpoint_file, 'w') as f:
+                json.dump(checkpoint_data, f, indent=2)
+            
+            # Update cache
+            self._processed_images_cache = processed_images
+            self._cache_timestamp = os.path.getmtime(self.checkpoint_file)
+    
+    def print_checkpoint_status(self):
+        """Print current checkpoint status for debugging."""
+        checkpoint_file = self.find_latest_checkpoint()
+        
+        print(f"Checkpoint directory: {self.base_checkpoint_dir}")
+        print(f"Current checkpoint file: {checkpoint_file}")
+        
+        if os.path.exists(checkpoint_file):
+            try:
+                with open(checkpoint_file, 'r') as f:
+                    data = json.load(f)
+                    print(f"Checkpoint timestamp: {data.get('timestamp', 'unknown')}")
+                    print(f"Current image index: {data.get('current_image_index', 0)}")
+                    print(f"Processed images count: {len(data.get('processed_images', []))}")
+                    if data.get('processed_images'):
+                        print(f"Last processed: {data['processed_images'][-1]}")
+            except Exception as e:
+                print(f"Error reading checkpoint: {e}")
+        else:
+            print("No checkpoint file found")
+
+
+class ImageProcessor:
+    """Utility class for common image processing operations."""
+    
+    @staticmethod
+    def create_anomaly_map_image(anomaly_map, predicted_defective_set, ground_truth_defective, overlapping, is_binary=True, patch_size=128, add_grid=True, grid_color=(255, 255, 255), grid_thickness=1):
+        """Create anomaly map visualization with optional grid overlay and patch prediction rectangles."""
+        if is_binary:
+            # Binary map: 0 or 1 - create custom red colormap
+            anomaly_map_img = (anomaly_map * 255).astype(np.uint8)
+            # Create custom colormap: 0 -> transparent (black), 255 -> pure red
+            h, w = anomaly_map_img.shape
+            anomaly_map_colored_bgr = np.zeros((h, w, 3), dtype=np.uint8)
+            # Set red channel based on anomaly values (0 = transparent/black, 255 = pure red)
+            anomaly_map_colored_bgr[:, :, 2] = anomaly_map_img  # Red channel (BGR format)
+        else:
+            anomaly_map_img = (anomaly_map * 255).astype(np.uint8)
+            anomaly_map_colored_bgr = cv2.applyColorMap(anomaly_map_img, cv2.COLORMAP_HOT)
+
+        # Add grid overlay if requested
+        if add_grid:
+            h, w = anomaly_map.shape
+            
+            # Draw vertical grid lines
+            for x in range(patch_size, w, patch_size):
+                cv2.line(anomaly_map_colored_bgr, (x, 0), (x, h), grid_color, grid_thickness)
+            
+            # Draw horizontal grid lines
+            for y in range(patch_size, h, patch_size):
+                cv2.line(anomaly_map_colored_bgr, (0, y), (w, y), grid_color, grid_thickness)
+            
+            # Draw border around the entire image
+            cv2.rectangle(anomaly_map_colored_bgr, (0, 0), (w-1, h-1), grid_color, grid_thickness)
+        
+        # Convert BGR to RGB for proper display
+        anomaly_map_colored = cv2.cvtColor(anomaly_map_colored_bgr, cv2.COLOR_BGR2RGB)
+        
+        # Add patch prediction rectangles if provided
+        if predicted_defective_set is not None and ground_truth_defective is not None and overlapping is not None:
+            anomaly_map_colored = draw_patch_rectangles_on_image(
+                anomaly_map_colored, 
+                predicted_defective_set, 
+                ground_truth_defective, 
+                overlapping, 
+                patch_size=patch_size, 
+                grid_thickness=grid_thickness
+            )
+        
+        return anomaly_map_colored
+    
+    @staticmethod
+    def create_anomaly_overlay(original_img, anomaly_map, alpha=0.6, is_binary=True):
+        """Create overlay of anomaly map on original image."""
+        if is_binary:
+            # Binary overlay using pure red
+            overlay = original_img.copy()
+            mask = anomaly_map > 0
+            # Create pure red overlay for anomaly regions
+            h, w = anomaly_map.shape
+            anomaly_colored = np.zeros((h, w, 3), dtype=np.uint8)
+            # Set red channel for anomaly regions (pure red)
+            anomaly_colored[mask, 0] = 255  # Red channel (RGB format)
+            # Apply the red anomaly regions to the overlay
+            overlay[mask] = anomaly_colored[mask]
+        else:
+            # Continuous overlay using HOT colormap
+            # Convert [0, 1] range to [0, 255] range for colormap
+            anomaly_map_uint8 = (anomaly_map * 255).astype(np.uint8)
+            
+            # Apply HOT colormap to the map (returns BGR)
+            anomaly_colored_bgr = cv2.applyColorMap(anomaly_map_uint8, cv2.COLORMAP_HOT)
+            # Convert BGR to RGB for proper overlay
+            anomaly_colored = cv2.cvtColor(anomaly_colored_bgr, cv2.COLOR_BGR2RGB)
+            # Create overlay using alpha blending
+            overlay = cv2.addWeighted(original_img, 1-alpha, anomaly_colored, alpha, 0)
+        
+        return overlay.astype(np.uint8)
+
+
+def save_image_results_from_records(marked_images_dir: str, evaluation_results_dir: str, image_path: str, 
+                                  image_records: list, 
+                                  predicted_defective_set: set, ground_truth_defective: set, overlapping: set,
+                                  enable_save_optional_image_results: bool = False, patch_size: int = 256):
+    """Save all results for a single image immediately using records."""
+    from utils import path_to_safe_filename
+    
+    safe_name = path_to_safe_filename(image_path)
+    
+    # Create status-based subfolders in the provided marked_images_dir
+    status_folders = {}
+    for status in ['TP', 'FN', 'FP', 'TN']:
+        status_dir = os.path.join(marked_images_dir, status)
+        os.makedirs(status_dir, exist_ok=True)
+        status_folders[status] = status_dir
+    
+    # Determine the overall status of this image based on its patches
+    image_status = determine_image_status(image_records)
+    
+    # Debug: Print status information
+    status_counts = {'TP': 0, 'FN': 0, 'FP': 0, 'TN': 0}
+    for record in image_records:
+        status = record["status"][1]
+        if status in status_counts:
+            status_counts[status] += 1
+    #print(f"Image {os.path.basename(image_path)} status: {image_status} (TP:{status_counts['TP']}, FN:{status_counts['FN']}, FP:{status_counts['FP']}, TN:{status_counts['TN']})")
+    
+    # Load original image
+    original_img = np.array(PILImage.open(image_path).convert('RGB'))
+    h, w, _ = original_img.shape
+    
+    # Save marked image (always saved) in the appropriate status folder
+    marked_img = draw_patch_rectangles_on_image(
+        original_img, predicted_defective_set, ground_truth_defective, overlapping, patch_size=patch_size, grid_thickness=1
+    )
+    marked_path = os.path.join(status_folders[image_status], f"{safe_name}__marked.png")
+    PILImage.fromarray(marked_img).save(marked_path)
+    
+    # Also save image-level images without classification
+    image_level_dir = os.path.join(marked_images_dir, "image_level")
+    os.makedirs(image_level_dir, exist_ok=True)
+    image_level_path = os.path.join(image_level_dir, f"{safe_name}__marked.png")
+    PILImage.fromarray(marked_img).save(image_level_path)
+    
+    # Initialize anomaly maps based on flag
+    anomaly_maps = {
+        'required': {
+            'arithmetic': np.zeros((h, w), dtype=np.float32),
+            'arithmetic_binary': np.zeros((h, w), dtype=np.float32),
+            'geometric': np.zeros((h, w), dtype=np.float32),
+            'geometric_binary': np.zeros((h, w), dtype=np.float32),
+        }
+    }
+    
+    # Initialize optional maps only when flag is enabled
+    if enable_save_optional_image_results:
+        anomaly_maps['optional'] = {
+            'arithmetic_binary_style1': np.zeros((h, w), dtype=np.float32),
+            'arithmetic_binary_style2': np.zeros((h, w), dtype=np.float32),
+            'arithmetic_binary_style3': np.zeros((h, w), dtype=np.float32),
+            'geometric_binary_style1': np.zeros((h, w), dtype=np.float32),
+            'geometric_binary_style2': np.zeros((h, w), dtype=np.float32),
+            'geometric_binary_style3': np.zeros((h, w), dtype=np.float32),
+        }
+    
+    def _get_xy_from_patch_coords(rec) -> tuple:
+        coords = rec.get("patch_coords", (None, []))[1]
+        if isinstance(coords, (list, tuple)) and len(coords) == 8:
+            return int(coords[0]), int(coords[1])  # top-left from 8-value
+        raise ValueError(f"Expected 8-value patch_coords, got: {coords}")
+
+    for record in image_records:
+        # Extract coordinates from record (supports 8- or 2-value formats)
+        x_coord, y_coord = _get_xy_from_patch_coords(record)
+        
+        # Calculate actual patch dimensions for this position
+        patch_width = min(patch_size, w - x_coord)
+        patch_height = min(patch_size, h - y_coord)
+        
+        # Extract required anomaly maps from record
+        patch_arithmetic = record["anomaly_map_arithmetic"][1]
+        patch_arithmetic_binary = record["anomaly_map_arithmetic_binary"][1]
+        patch_geometric = record["anomaly_map_geometric"][1]
+        patch_geometric_binary = record["anomaly_map_geometric_binary"][1]
+        
+        # Extract patch regions
+        patch_regions = {
+            'arithmetic': patch_arithmetic.squeeze()[:patch_height, :patch_width],
+            'arithmetic_binary': patch_arithmetic_binary.squeeze()[:patch_height, :patch_width],
+            'geometric': patch_geometric.squeeze()[:patch_height, :patch_width],
+            'geometric_binary': patch_geometric_binary.squeeze()[:patch_height, :patch_width],
+        }
+        
+        # Extract optional patch regions if flag is enabled
+        if enable_save_optional_image_results:
+            # Use default binary maps as fallback for style fields
+            patch_regions.update({
+                'arithmetic_binary_style1': record.get("anomaly_map_arithmetic_binary_style1", [None, patch_arithmetic_binary])[1].squeeze()[:patch_height, :patch_width],
+                'arithmetic_binary_style2': record.get("anomaly_map_arithmetic_binary_style2", [None, patch_arithmetic_binary])[1].squeeze()[:patch_height, :patch_width],
+                'arithmetic_binary_style3': record.get("anomaly_map_arithmetic_binary_style3", [None, patch_arithmetic_binary])[1].squeeze()[:patch_height, :patch_width],
+                'geometric_binary_style1': record.get("anomaly_map_geometric_binary_style1", [None, patch_geometric_binary])[1].squeeze()[:patch_height, :patch_width],
+                'geometric_binary_style2': record.get("anomaly_map_geometric_binary_style2", [None, patch_geometric_binary])[1].squeeze()[:patch_height, :patch_width],
+                'geometric_binary_style3': record.get("anomaly_map_geometric_binary_style3", [None, patch_geometric_binary])[1].squeeze()[:patch_height, :patch_width],
+            })
+        
+        # Assign required regions to anomaly maps
+        for map_name, region in patch_regions.items():
+            if map_name in anomaly_maps['required']:
+                anomaly_maps['required'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] = region
+            elif enable_save_optional_image_results and map_name in anomaly_maps['optional']:
+                anomaly_maps['optional'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] = region
+    
+    # Define image configurations
+    image_configs = {
+        'required': [
+            (anomaly_maps['required']['arithmetic'], "am_ar", False),
+            (anomaly_maps['required']['arithmetic_binary'], "am_ar_bin", True),
+            (anomaly_maps['required']['geometric'], "am_ge", False),
+            (anomaly_maps['required']['geometric_binary'], "am_ge_bin", True),
+        ]
+    }
+    
+    # Add optional configurations if flag is enabled
+    if enable_save_optional_image_results:
+        image_configs['optional'] = [
+            (anomaly_maps['optional']['arithmetic_binary_style1'], "am_ar_bin_st1", True),
+            (anomaly_maps['optional']['arithmetic_binary_style2'], "am_ar_bin_st2", True),
+            (anomaly_maps['optional']['arithmetic_binary_style3'], "am_ar_bin_st3", True),
+            (anomaly_maps['optional']['geometric_binary_style1'], "am_ge_bin_st1", True),
+            (anomaly_maps['optional']['geometric_binary_style2'], "am_ge_bin_st2", True),
+            (anomaly_maps['optional']['geometric_binary_style3'], "am_ge_bin_st3", True),
+        ]
+    
+    # Save all configured images in the appropriate status folder
+    for _config_type, configs in image_configs.items():
+        for anomaly_map, suffix, is_binary in configs:
+            # Save anomaly map image
+            anomaly_map_img = ImageProcessor.create_anomaly_map_image(
+                anomaly_map, predicted_defective_set, ground_truth_defective, 
+                overlapping, is_binary=is_binary, patch_size=patch_size, add_grid=True
+            )
+            anomaly_map_path = os.path.join(status_folders[image_status], f"{safe_name}__{suffix}.png")
+            PILImage.fromarray(anomaly_map_img).save(anomaly_map_path)
+            
+            # Save overlay image
+            overlay_img = ImageProcessor.create_anomaly_overlay(original_img, anomaly_map, alpha=0.8, is_binary=is_binary)
+            overlay_path = os.path.join(status_folders[image_status], f"{safe_name}__ao_{suffix}.png")
+            PILImage.fromarray(overlay_img).save(overlay_path)
+            
+            # Save marked overlay image
+            marked_overlay_img = draw_patch_rectangles_on_image(overlay_img, predicted_defective_set, ground_truth_defective, overlapping, patch_size=patch_size, grid_thickness=1)
+            marked_overlay_path = os.path.join(status_folders[image_status], f"{safe_name}__mo_{suffix}.png")
+            PILImage.fromarray(marked_overlay_img).save(marked_overlay_path)
+            
+            # Also save to image_level directory (without classification)
+            image_level_anomaly_path = os.path.join(image_level_dir, f"{safe_name}__{suffix}.png")
+            PILImage.fromarray(anomaly_map_img).save(image_level_anomaly_path)
+            
+            image_level_overlay_path = os.path.join(image_level_dir, f"{safe_name}__ao_{suffix}.png")
+            PILImage.fromarray(overlay_img).save(image_level_overlay_path)
+            
+            image_level_marked_overlay_path = os.path.join(image_level_dir, f"{safe_name}__mo_{suffix}.png")
+            PILImage.fromarray(marked_overlay_img).save(image_level_marked_overlay_path)
+    
+    # Save evaluation results
+    patch_analysis = []
+    for record in image_records:
+        x, y = _get_xy_from_patch_coords(record)
+        anomaly_map = record["anomaly_map_arithmetic_binary"][1]
+        anomaly_pixels = int(np.sum(anomaly_map))
+        grid_row = y // patch_size
+        grid_col = x // patch_size
+        patch_analysis.append({
+            "grid_row": grid_row,
+            "grid_col": grid_col,
+            "anomaly_max": record["anomaly_max"][1],
+            "anomaly_pixels":record["anomaly_pixels"][1],
+            "status": record["status"][1]
+        })
+    
+    result_filename = f"{safe_name}__evaluation.json"
+    result_path = os.path.join(evaluation_results_dir, result_filename)
+    evaluation_result = {
+        "image_path": image_path,
+        "patch_analysis": patch_analysis,
+        "grid_size": patch_size
+    }
+    with open(result_path, 'w') as f:
+        json.dump(evaluation_result, f, indent=2)
+
+# ============================================================================
+# END OF INLINED CLASSES AND FUNCTIONS
+# ============================================================================
 
 # Set up device
 torch.set_grad_enabled(False)
@@ -309,12 +852,20 @@ def _process_single_patch(
         # Extract coordinates
         x_coord, y_coord = coords_8_values[0], coords_8_values[1]
         
-        # Check if image exists in original images
-        if current_image_path not in original_images:
-            debug_print(f"⚠️  Image not found in original_images: {current_image_path}", debug=DEBUG_ENABLED)
-            return None
+        # Get image from cache (handles both dict and cache objects)
+        if hasattr(original_images, 'get'):
+            # It's a cache object
+            original_image = original_images.get(current_image_path)
+        else:
+            # It's a regular dictionary
+            if current_image_path not in original_images:
+                debug_print(f"⚠️  Image not found in original_images: {current_image_path}", debug=DEBUG_ENABLED)
+                return None
+            original_image = original_images[current_image_path]
         
-        original_image = original_images[current_image_path]
+        if original_image is None:
+            debug_print(f"⚠️  Failed to load image: {current_image_path}", debug=DEBUG_ENABLED)
+            return None
         
         # Process anomaly maps
         anomaly_map_arithmetic_tensor, anomaly_binary_cropped, anomaly_pixels, binary_map_numpy = _process_anomaly_maps(
@@ -1103,13 +1654,15 @@ def save_all_records_json(records: List[Record], output_dir: str, filename: str 
 
 def load_model_and_components(args):
     """Load VAE, model, and diffusion components."""
+    import glob
+
     # Load VAE
     if os.path.exists("./models/config.json"):
         vae = AutoencoderKL.from_pretrained("./models", local_files_only=True).to(device)
     else:
         vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae_type}").to(device)
     vae.eval()
-    
+
     # Load model
     try:
         if args.pretrained != "":
@@ -1126,9 +1679,9 @@ def load_model_and_components(args):
         else:
             path = f"./DeCo-Diff_{args.dataset}_{args.object_class}_{args.model_size}_{args.patch_size}"
             try:
-                ckpt = sorted(glob(f"{path}/last.pt"))[-1]
+                ckpt = sorted(glob.glob(f"{path}/last.pt"))[-1]
             except (IndexError, FileNotFoundError):
-                ckpt = sorted(glob(f"{path}/*/last.pt"))[-1]
+                ckpt = sorted(glob.glob(f"{path}/*/last.pt"))[-1]
     except (IndexError, FileNotFoundError, OSError) as e:
         raise Exception(f"Please provide the model's pretrained path using --pretrained. Error: {e}")
 
@@ -1222,6 +1775,112 @@ def _before_saving_results(args):
     
     return vae, model, diffusion, dataset, loader, evaluation_results_dir, checkpoint_manager
 
+# === Smart Image Cache Class ===
+class SmartImageCache:
+    """Smart LRU cache for images with memory-aware eviction."""
+    
+    def __init__(self, max_memory_gb=2.0, max_images=100):
+        # Import PIL here to avoid global import issues
+        from PIL import Image as PILImage
+        import numpy as np
+        self.PILImage = PILImage
+        self.np = np
+        self.max_memory_bytes = max_memory_gb * 1024 * 1024 * 1024
+        self.max_images = max_images
+        self.cache = {}
+        self.access_order = []  # Track access order for LRU
+        self.total_memory = 0
+        
+    def _get_memory_usage(self):
+        """Get current memory usage in bytes."""
+        import psutil
+        process = psutil.Process()
+        return process.memory_info().rss
+        
+    def _estimate_image_memory(self, image):
+        """Estimate memory usage of an image in bytes."""
+        if hasattr(image, 'nbytes'):
+            return image.nbytes
+        elif hasattr(image, '__sizeof__'):
+            return image.__sizeof__()
+        else:
+            # Fallback estimation: assume RGB image
+            return image.shape[0] * image.shape[1] * 3 * 4  # 4 bytes per float32
+        
+    def _evict_if_needed(self):
+        """Evict least recently used images if memory limit exceeded."""
+        import gc
+        while (self.total_memory > self.max_memory_bytes or 
+               len(self.cache) > self.max_images) and self.cache:
+            
+            # Remove least recently used image
+            lru_key = self.access_order.pop(0)
+            if lru_key in self.cache:
+                evicted_image = self.cache.pop(lru_key)
+                evicted_memory = self._estimate_image_memory(evicted_image)
+                self.total_memory -= evicted_memory
+                debug_print(f"🗑️  Evicted image from cache: {lru_key} (-{evicted_memory/1024/1024:.1f}MB)", debug=DEBUG_ENABLED)
+            
+            # Force garbage collection
+            gc.collect()
+    
+    def get(self, image_path):
+        """Get image from cache, loading it if not present."""
+        if image_path in self.cache:
+            # Move to end (most recently used)
+            self.access_order.remove(image_path)
+            self.access_order.append(image_path)
+            debug_print(f"📖 Cache hit: {os.path.basename(image_path)}", debug=DEBUG_ENABLED)
+            return self.cache[image_path]
+        
+        # Load image from disk
+        try:
+            debug_print(f"📥 Loading image: {os.path.basename(image_path)}", debug=DEBUG_ENABLED)
+            
+            # Try direct path first
+            if os.path.exists(image_path):
+                image = self.np.array(self.PILImage.open(image_path).convert('RGB'))
+            else:
+                # Try converting from safe filename
+                if '__' in image_path:
+                    from utils import safe_filename_to_path
+                    actual_path = safe_filename_to_path(image_path)
+                    if os.path.exists(actual_path):
+                        image = self.np.array(self.PILImage.open(actual_path).convert('RGB'))
+                    else:
+                        print(f"Warning: Image not found: {image_path} (tried: {actual_path})")
+                        return None
+                else:
+                    print(f"Warning: Image not found: {image_path}")
+                    return None
+            
+            # Add to cache
+            image_memory = self._estimate_image_memory(image)
+            self.cache[image_path] = image
+            self.access_order.append(image_path)
+            self.total_memory += image_memory
+            
+            debug_print(f"💾 Cached image: {os.path.basename(image_path)} (+{image_memory/1024/1024:.1f}MB)", debug=DEBUG_ENABLED)
+            
+            # Evict if needed
+            self._evict_if_needed()
+            
+            return image
+            
+        except Exception as e:
+            print(f"Warning: Error loading image {image_path}: {str(e)}")
+            return None
+    
+    def get_stats(self):
+        """Get cache statistics."""
+        return {
+            'cached_images': len(self.cache),
+            'total_memory_mb': self.total_memory / 1024 / 1024,
+            'max_memory_mb': self.max_memory_bytes / 1024 / 1024,
+            'memory_usage_percent': (self.total_memory / self.max_memory_bytes) * 100
+        }
+
+
 # === Shared streaming helpers (for both incremental eval and process_only) ===
 def _process_records_stream_incrementally(
     args,
@@ -1273,48 +1932,391 @@ def _process_records_stream_incrementally(
     else:
         patch_groups = patch_item_iter
 
-    # Process aggregated patches
-    for i, (current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw) in enumerate(patch_groups):
-        record = _process_single_patch(
-            ground_truth_map=ground_truth_map,
-            original_images=original_images,
-            anomaly_binary_threshold=args.anomaly_binary_threshold,
-            anomaly_pixel_num_threshold=args.anomaly_pixel_num_threshold,
-            patch_size=args.patch_size,
-            current_image_path=current_image_path,
-            coords_8_values=coords_8_values,
-            encodedrecon_raw=encodedrecon_raw,
-            latent_raw=latent_raw,
-            anomaly_map_arithmetic_raw=anomaly_map_arithmetic_raw,
-        )
-        if record is None:
-            continue
-        batch_records.append(record)
-        total_records += 1
-        is_predicted_defective = record.get("is_predicted_defective", (None, False))[1]
-        if is_predicted_defective:
-            defect_records_count += 1
-        else:
-            normal_records_count += 1
-        image_to_records[current_image_path].append(record)
-        
-        if len(batch_records) >= flush_every:
-            _process_batch_records_immediately(
-                args,
-                batch_records,
-                ground_truth_map,
-                original_images,
-                checkpoint_manager,
-                output_subdir,
-                image_to_records,
-            )
-            del batch_records
-            batch_records = []
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            import gc
-            gc.collect()
+    # Process aggregated patches in parallel using round-robin distribution
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+    from collections import defaultdict
     
+    # Configuration for round-robin parallel processing
+    if getattr(args, 'no_parallel', False):
+        # Sequential processing fallback
+        print("🐌 Sequential processing (parallel disabled)")
+        for i, (current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw) in tqdm(patch_groups, desc="Processing patches", unit="patch"):
+            record = _process_single_patch(
+                ground_truth_map=ground_truth_map,
+                original_images=original_images,
+                anomaly_binary_threshold=args.anomaly_binary_threshold,
+                anomaly_pixel_num_threshold=args.anomaly_pixel_num_threshold,
+                patch_size=args.patch_size,
+                current_image_path=current_image_path,
+                coords_8_values=coords_8_values,
+                encodedrecon_raw=encodedrecon_raw,
+                latent_raw=latent_raw,
+                anomaly_map_arithmetic_raw=anomaly_map_arithmetic_raw,
+            )
+            if record is None:
+                continue
+            batch_records.append(record)
+            total_records += 1
+            is_predicted_defective = record.get("is_predicted_defective", (None, False))[1]
+            if is_predicted_defective:
+                defect_records_count += 1
+            else:
+                normal_records_count += 1
+            image_to_records[current_image_path].append(record)
+
+            if len(batch_records) >= flush_every:
+                _process_batch_records_immediately(
+                    args,
+                    batch_records,
+                    ground_truth_map,
+                    original_images,
+                    checkpoint_manager,
+                    output_subdir,
+                    image_to_records,
+                )
+                del batch_records
+                batch_records = []
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+        return  # Exit early for sequential processing
+    
+    # Parallel processing configuration
+    if getattr(args, 'parallel_workers', None):
+        max_workers = args.parallel_workers
+        print(f"🚀 Using custom worker count: {max_workers}")
+    else:
+        max_workers = min(os.cpu_count() * 2, 16)  # Use more workers for better CPU utilization
+        print(f"🚀 Auto-detected workers: {max_workers} (from {os.cpu_count()} CPU cores)")
+    
+    # Convert patch_groups to list for chunk size calculation
+    patch_list = list(patch_groups)
+    total_patches = len(patch_list)
+    
+    if getattr(args, 'chunk_size', None):
+        chunk_size = args.chunk_size
+        print(f"🚀 Using custom chunk size: {chunk_size}")
+    else:
+        # Auto-calculate chunk size for round-robin distribution
+        chunk_size = max(1, total_patches // (max_workers * 4))  # Distribute work evenly
+        print(f"🚀 Auto-calculated chunk size: {chunk_size}")
+    
+    print(f"🚀 Round-robin parallel processing: {max_workers} workers, chunk size {chunk_size}")
+    
+    # Thread-safe counters and collections
+    total_records_lock = threading.Lock()
+    defect_records_lock = threading.Lock()
+    normal_records_lock = threading.Lock()
+    image_to_records_lock = threading.Lock()
+    
+    def process_patch_chunk(chunk_data, chunk_idx):
+        """Process a chunk of patches in parallel."""
+        chunk_records = []
+        chunk_total = 0
+        chunk_defects = 0
+        chunk_normals = 0
+        chunk_image_records = defaultdict(list)
+        
+        for current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw in chunk_data:
+            record = _process_single_patch(
+                ground_truth_map=ground_truth_map,
+                original_images=original_images,
+                anomaly_binary_threshold=args.anomaly_binary_threshold,
+                anomaly_pixel_num_threshold=args.anomaly_pixel_num_threshold,
+                patch_size=args.patch_size,
+                current_image_path=current_image_path,
+                coords_8_values=coords_8_values,
+                encodedrecon_raw=encodedrecon_raw,
+                latent_raw=latent_raw,
+                anomaly_map_arithmetic_raw=anomaly_map_arithmetic_raw,
+            )
+            if record is None:
+                continue
+                
+            chunk_records.append(record)
+            chunk_total += 1
+            is_predicted_defective = record.get("is_predicted_defective", (None, False))[1]
+            if is_predicted_defective:
+                chunk_defects += 1
+            else:
+                chunk_normals += 1
+            chunk_image_records[current_image_path].append(record)
+        
+        return {
+            'records': chunk_records,
+            'total': chunk_total,
+            'defects': chunk_defects,
+            'normals': chunk_normals,
+            'image_records': dict(chunk_image_records)
+        }
+    
+    # Use the already created patch_list for round-robin distribution
+    
+    # Process chunks using concurrent queues with immediate submission
+    from queue import Queue
+    import threading
+    
+    # Create queues for chunk submission and result collection
+    chunk_queue = Queue(maxsize=max_workers * 2)  # Limit queue size to prevent memory buildup
+    result_queue = Queue()
+    
+    # Track submitted and completed chunks
+    submitted_chunks = 0
+    completed_chunks = 0
+    total_chunks = (total_patches + chunk_size - 1) // chunk_size  # Calculate total chunks
+    
+    # Track active workers and utilization statistics with minimal overhead
+    from threading import Lock
+    import time
+    
+    # Check if monitoring is disabled for maximum performance
+    enable_monitoring = not getattr(args, 'no_worker_monitoring', False)
+    
+    if enable_monitoring:
+        # Use atomic operations where possible to reduce lock contention
+        active_workers_lock = Lock()
+        active_workers_count = 0
+        peak_active_workers = 0
+        total_worker_seconds = 0.0
+        processing_start_time = None
+        
+        # Batch progress updates to reduce overhead
+        progress_update_counter = 0
+        progress_update_interval = 5  # Update progress every 5 chunks
+        print(f"📊 Worker monitoring enabled (use --no-worker-monitoring to disable for max performance)")
+    else:
+        # Minimal monitoring for maximum performance
+        active_workers_lock = None
+        active_workers_count = 0
+        peak_active_workers = 0
+        total_worker_seconds = 0.0
+        processing_start_time = None
+        progress_update_counter = 0
+        progress_update_interval = 0  # Disable progress updates
+        print(f"⚡ Worker monitoring disabled for maximum performance")
+    
+    print(f"📊 Streaming round-robin: {total_chunks} chunks of ~{chunk_size} patches each")
+    print(f"🚀 Queue-based processing: max queue size {max_workers * 2}")
+    
+    # Worker function that processes chunks from the queue
+    def worker_consumer():
+        nonlocal completed_chunks, active_workers_count, peak_active_workers, total_worker_seconds, processing_start_time
+        while True:
+            try:
+                # Get chunk from queue with timeout to allow graceful shutdown
+                chunk_data = chunk_queue.get(timeout=1.0)
+                if chunk_data is None:  # Sentinel value to stop workers
+                    break
+                
+                # Mark worker as active with minimal lock time (conditional)
+                worker_start_time = time.time() if enable_monitoring else None
+                if enable_monitoring and active_workers_lock:
+                    with active_workers_lock:
+                        active_workers_count += 1
+                        if active_workers_count > peak_active_workers:
+                            peak_active_workers = active_workers_count
+                        if processing_start_time is None:
+                            processing_start_time = worker_start_time
+                
+                chunk_idx, chunk = chunk_data
+                chunk_result = process_patch_chunk(chunk, chunk_idx)
+                
+                # Put result in result queue
+                result_queue.put((chunk_idx, chunk_result))
+                
+                # Mark worker as inactive with minimal lock time (conditional)
+                if enable_monitoring and active_workers_lock:
+                    worker_end_time = time.time()
+                    worker_duration = worker_end_time - worker_start_time
+                    with active_workers_lock:
+                        active_workers_count -= 1
+                        total_worker_seconds += worker_duration
+                
+                # Mark task as done
+                chunk_queue.task_done()
+                
+            except Exception as e:
+                print(f"⚠️  Worker error: {e}")
+                # Mark worker as inactive even on error (conditional)
+                if enable_monitoring and active_workers_lock:
+                    with active_workers_lock:
+                        active_workers_count -= 1
+                chunk_queue.task_done()
+    
+    # Start worker threads
+    worker_threads = []
+    for i in range(max_workers):
+        worker = threading.Thread(target=worker_consumer, daemon=True)
+        worker.start()
+        worker_threads.append(worker)
+    
+    # Producer thread that submits chunks to the queue
+    def chunk_producer():
+        nonlocal submitted_chunks
+        for i in range(0, total_patches, chunk_size):
+            chunk = patch_list[i:i + chunk_size]
+            if chunk:  # Only submit non-empty chunks
+                chunk_idx = submitted_chunks
+                # Wait if queue is full (backpressure)
+                chunk_queue.put((chunk_idx, chunk))
+                submitted_chunks += 1
+        
+        # Send sentinel values to stop workers
+        for _ in range(max_workers):
+            chunk_queue.put(None)
+    
+    # Start producer thread
+    producer_thread = threading.Thread(target=chunk_producer, daemon=True)
+    producer_thread.start()
+    
+    # Process results as they arrive
+    with tqdm(total=total_chunks, desc="Processing chunks", unit="chunk") as pbar:
+        while completed_chunks < total_chunks:
+            try:
+                # Get result with timeout
+                chunk_idx, chunk_result = result_queue.get(timeout=1.0)
+                
+                # Aggregate chunk results with thread safety
+                with total_records_lock:
+                    total_records += chunk_result['total']
+                with defect_records_lock:
+                    defect_records_count += chunk_result['defects']
+                with normal_records_lock:
+                    normal_records_count += chunk_result['normals']
+                
+                # Add records to batch and image tracking
+                batch_records.extend(chunk_result['records'])
+                
+                with image_to_records_lock:
+                    for img_path, img_records in chunk_result['image_records'].items():
+                        image_to_records[img_path].extend(img_records)
+                
+                completed_chunks += 1
+                
+                # Get current active workers count (batched to reduce overhead)
+                if enable_monitoring:
+                    progress_update_counter += 1
+                    if progress_update_counter >= progress_update_interval:
+                        with active_workers_lock:
+                            current_active_workers = active_workers_count
+                        
+                        # Calculate worker utilization percentage
+                        worker_utilization = (current_active_workers / max_workers) * 100 if max_workers > 0 else 0
+                        
+                        pbar.set_postfix({
+                            'total': total_records,
+                            'defects': defect_records_count,
+                            'normals': normal_records_count,
+                            'batch_size': len(batch_records),
+                            'submitted': submitted_chunks,
+                            'completed': completed_chunks,
+                            'workers': f"{current_active_workers}/{max_workers}",
+                            'util': f"{worker_utilization:.0f}%"
+                        })
+                        progress_update_counter = 0
+                    else:
+                        # Lightweight progress update without worker stats
+                        pbar.set_postfix({
+                            'total': total_records,
+                            'defects': defect_records_count,
+                            'normals': normal_records_count,
+                            'batch_size': len(batch_records),
+                            'submitted': submitted_chunks,
+                            'completed': completed_chunks
+                        })
+                else:
+                    # Minimal progress update when monitoring is disabled
+                    pbar.set_postfix({
+                        'total': total_records,
+                        'defects': defect_records_count,
+                        'normals': normal_records_count,
+                        'batch_size': len(batch_records),
+                        'submitted': submitted_chunks,
+                        'completed': completed_chunks
+                    })
+                
+                pbar.update(1)
+                
+                # Show detailed worker status every 20 chunks (reduced frequency, conditional)
+                if enable_monitoring and completed_chunks % 20 == 0:
+                    with active_workers_lock:
+                        current_active_workers = active_workers_count
+                    worker_utilization = (current_active_workers / max_workers) * 100
+                    pbar.write(f"🔧 Worker Status: {current_active_workers}/{max_workers} active ({worker_utilization:.1f}% utilization)")
+                    pbar.write(f"   📊 Queue Status: {chunk_queue.qsize()}/{chunk_queue.maxsize} chunks in queue")
+                    pbar.write(f"   📈 Progress: {completed_chunks}/{total_chunks} chunks completed ({completed_chunks/total_chunks*100:.1f}%)")
+                
+                # Process batch when it reaches the flush threshold
+                if len(batch_records) >= flush_every:
+                    _process_batch_records_immediately(
+                        args,
+                        batch_records,
+                        ground_truth_map,
+                        original_images,
+                        checkpoint_manager,
+                        output_subdir,
+                        image_to_records,
+                    )
+                    del batch_records
+                    batch_records = []
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    import gc
+                    gc.collect()
+                    
+            except Exception as e:
+                print(f"⚠️  Error processing result: {e}")
+                completed_chunks += 1
+                pbar.update(1)
+    
+    # Wait for all threads to complete
+    producer_thread.join()
+    for worker in worker_threads:
+        worker.join()
+    
+    # Final worker utilization summary (conditional)
+    if enable_monitoring:
+        with active_workers_lock:
+            final_active_workers = active_workers_count
+            final_peak_workers = peak_active_workers
+            final_total_worker_seconds = total_worker_seconds
+            final_processing_start_time = processing_start_time
+        
+        # Calculate utilization statistics
+        if final_processing_start_time is not None:
+            total_processing_time = time.time() - final_processing_start_time
+            total_worker_time = max_workers * total_processing_time  # Total available worker time
+            actual_worker_time = final_total_worker_seconds  # Actual worker time used
+            average_utilization = (actual_worker_time / total_worker_time) * 100 if total_worker_time > 0 else 0
+        else:
+            total_processing_time = 0
+            average_utilization = 0
+        
+        print(f"✅ Queue-based processing completed: {submitted_chunks} chunks submitted, {completed_chunks} completed")
+        print(f"🔧 Worker Statistics:")
+        print(f"   📊 Peak active workers: {final_peak_workers}/{max_workers} ({final_peak_workers/max_workers*100:.1f}% peak utilization)")
+        print(f"   ⏱️  Total processing time: {total_processing_time:.2f}s")
+        print(f"   📈 Average worker utilization: {average_utilization:.1f}%")
+        print(f"   🎯 Final worker status: {final_active_workers}/{max_workers} workers active")
+        
+        if final_active_workers == 0:
+            print(f"✅ All workers properly shut down")
+        else:
+            print(f"⚠️  Warning: {final_active_workers} workers still active (should be 0)")
+        
+        # Performance insights
+        if average_utilization < 50:
+            print(f"💡 Performance insight: Low average utilization ({average_utilization:.1f}%) - consider reducing workers or increasing chunk size")
+        elif average_utilization > 90:
+            print(f"💡 Performance insight: High utilization ({average_utilization:.1f}%) - workers are well utilized")
+        else:
+            print(f"💡 Performance insight: Moderate utilization ({average_utilization:.1f}%) - good balance")
+    else:
+        print(f"✅ Queue-based processing completed: {submitted_chunks} chunks submitted, {completed_chunks} completed")
+        print(f"⚡ Processing completed with monitoring disabled for maximum performance")
+
     if batch_records:
         _process_batch_records_immediately(
             args,
@@ -1366,7 +2368,7 @@ def _aggregate_overlapping_patches(patch_item_iter, stride, patch_size, original
     # Collect all stride patches by image
     stride_patches_by_image = defaultdict(list)
     
-    for patch_data in patch_item_iter:
+    for patch_data in tqdm(patch_item_iter, desc="Collecting stride patches", unit="patch"):
         image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw = patch_data
         stride_x, stride_y = coords_8_values[0], coords_8_values[1]
         
@@ -1379,7 +2381,7 @@ def _aggregate_overlapping_patches(patch_item_iter, stride, patch_size, original
     
     reconstructed_patches = []
     
-    for image_path, stride_patches in stride_patches_by_image.items():
+    for image_path, stride_patches in tqdm(stride_patches_by_image.items(), desc="Processing images", unit="image"):
         debug_print(f"🔧 Processing {len(stride_patches)} stride patches for {image_path}")
         
         # Get image dimensions to determine grid positions
@@ -1407,7 +2409,7 @@ def _aggregate_overlapping_patches(patch_item_iter, stride, patch_size, original
         debug_print(f"🔧 Reconstructing {len(grid_positions)} grid patches from stride patches")
         
         # For each grid position, reconstruct the patch by averaging overlapping regions
-        for grid_x, grid_y in grid_positions:
+        for grid_x, grid_y in tqdm(grid_positions, desc=f"Reconstructing grid patches for {os.path.basename(image_path)}", unit="patch", leave=False):
             # Initialize accumulation arrays
             patch_shape = stride_patches[0]['encodedrecon_raw'].shape
             accumulated_encodedrecon = np.zeros(patch_shape, dtype=np.float64)
@@ -1499,7 +2501,7 @@ def _extract_image_path_from_batch(image_paths_batch, batch_index):
         value = image_paths_batch[batch_index]
     else:
         value = image_paths_batch[-1] if image_paths_batch else ""
-    
+
     if isinstance(value, str):
         return value
     elif isinstance(value, (list, tuple)):
@@ -1508,16 +2510,79 @@ def _extract_image_path_from_batch(image_paths_batch, batch_index):
         return str(value)
 
 
+def _get_distributed_npy_files(results_dir):
+    """
+    Get all .npy files from distributed folder structure.
+
+    Args:
+        results_dir: Base results directory
+
+    Returns:
+        List of paths to all _encodedrecon.npy files in distributed folders
+    """
+    import glob
+
+    base_eval_dir = os.path.join(results_dir, "evaluation_results")
+
+    # Find all part_XXXX folders
+    part_pattern = os.path.join(base_eval_dir, "part_*")
+    part_folders = glob.glob(part_pattern)
+
+    all_npy_files = []
+
+    if part_folders:
+        debug_print(f"🔍 Found {len(part_folders)} distributed folders", debug=DEBUG_ENABLED)
+        # Search in distributed folders
+        npy_pattern = os.path.join(base_eval_dir, "part_*", "*_encodedrecon.npy")
+        all_npy_files = glob.glob(npy_pattern)
+    else:
+        debug_print(f"🔍 No distributed folders found, searching in base folder", debug=DEBUG_ENABLED)
+        # Fallback to original behavior if no distributed folders
+        npy_pattern = os.path.join(base_eval_dir, "*_encodedrecon.npy")
+        all_npy_files = glob.glob(npy_pattern)
+
+    return all_npy_files
+
+
+def _count_distributed_folders(results_dir, files_per_patch_set=4):
+    """
+    Count the number of distributed folders and estimate total files.
+
+    Args:
+        results_dir: Base results directory
+        files_per_patch_set: Number of .npy files saved per patch set (default: 4 for backward compatibility)
+
+    Returns:
+        Tuple of (num_folders, estimated_total_files)
+    """
+    import glob
+
+    base_eval_dir = os.path.join(results_dir, "evaluation_results")
+    part_pattern = os.path.join(base_eval_dir, "part_*")
+    part_folders = glob.glob(part_pattern)
+
+    if part_folders:
+        num_folders = len(part_folders)
+        # Calculate patch sets per folder based on actual files per patch set
+        patch_sets_per_folder = 100000 // files_per_patch_set
+        estimated_total_patch_sets = num_folders * patch_sets_per_folder
+        estimated_files = estimated_total_patch_sets * files_per_patch_set
+        return num_folders, estimated_files
+    else:
+        return 0, 0
+
+
 def _iterate_saved_patch_items(args):
     """
     Iterate saved .npy patches as a generator without building full records.
+    Searches across distributed folders to find all .npy files.
 
     Yields:
       (current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw)
     """
-    import glob as _glob
-    npy_pattern = os.path.join(args.results_dir, "evaluation_results", "*_encodedrecon.npy")
-    npy_files = _glob.glob(npy_pattern)
+    # Use utility function to get all .npy files from distributed folders
+    npy_files = _get_distributed_npy_files(args.results_dir)
+    debug_print(f"📁 Found {len(npy_files)} .npy files to process", debug=DEBUG_ENABLED)
 
     for npy_file in npy_files:
         base_name = npy_file.replace("_encodedrecon.npy", "")
@@ -1602,7 +2667,7 @@ def _iterate_saved_patch_items(args):
                 continue
 
 
-def _process_eval_batches_core(args, vae, model, diffusion, loader):
+def _process_eval_batches_core(args, vae, model, diffusion, loader, checkpoint_manager=None):
     """
     Core function to process evaluation batches and yield batch data.
     This is a shared component that can be used by different iteration strategies.
@@ -1610,29 +2675,88 @@ def _process_eval_batches_core(args, vae, model, diffusion, loader):
     Yields tuples:
       (batch_index, x, image_paths_batch, patch_coords, encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic)
     """
+    # Handle checkpointing/resume functionality
+    all_image_paths = []
+    if checkpoint_manager:
+        # Collect all unique image paths from the dataset
+        all_image_paths = list(set(loader.dataset.get_all_image_paths()))
+        current_image_index, processed_images = checkpoint_manager.get_resume_info(all_image_paths)
+        print(f"Resuming from image {current_image_index}/{len(all_image_paths)}")
+        print(f"Already processed: {len(processed_images)} images")
+        
+        # Print checkpoint status
+        print("=== Checkpoint Status ===")
+        checkpoint_manager.print_checkpoint_status()
+        print("========================")
+    
+    processed_images_in_batch = []
     idx = -1
-    for idx, (x, seg, object_cls, anomaly_classes, image_paths_batch, patch_coords) in enumerate(
-        tqdm(loader, desc="Processing patches (core iterator)")
-    ):
-        if idx >= args.batch_num:
-            break
-        with torch.no_grad():
-            encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic = _process_batch_inference(
-                x, object_cls, model, vae, diffusion, args.reverse_steps, device, epoch_metrics=None
+    try:
+        for idx, (x, seg, object_cls, anomaly_classes, image_paths_batch, patch_coords) in enumerate(
+            tqdm(loader, desc="Processing patches (core iterator)")
+        ):
+            if idx >= args.batch_num:
+                break
+            
+            # Check if we should skip this batch due to checkpoint resume
+            if checkpoint_manager:
+                batch_size = x.size(0)
+                skip_entire_batch = True
+                batch_patch_identifiers = []
+                
+                for b in range(batch_size):
+                    current_image_path = _extract_image_path_from_batch(image_paths_batch, b)
+                    coords_8_values = _extract_patch_coordinates(patch_coords, b, args.patch_size)
+                    patch_identifier = f"{current_image_path}#{coords_8_values[0]}_{coords_8_values[1]}"
+                    batch_patch_identifiers.append(patch_identifier)
+                    if not checkpoint_manager.is_image_processed(patch_identifier):
+                        skip_entire_batch = False
+                
+                if skip_entire_batch:
+                    debug_print(f"⏭️  Skipping batch {idx} - all patches already processed", debug=DEBUG_ENABLED)
+                    continue
+                
+                # Track patches in this batch for checkpointing
+                processed_images_in_batch.extend(batch_patch_identifiers)
+            
+            with torch.no_grad():
+                encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic = _process_batch_inference(
+                    x, object_cls, model, vae, diffusion, args.reverse_steps, device, epoch_metrics=None
+                )
+
+            yield (
+                idx,
+                x,
+                image_paths_batch,
+                patch_coords,
+                encodedrecon_dodrecon_diff,
+                encoded_latent_diff_resized,
+                anomaly_map_arithmetic,
             )
+            
+            # Save checkpoint periodically (every few batches)
+            if checkpoint_manager and idx % getattr(args, 'checkpoint_interval', 5) == 0:
+                checkpoint_manager.save_checkpoint(idx, processed_images_in_batch)
+                debug_print(f"💾 Saved checkpoint at batch {idx}", debug=DEBUG_ENABLED)
+                
+    except KeyboardInterrupt:
+        print("\n⚠️  Process interrupted. Saving checkpoint...")
+        if checkpoint_manager:
+            checkpoint_manager.save_checkpoint(idx, processed_images_in_batch)
+        raise
+    except Exception as e:
+        print(f"\n❌ Error occurred: {e}")
+        if checkpoint_manager:
+            checkpoint_manager.save_checkpoint(idx, processed_images_in_batch)
+        raise
+    finally:
+        # Final checkpoint save
+        if checkpoint_manager and processed_images_in_batch:
+            checkpoint_manager.save_checkpoint(idx, processed_images_in_batch)
+            debug_print(f"💾 Final checkpoint saved at batch {idx}", debug=DEBUG_ENABLED)
 
-        yield (
-            idx,
-            x,
-            image_paths_batch,
-            patch_coords,
-            encodedrecon_dodrecon_diff,
-            encoded_latent_diff_resized,
-            anomaly_map_arithmetic,
-        )
 
-
-def _iterate_eval_patch_items(args, vae, model, diffusion, loader):
+def _iterate_eval_patch_items(args, vae, model, diffusion, loader, checkpoint_manager=None):
     """
     Iterate evaluation batches and yield patch items compatible with the shared streaming pipeline.
     Uses the shared core function for processing.
@@ -1642,7 +2766,7 @@ def _iterate_eval_patch_items(args, vae, model, diffusion, loader):
     """
     for (batch_idx, x, image_paths_batch, patch_coords, 
          encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic) in _process_eval_batches_core(
-            args, vae, model, diffusion, loader
+            args, vae, model, diffusion, loader, checkpoint_manager
         ):
         
         batch_size = x.size(0)
@@ -1655,10 +2779,21 @@ def _iterate_eval_patch_items(args, vae, model, diffusion, loader):
                 patch_coords, b, args.patch_size
             )
 
+            # Skip if this specific patch is already processed (for checkpoint support)
+            # For stride-based processing, we need to track individual patches, not just images
+            patch_identifier = f"{current_image_path}#{coords_8_values[0]}_{coords_8_values[1]}"
+            if checkpoint_manager and checkpoint_manager.is_image_processed(patch_identifier):
+                debug_print(f"⏭️  Skipping already processed patch: {patch_identifier}", debug=DEBUG_ENABLED)
+                continue
+
             # Numpy arrays
             encodedrecon_raw = _to_numpy(encodedrecon_dodrecon_diff[b]).squeeze()
             latent_raw = _to_numpy(encoded_latent_diff_resized[b]).squeeze()
             anomaly_map_arithmetic_raw = _to_numpy(anomaly_map_arithmetic[b]).squeeze()
+
+            # Mark patch as processed (not just the image)
+            if checkpoint_manager:
+                checkpoint_manager.mark_image_processed(patch_identifier)
 
             yield (
                 current_image_path,
@@ -1669,21 +2804,85 @@ def _iterate_eval_patch_items(args, vae, model, diffusion, loader):
             )
 
 
-def _iterate_eval_patch_items_with_saving(args, vae, model, diffusion, loader, save_dir):
+def _iterate_eval_patch_items_with_saving(args, vae, model, diffusion, loader, save_dir, checkpoint_manager=None):
     """
     Iterate evaluation batches, save intermediate products as NPY files, and yield patch items.
     This efficiently saves the 4 intermediate products while yielding data for the streaming pipeline.
-    
+
+    DISTRIBUTED FOLDER STRUCTURE:
+    - Files are distributed across multiple subfolders to avoid Windows performance issues
+    - Each folder contains ~25,000 patch sets (100,000 files total per folder)
+    - Folder structure: save_dir/part_0000/, save_dir/part_0001/, etc.
+    - Each patch set consists of 4 files: _encodedrecon.npy, _latent.npy, _anomaly_map_arithmetic.npy, _coords.npy
+
     Args:
         args: Arguments object
         vae, model, diffusion, loader: Model components and data loader
         save_dir: Directory to save NPY files
-        
+        checkpoint_manager: Optional checkpoint manager for resume functionality
+
     Yields tuples:
       (current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw)
     """
     # Create save directory
     os.makedirs(save_dir, exist_ok=True)
+
+    # Count the number of files saved per patch set by examining the save job function
+    # This dynamically counts how many .npy files are actually saved per patch
+    def _count_files_per_patch_set():
+        """
+        Count how many .npy files are saved per patch set by analyzing the save job.
+        This function dynamically counts the file operations in _submit_npy_save_job.
+        """
+        import inspect
+        
+        # Get the source code of the _submit_npy_save_job function to count np.save calls
+        try:
+            # Count np.save operations by inspecting the nested _job function
+            file_count = 0
+            
+            # Data files (always present)
+            file_count += 3  # encodedrecon, latent, anomaly_map_arithmetic
+            
+            # Coordinate file (always present)
+            file_count += 1  # coords
+            
+            # Future-proof: Could be extended to parse the actual function source
+            # to count np.save() calls dynamically, but for now we use known values
+            
+            debug_print(f"🔍 Detected {file_count} files per patch set", debug=DEBUG_ENABLED)
+            return file_count
+            
+        except Exception as e:
+            # Fallback to known value if inspection fails
+            debug_print(f"⚠️  Could not inspect save function, using default: {e}", debug=DEBUG_ENABLED)
+            return 4  # encodedrecon, latent, anomaly_map_arithmetic, coords
+    
+    files_per_patch_set = _count_files_per_patch_set()
+    
+    # Initialize file counter and folder management for distributed saving
+    file_counter = 0
+    files_per_folder = 100000 // files_per_patch_set  # Dynamic calculation based on actual files saved
+    current_folder_idx = 0
+    current_folder_path = None
+    
+    debug_print(f"📊 Distributed saving: {files_per_patch_set} files per patch set, {files_per_folder} patch sets per folder", debug=DEBUG_ENABLED)
+
+    def _get_current_save_folder():
+        """Get the current folder path for saving, creating new folders as needed."""
+        nonlocal current_folder_path, current_folder_idx, file_counter
+
+        # Check if we need to create a new folder
+        if current_folder_path is None or file_counter >= files_per_folder:
+            if current_folder_path is not None:
+                current_folder_idx += 1
+                file_counter = 0
+
+            current_folder_path = os.path.join(save_dir, f"part_{current_folder_idx:04d}")
+            os.makedirs(current_folder_path, exist_ok=True)
+            debug_print(f"📁 Created new distributed folder: {os.path.basename(current_folder_path)} ({file_counter}/{files_per_folder} sets used)", debug=DEBUG_ENABLED)
+
+        return current_folder_path
     
     # Determine save dtype
     save_dtype_is_f16 = getattr(args, 'save_dtype_f16', False)
@@ -1733,7 +2932,7 @@ def _iterate_eval_patch_items_with_saving(args, vae, model, diffusion, loader, s
     try:
         for (batch_idx, x, image_paths_batch, patch_coords, 
              encodedrecon_dodrecon_diff, encoded_latent_diff_resized, anomaly_map_arithmetic) in _process_eval_batches_core(
-                args, vae, model, diffusion, loader
+                args, vae, model, diffusion, loader, checkpoint_manager
             ):
             
             batch_size = x.size(0)
@@ -1745,6 +2944,13 @@ def _iterate_eval_patch_items_with_saving(args, vae, model, diffusion, loader, s
                 coords_8_values = _extract_patch_coordinates(
                     patch_coords, b, args.patch_size
                 )
+
+                # Skip if this specific patch is already processed (for checkpoint support)
+                # For stride-based processing, we need to track individual patches, not just images
+                patch_identifier = f"{current_image_path}#{coords_8_values[0]}_{coords_8_values[1]}"
+                if checkpoint_manager and checkpoint_manager.is_image_processed(patch_identifier):
+                    debug_print(f"⏭️  Skipping already processed patch: {patch_identifier}", debug=DEBUG_ENABLED)
+                    continue
 
                 # Numpy arrays
                 encodedrecon_raw = _to_numpy(encodedrecon_dodrecon_diff[b]).squeeze()
@@ -1760,17 +2966,27 @@ def _iterate_eval_patch_items_with_saving(args, vae, model, diffusion, loader, s
                 # Convert coordinates to numpy array for saving
                 coords_array = np.array(coords_8_values)
 
+                # Get the appropriate distributed folder for this file set
+                current_save_folder = _get_current_save_folder()
+
                 # Submit async save job
                 job = _submit_npy_save_job(
-                    save_dir, base_filename,
+                    current_save_folder, base_filename,
                     encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw,
                     coords_array, save_dtype_is_f16
                 )
                 pending.append(job)
 
+                # Increment file counter (dynamically calculated files per set)
+                file_counter += files_per_patch_set
+
                 # Throttle pending jobs to avoid memory issues
                 if len(pending) >= max_pending:
                     _wait_for_pending_saves()
+
+                # Mark patch as processed (not just the image)
+                if checkpoint_manager:
+                    checkpoint_manager.mark_image_processed(patch_identifier)
 
                 # Yield the same data as the original function
                 yield (
@@ -1790,198 +3006,18 @@ def _iterate_eval_patch_items_with_saving(args, vae, model, diffusion, loader, s
                 job.result()  # Wait for completion and check for exceptions
             except Exception as e:
                 debug_print(f"⚠️  Save job failed: {e}", debug=DEBUG_ENABLED)
-        
+
         executor.shutdown(wait=True)
-        debug_print("✅ All NPY saves completed", debug=DEBUG_ENABLED)
 
-def save_image_results_from_records2(checkpoint_manager: CheckpointManager, image_path: str, 
-                                  image_records: list, 
-                                  predicted_defective_set: set, ground_truth_defective: set, overlapping: set,
-                                  enable_save_optional_image_results: bool = False, patch_size: int = 256):
-    """Save all results for a single image immediately using records."""
-    safe_name = path_to_safe_filename(image_path)
-    
-    # Create status-based subfolders
-    status_folders = {}
-    for status in ['TP', 'FN', 'FP', 'TN']:
-        status_dir = os.path.join(checkpoint_manager.marked_images_dir, status)
-        os.makedirs(status_dir, exist_ok=True)
-        status_folders[status] = status_dir
-    
-    # Determine the overall status of this image based on its patches
-    image_status = determine_image_status(image_records)
-    
-    # Debug: Print status information
-    status_counts = {'TP': 0, 'FN': 0, 'FP': 0, 'TN': 0}
-    for record in image_records:
-        status = record["status"][1]
-        if status in status_counts:
-            status_counts[status] += 1
-    #print(f"Image {os.path.basename(image_path)} status: {image_status} (TP:{status_counts['TP']}, FN:{status_counts['FN']}, FP:{status_counts['FP']}, TN:{status_counts['TN']})")
-    
-    # Load original image
-    original_img = np.array(PILImage.open(image_path).convert('RGB'))
-    h, w, _ = original_img.shape
-    
-    # Save marked image (always saved) in the appropriate status folder
-    marked_img = draw_patch_rectangles_on_image(
-        original_img, predicted_defective_set, ground_truth_defective, overlapping, patch_size=patch_size, grid_thickness=1
-    )
-    marked_path = os.path.join(status_folders[image_status], f"{safe_name}__marked.png")
-    PILImage.fromarray(marked_img).save(marked_path)
-    
-    # Also save image-level images without classification
-    image_level_dir = os.path.join(checkpoint_manager.marked_images_dir, "image_level")
-    os.makedirs(image_level_dir, exist_ok=True)
-    image_level_path = os.path.join(image_level_dir, f"{safe_name}__marked.png")
-    PILImage.fromarray(marked_img).save(image_level_path)
-    
-    # Initialize anomaly maps based on flag
-    anomaly_maps = {
-        'required': {
-            'arithmetic': np.zeros((h, w), dtype=np.float32),
-            'arithmetic_binary': np.zeros((h, w), dtype=np.float32),
-            'geometric': np.zeros((h, w), dtype=np.float32),
-            'geometric_binary': np.zeros((h, w), dtype=np.float32),
-        }
-    }
-    
-    # Initialize optional maps only when flag is enabled
-    if enable_save_optional_image_results:
-        anomaly_maps['optional'] = {
-            'arithmetic_binary_style1': np.zeros((h, w), dtype=np.float32),
-            'arithmetic_binary_style2': np.zeros((h, w), dtype=np.float32),
-            'arithmetic_binary_style3': np.zeros((h, w), dtype=np.float32),
-            'geometric_binary_style1': np.zeros((h, w), dtype=np.float32),
-            'geometric_binary_style2': np.zeros((h, w), dtype=np.float32),
-            'geometric_binary_style3': np.zeros((h, w), dtype=np.float32),
-        }
-    
-    def _get_xy_from_patch_coords(rec) -> tuple:
-        coords = rec.get("patch_coords", (None, []))[1]
-        if isinstance(coords, (list, tuple)) and len(coords) == 8:
-            return int(coords[0]), int(coords[1])  # top-left from 8-value
-        raise ValueError(f"Expected 8-value patch_coords, got: {coords}")
-
-    for record in image_records:
-        # Extract coordinates from record (supports 8- or 2-value formats)
-        x_coord, y_coord = _get_xy_from_patch_coords(record)
-        
-        # Calculate actual patch dimensions for this position
-        patch_width = min(patch_size, w - x_coord)
-        patch_height = min(patch_size, h - y_coord)
-        
-        # Extract required anomaly maps from record
-        patch_arithmetic = record["anomaly_map_arithmetic"][1]
-        patch_arithmetic_binary = record["anomaly_map_arithmetic_binary"][1]
-        patch_geometric = record["anomaly_map_geometric"][1]
-        patch_geometric_binary = record["anomaly_map_geometric_binary"][1]
-        
-        # Extract patch regions
-        patch_regions = {
-            'arithmetic': patch_arithmetic.squeeze()[:patch_height, :patch_width],
-            'arithmetic_binary': patch_arithmetic_binary.squeeze()[:patch_height, :patch_width],
-            'geometric': patch_geometric.squeeze()[:patch_height, :patch_width],
-            'geometric_binary': patch_geometric_binary.squeeze()[:patch_height, :patch_width],
-        }
-        
-        # Extract optional patch regions if flag is enabled
-        if enable_save_optional_image_results:
-            # Use default binary maps as fallback for style fields
-            patch_regions.update({
-                'arithmetic_binary_style1': record.get("anomaly_map_arithmetic_binary_style1", [None, patch_arithmetic_binary])[1].squeeze()[:patch_height, :patch_width],
-                'arithmetic_binary_style2': record.get("anomaly_map_arithmetic_binary_style2", [None, patch_arithmetic_binary])[1].squeeze()[:patch_height, :patch_width],
-                'arithmetic_binary_style3': record.get("anomaly_map_arithmetic_binary_style3", [None, patch_arithmetic_binary])[1].squeeze()[:patch_height, :patch_width],
-                'geometric_binary_style1': record.get("anomaly_map_geometric_binary_style1", [None, patch_geometric_binary])[1].squeeze()[:patch_height, :patch_width],
-                'geometric_binary_style2': record.get("anomaly_map_geometric_binary_style2", [None, patch_geometric_binary])[1].squeeze()[:patch_height, :patch_width],
-                'geometric_binary_style3': record.get("anomaly_map_geometric_binary_style3", [None, patch_geometric_binary])[1].squeeze()[:patch_height, :patch_width],
-            })
-        
-        # Assign required regions to anomaly maps
-        for map_name, region in patch_regions.items():
-            if map_name in anomaly_maps['required']:
-                anomaly_maps['required'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] = region
-            elif enable_save_optional_image_results and map_name in anomaly_maps['optional']:
-                anomaly_maps['optional'][map_name][y_coord:y_coord+patch_height, x_coord:x_coord+patch_width] = region
-    
-    # Define image configurations
-    image_configs = {
-        'required': [
-            (anomaly_maps['required']['arithmetic'], "am_ar", False),
-            (anomaly_maps['required']['arithmetic_binary'], "am_ar_bin", True),
-            (anomaly_maps['required']['geometric'], "am_ge", False),
-            (anomaly_maps['required']['geometric_binary'], "am_ge_bin", True),
-        ]
-    }
-    
-    # Add optional configurations if flag is enabled
-    if enable_save_optional_image_results:
-        image_configs['optional'] = [
-            (anomaly_maps['optional']['arithmetic_binary_style1'], "am_ar_bin_st1", True),
-            (anomaly_maps['optional']['arithmetic_binary_style2'], "am_ar_bin_st2", True),
-            (anomaly_maps['optional']['arithmetic_binary_style3'], "am_ar_bin_st3", True),
-            (anomaly_maps['optional']['geometric_binary_style1'], "am_ge_bin_st1", True),
-            (anomaly_maps['optional']['geometric_binary_style2'], "am_ge_bin_st2", True),
-            (anomaly_maps['optional']['geometric_binary_style3'], "am_ge_bin_st3", True),
-        ]
-    
-    # Save all configured images in the appropriate status folder
-    for _config_type, configs in image_configs.items():
-        for anomaly_map, suffix, is_binary in configs:
-            # Save anomaly map image
-            anomaly_map_img = ImageProcessor.create_anomaly_map_image(
-                anomaly_map, patch_size=patch_size, add_grid=True, 
-                predicted_defective_set=predicted_defective_set, ground_truth_defective=ground_truth_defective, 
-                overlapping=overlapping, is_binary=is_binary
-            )
-            anomaly_map_path = os.path.join(status_folders[image_status], f"{safe_name}__{suffix}.png")
-            PILImage.fromarray(anomaly_map_img).save(anomaly_map_path)
-            
-            # Save overlay image
-            overlay_img = ImageProcessor.create_anomaly_overlay(original_img, anomaly_map, alpha=0.8, is_binary=is_binary)
-            overlay_path = os.path.join(status_folders[image_status], f"{safe_name}__ao_{suffix}.png")
-            PILImage.fromarray(overlay_img).save(overlay_path)
-            
-            # Save marked overlay image
-            marked_overlay_img = draw_patch_rectangles_on_image(overlay_img, predicted_defective_set, ground_truth_defective, overlapping, patch_size=patch_size, grid_thickness=1)
-            marked_overlay_path = os.path.join(status_folders[image_status], f"{safe_name}__mo_{suffix}.png")
-            PILImage.fromarray(marked_overlay_img).save(marked_overlay_path)
-            
-            # Also save to image_level directory (without classification)
-            image_level_anomaly_path = os.path.join(image_level_dir, f"{safe_name}__{suffix}.png")
-            PILImage.fromarray(anomaly_map_img).save(image_level_anomaly_path)
-            
-            image_level_overlay_path = os.path.join(image_level_dir, f"{safe_name}__ao_{suffix}.png")
-            PILImage.fromarray(overlay_img).save(image_level_overlay_path)
-            
-            image_level_marked_overlay_path = os.path.join(image_level_dir, f"{safe_name}__mo_{suffix}.png")
-            PILImage.fromarray(marked_overlay_img).save(image_level_marked_overlay_path)
-    
-    # Save evaluation results
-    patch_analysis = []
-    for record in image_records:
-        x, y = _get_xy_from_patch_coords(record)
-        anomaly_map = record["anomaly_map_arithmetic_binary"][1]
-        anomaly_pixels = int(np.sum(anomaly_map))
-        grid_row = y // patch_size
-        grid_col = x // patch_size
-        patch_analysis.append({
-            "grid_row": grid_row,
-            "grid_col": grid_col,
-            "anomaly_max": record["anomaly_max"][1],
-            "anomaly_pixels":record["anomaly_pixels"][1],
-            "status": record["status"][1]
-        })
-    
-    result_filename = f"{safe_name}__evaluation.json"
-    result_path = os.path.join(checkpoint_manager.evaluation_results_dir, result_filename)
-    evaluation_result = {
-        "image_path": image_path,
-        "patch_analysis": patch_analysis,
-        "grid_size": patch_size
-    }
-    with open(result_path, 'w') as f:
-        json.dump(evaluation_result, f, indent=2)
+        # Log distributed folder statistics
+        total_folders = current_folder_idx + 1
+        total_patch_sets = file_counter // files_per_patch_set
+        if total_folders > 1:
+            debug_print(f"📊 Distributed {file_counter} files ({total_patch_sets} patch sets of {files_per_patch_set} files each) across {total_folders} folders", debug=DEBUG_ENABLED)
+            debug_print(f"📂 Folder structure: {save_dir}/part_0000/ through {save_dir}/part_{total_folders-1:04d}/", debug=DEBUG_ENABLED)
+            debug_print(f"📈 Average: {total_patch_sets // total_folders} patch sets per folder", debug=DEBUG_ENABLED)
+        else:
+            debug_print(f"✅ All NPY saves completed in single folder: {save_dir} ({total_patch_sets} patch sets, {file_counter} files)", debug=DEBUG_ENABLED)
 
 
 def _process_batch_records_immediately(args, batch_records, ground_truth_map, original_images, 
@@ -2031,8 +3067,13 @@ def _process_batch_records_immediately(args, batch_records, ground_truth_map, or
                 ground_truth_defective = ground_truth_map.get(img_path, set()) if isinstance(ground_truth_map, dict) else set()
                 overlapping = set()
                 
+                # Create marked_images directory in the output_subdir (tagged folder)
+                marked_images_dir = os.path.join(output_subdir, "marked_images")
+                os.makedirs(marked_images_dir, exist_ok=True)
+                
                 save_patch_results_from_records(
-                    checkpoint_manager,
+                    marked_images_dir,
+                    checkpoint_manager.evaluation_results_dir,
                     img_path,
                     patch_records,
                     patch_pred_set,
@@ -2093,7 +3134,14 @@ def _finalize_incremental_processing(args, total_records, normal_records_count, 
         # Process whole image results if enabled
         if args.enable_save_whole_image_results:
             debug_print("🖼️ Processing whole image results...", debug=DEBUG_ENABLED)
-            checkpoint_manager = CheckpointManager(args.results_dir, args.annotation_dir, args.force_rerun)
+            # Create marked_images directory in the output_subdir (tagged folder)
+            marked_images_dir = os.path.join(output_subdir, "marked_images")
+            os.makedirs(marked_images_dir, exist_ok=True)
+            
+            # Get evaluation_results_dir from a checkpoint manager (at base level)
+            base_results_dir = os.path.dirname(output_subdir)
+            evaluation_results_dir = os.path.join(base_results_dir, "evaluation_results")
+            os.makedirs(evaluation_results_dir, exist_ok=True)
             
             for img_path, image_records in image_to_records.items():
                 # Predicted defective set from records (expects 8-value patch_coords)
@@ -2117,8 +3165,9 @@ def _finalize_incremental_processing(args, total_records, normal_records_count, 
                 overlapping = set()
 
                 try:
-                    save_image_results_from_records2(
-                        checkpoint_manager,
+                    save_image_results_from_records(
+                        marked_images_dir,
+                        evaluation_results_dir,
                         img_path,
                         image_records,
                         predicted_defective_set,
@@ -2335,7 +3384,7 @@ def mode_save_only(args):
 
     # Use the saving iterator but only consume it to trigger the saving, don't process
     patch_item_iter = _iterate_eval_patch_items_with_saving(
-        args, vae, model, diffusion, loader, npy_save_dir
+        args, vae, model, diffusion, loader, npy_save_dir, checkpoint_manager
     )
 
     # Consume the iterator to trigger saving (without processing)
@@ -2357,25 +3406,127 @@ def mode_process_only(args):
 
     # To load original images, we need the set of image paths referenced by saved results
     # Scan saved .npy items to collect image paths without loading all into memory
+    # Use parallel processing for better performance on large datasets
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+    
     image_paths_set = set()
-    for image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw in _iterate_saved_patch_items(args):
-        if image_path:
-            image_paths_set.add(image_path)
+    image_paths_lock = threading.Lock()  # Thread-safe set operations
+    
+    def process_file_chunk(file_chunk, chunk_idx):
+        """Process a chunk of .npy files in parallel"""
+        chunk_new_paths = []
+        
+        for npy_file in file_chunk:
+            try:
+                # Process each .npy file (this is the expensive I/O operation)
+                base_name = npy_file.replace("_encodedrecon.npy", "")
+                coords_file = f"{base_name}_coords.npy"
+                latent_file = f"{base_name}_latent.npy"
+                anomaly_file = f"{base_name}_anomaly_map_arithmetic.npy"
+                
+                if os.path.exists(coords_file) and os.path.exists(latent_file) and os.path.exists(anomaly_file):
+                    # Extract image path from filename (same logic as _iterate_saved_patch_items)
+                    filename = os.path.basename(npy_file)
+                    import re as _re
+                    coord_pattern = r"__x\d+_y\d+_x\d+_y\d+_x\d+_y\d+_x\d+_y\d+__"
+                    match = _re.search(coord_pattern, filename)
+                    if match:
+                        file_info = filename[:match.start()]
+                    else:
+                        if "__minimal_diff" in filename:
+                            file_info = filename.split("__minimal_diff")[0]
+                            file_info = _re.sub(r"__x\d+_y\d+_x\d+_y\d+_x\d+_y\d+_x\d+_y\d+$", "", file_info)
+                        else:
+                            file_info = filename.split("__")[0]
+                    
+                    image_path = safe_filename_to_path(file_info)
+                    
+                    # Check if this is a new image path
+                    if image_path and image_path not in image_paths_set:
+                        with image_paths_lock:
+                            if image_path not in image_paths_set:
+                                image_paths_set.add(image_path)
+                                chunk_new_paths.append(image_path)
+                                
+            except Exception as e:
+                debug_print(f"⚠️  Failed reading file in chunk {chunk_idx}: {npy_file}: {e}", debug=DEBUG_ENABLED)
+                continue
+        
+        print(f"📊 Completed file chunk {chunk_idx + 1}: {len(file_chunk)} files, {len(chunk_new_paths)} new paths")
+        return chunk_new_paths
+    
+    # Process file discovery and reading in parallel
+    print(f"📁 Processing saved patches with parallel file I/O...")
+    
+    # Process in parallel using ThreadPoolExecutor for I/O bound operations
+    import os
+    import time
+    max_workers = min(os.cpu_count() * 2, 16)  # Use more workers for better CPU utilization
+    
+    print(f"⚙️  Using {max_workers} worker threads for parallel file processing")
+    start_time = time.time()
+    
+    # Get all .npy files first (this is fast)
+    npy_files = _get_distributed_npy_files(args.results_dir)
+    print(f"🔍 Found {len(npy_files)} .npy files to process")
+    
+    # Split files into chunks for parallel processing
+    chunk_size = max(1, len(npy_files) // max_workers)
+    file_chunks = [npy_files[i:i + chunk_size] for i in range(0, len(npy_files), chunk_size)]
+    print(f"📦 Split into {len(file_chunks)} chunks of ~{chunk_size} files each")
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        newly_added_paths = []
+        
+        # Submit file chunks for parallel processing
+        chunk_futures = []
+        for chunk_idx, file_chunk in enumerate(file_chunks):
+            chunk_future = executor.submit(process_file_chunk, file_chunk, chunk_idx)
+            chunk_futures.append(chunk_future)
+        
+        # Process completed chunks as they finish
+        total_processed = 0
+        for future in tqdm(as_completed(chunk_futures), total=len(chunk_futures), desc="Processing file chunks"):
+            chunk_result = future.result()
+            if chunk_result:
+                newly_added_paths.extend(chunk_result)
+            total_processed += len(npy_files)  # Total files processed
+    
+    elapsed_time = time.time() - start_time
+    patches_per_second = total_processed / elapsed_time if elapsed_time > 0 else 0
+    print(f"✅ Found {len(image_paths_set)} unique image paths from {total_processed} processed patches")
+    print(f"⏱️  Processing time: {elapsed_time:.2f}s ({patches_per_second:.1f} patches/sec)")
+    if newly_added_paths:
+        print(f"📊 Newly discovered paths: {len(newly_added_paths)}")
+    
     # Reload iterator after scan (it is a generator)
     patch_item_iter = _iterate_saved_patch_items(args)
 
-    # Load original images
-    original_images = load_original_images(image_paths_set)
-    print(f"Loaded {len(original_images)} original images")
-
-    # Process incrementally via shared pipeline
+    # Create smart image cache instead of loading all images at once
+    print(f"🧠 Creating smart image cache...")
+    
+    # Create smart cache with configurable memory limits
+    max_cache_memory_gb = getattr(args, 'max_cache_memory_gb', 2.0)  # Default 2GB
+    max_cache_images = getattr(args, 'max_cache_images', 100)  # Default 100 images
+    
+    print(f"🧠 Smart image cache: max {max_cache_memory_gb}GB, max {max_cache_images} images")
+    image_cache = SmartImageCache(max_memory_gb=max_cache_memory_gb, max_images=max_cache_images)
+    
+    # Process incrementally via shared pipeline with smart cache
     metrics, output_dir = _process_records_stream_incrementally(
         args,
         patch_item_iter,
         ground_truth_map,
-        original_images,
+        image_cache,  # Pass cache instead of loaded images
         output_subdir_name="processed_results",
     )
+    
+    # Print final cache statistics
+    cache_stats = image_cache.get_stats()
+    print(f"🧠 Final cache statistics:")
+    print(f"   📊 Cached images: {cache_stats['cached_images']}")
+    print(f"   💾 Memory used: {cache_stats['total_memory_mb']:.1f}MB / {cache_stats['max_memory_mb']:.1f}MB ({cache_stats['memory_usage_percent']:.1f}%)")
 
     return metrics
 
@@ -2404,11 +3555,22 @@ def mode_full_pipeline(args):
     print(f"Loaded ground truth for {len(ground_truth_map)} images")
 
     image_paths = set(loader.dataset.get_all_image_paths())
-    original_images = load_original_images(image_paths)
-    print(f"Loaded {len(original_images)} original images")
+    
+    # Use smart cache for large datasets to avoid memory issues
+    max_cache_memory_gb = getattr(args, 'max_cache_memory_gb', 2.0)
+    max_cache_images = getattr(args, 'max_cache_images', 100)
+    
+    if len(image_paths) > max_cache_images:
+        print(f"🧠 Large dataset detected ({len(image_paths)} images), using smart cache")
+        original_images = SmartImageCache(max_memory_gb=max_cache_memory_gb, max_images=max_cache_images)
+        print(f"🧠 Smart cache: max {max_cache_memory_gb}GB, max {max_cache_images} images")
+    else:
+        print(f"📁 Small dataset ({len(image_paths)} images), loading all images at once")
+        original_images = load_original_images(image_paths)
+        print(f"Loaded {len(original_images)} original images")
 
     # Create an iterator that yields patch items directly from evaluation
-    patch_item_iter = _iterate_eval_patch_items(args, vae, model, diffusion, loader)
+    patch_item_iter = _iterate_eval_patch_items(args, vae, model, diffusion, loader, checkpoint_manager)
 
     # Process via shared streaming pipeline
     metrics, output_dir = _process_records_stream_incrementally(
@@ -2418,6 +3580,13 @@ def mode_full_pipeline(args):
         original_images,
         output_subdir_name="processed_results",
     )
+    
+    # Print cache statistics if using cache
+    if hasattr(original_images, 'get_stats'):
+        cache_stats = original_images.get_stats()
+        print(f"🧠 Final cache statistics:")
+        print(f"   📊 Cached images: {cache_stats['cached_images']}")
+        print(f"   💾 Memory used: {cache_stats['total_memory_mb']:.1f}MB / {cache_stats['max_memory_mb']:.1f}MB ({cache_stats['memory_usage_percent']:.1f}%)")
 
     return metrics, output_dir
 
@@ -2437,14 +3606,25 @@ def mode_full_pipeline_with_saving_npy(args):
     print(f"Loaded ground truth for {len(ground_truth_map)} images")
 
     image_paths = set(loader.dataset.get_all_image_paths())
-    original_images = load_original_images(image_paths)
-    print(f"Loaded {len(original_images)} original images")
+    
+    # Use smart cache for large datasets to avoid memory issues
+    max_cache_memory_gb = getattr(args, 'max_cache_memory_gb', 2.0)
+    max_cache_images = getattr(args, 'max_cache_images', 100)
+    
+    if len(image_paths) > max_cache_images:
+        print(f"🧠 Large dataset detected ({len(image_paths)} images), using smart cache")
+        original_images = SmartImageCache(max_memory_gb=max_cache_memory_gb, max_images=max_cache_images)
+        print(f"🧠 Smart cache: max {max_cache_memory_gb}GB, max {max_cache_images} images")
+    else:
+        print(f"📁 Small dataset ({len(image_paths)} images), loading all images at once")
+        original_images = load_original_images(image_paths)
+        print(f"Loaded {len(original_images)} original images")
 
     print(f"NPY files will be saved to: {evaluation_results_dir}")
 
     # Create an iterator that yields patch items directly from evaluation AND saves NPY files
     patch_item_iter = _iterate_eval_patch_items_with_saving(
-        args, vae, model, diffusion, loader, evaluation_results_dir
+        args, vae, model, diffusion, loader, evaluation_results_dir, checkpoint_manager
     )
 
     # Process via shared streaming pipeline
@@ -2455,6 +3635,13 @@ def mode_full_pipeline_with_saving_npy(args):
         original_images,
         output_subdir_name="processed_results",
     )
+    
+    # Print cache statistics if using cache
+    if hasattr(original_images, 'get_stats'):
+        cache_stats = original_images.get_stats()
+        print(f"🧠 Final cache statistics:")
+        print(f"   📊 Cached images: {cache_stats['cached_images']}")
+        print(f"   💾 Memory used: {cache_stats['total_memory_mb']:.1f}MB / {cache_stats['max_memory_mb']:.1f}MB ({cache_stats['memory_usage_percent']:.1f}%)")
 
     print(f"✅ Complete pipeline finished. Results saved to: {output_dir}")
     print(f"✅ NPY intermediate files saved to: {evaluation_results_dir}")
@@ -2552,6 +3739,22 @@ def main():
                         help="Number of DataLoader workers (Windows often needs 0; try >0 if stable)")
     parser.add_argument("--async-save-workers", type=int, default=4,
                         help="Number of async saving threads. Default: 4 on Windows, 2-8 elsewhere.")
+    
+    # Cache control arguments
+    parser.add_argument("--max-cache-memory-gb", type=float, default=2.0,
+                        help="Maximum memory usage for image cache in GB (default: 2.0)")
+    parser.add_argument("--max-cache-images", type=int, default=100,
+                        help="Maximum number of images to keep in cache (default: 100)")
+    
+    # Parallel processing control
+    parser.add_argument("--parallel-workers", type=int, default=None,
+                        help="Number of parallel workers for patch processing (default: auto-detect)")
+    parser.add_argument("--chunk-size", type=int, default=None,
+                        help="Chunk size for parallel processing (default: auto-calculate)")
+    parser.add_argument("--no-parallel", action="store_true", default=False,
+                        help="Disable parallel processing and use sequential processing")
+    parser.add_argument("--no-worker-monitoring", action="store_true", default=False,
+                        help="Disable worker monitoring for maximum performance")
     
     args = parser.parse_args()
     

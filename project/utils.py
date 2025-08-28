@@ -1,8 +1,10 @@
 import os
 import re
+import glob
+import json
 import torch
 import numpy as np
-from typing import Dict, Set
+from typing import Dict, Set, Tuple
 from PIL import Image as PILImage
 
 def path_to_safe_filename(file_path: str) -> str:
@@ -602,3 +604,38 @@ def debug_print(*args, debug: bool = False, **kwargs):
     """
     if debug:
         print(*args, **kwargs)
+
+def load_ground_truth_map(annotation_dir: str) -> Dict[str, Set[Tuple[int, int]]]:
+    """
+    Load ground truth defective patches for all images from annotation files.
+    
+    Args:
+        annotation_dir: Directory containing annotation files
+        
+    Returns:
+        Dictionary mapping image paths to sets of (grid_row, grid_col) tuples
+    """
+    ground_truth_map = {}
+    
+    if not annotation_dir or not os.path.exists(annotation_dir):
+        return ground_truth_map
+    
+    # Find all annotation files
+    annotation_files = glob.glob(os.path.join(annotation_dir, "*__annotations.json"))
+    
+    for annotation_file in annotation_files:
+        try:
+            with open(annotation_file, 'r') as f:
+                annotation = json.load(f)
+                
+            # Get the original image path from the annotation
+            image_path = annotation.get("image_path")
+            if image_path:
+                # Convert defective patches to set of tuples
+                defective_patches = set(tuple(x) for x in annotation.get("defective_patches", []))
+                ground_truth_map[image_path] = defective_patches
+                
+        except Exception as e:
+            print(f"Warning: Error reading annotation file {annotation_file}: {e}")
+    
+    return ground_truth_map
