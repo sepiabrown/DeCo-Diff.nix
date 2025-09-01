@@ -443,32 +443,47 @@ class PCBDataset(Dataset):
         self.image_paths = []
         self.anomaly_classes = []
         for i, row in df.iterrows():
-            data_path = os.path.join(rootdir, str(row["image"]))
-            img = np.array(
-                Image.open(data_path).convert("RGB")
-                # .resize((self.image_size, self.image_size))
-            ).astype(np.uint8)
-            self.image_paths.append(data_path)
-            self.images.append(img)
-            self.object_classes.append(object_cls_dict[str(row["object"])])
-            self.anomaly_classes.append(str(row["category"]))
-            if str(row["category"]) != "good":
-                seg_path = os.path.join(rootdir, str(row["mask"]))
-                seg = (
-                    np.array(
-                        Image.open(seg_path).convert("L")
-                        # .resize((self.image_size, self.image_size))
-                    )
-                    > 0
+            # Fix path handling to ensure consistent separators
+            image_filename = str(row["image"]).strip()
+            # Normalize the path to handle mixed separators
+            data_path = os.path.normpath(os.path.join(rootdir, image_filename))
+            
+            # Check if file exists before trying to load it
+            if not os.path.exists(data_path):
+                print(f"Warning: Image file not found: {data_path}")
+                print(f"  - rootdir: {rootdir}")
+                print(f"  - image filename: {image_filename}")
+                continue
+                
+            try:
+                img = np.array(
+                    Image.open(data_path).convert("RGB")
+                    # .resize((self.image_size, self.image_size))
                 ).astype(np.uint8)
-                self.segs.append((seg))
-            else:
-                seg_path = os.path.join(rootdir, str(row["image"]))
-                if os.path.exists(seg_path):
-                    seg_shape = np.array(Image.open(seg_path)).shape
+                self.image_paths.append(data_path)
+                self.images.append(img)
+                self.object_classes.append(object_cls_dict[str(row["object"])])
+                self.anomaly_classes.append(str(row["category"]))
+                if str(row["category"]) != "good":
+                    seg_path = os.path.normpath(os.path.join(rootdir, str(row["mask"])))
+                    seg = (
+                        np.array(
+                            Image.open(seg_path).convert("L")
+                            # .resize((self.image_size, self.image_size))
+                        )
+                        > 0
+                    ).astype(np.uint8)
+                    self.segs.append((seg))
                 else:
-                    seg_shape = (self.image_size, self.image_size)
-                self.segs.append(np.zeros(seg_shape))
+                    seg_path = os.path.normpath(os.path.join(rootdir, str(row["image"])))
+                    if os.path.exists(seg_path):
+                        seg_shape = np.array(Image.open(seg_path)).shape
+                    else:
+                        seg_shape = (self.image_size, self.image_size)
+                    self.segs.append(np.zeros(seg_shape))
+            except Exception as e:
+                print(f"Error loading image {data_path}: {e}")
+                continue
 
     def _load_json_data(self, split_json_path, rootdir, num_datafile, object_class, mode, anomaly_class):
         """Load image paths and masks from JSON file.
@@ -1139,10 +1154,24 @@ def random_brightness_contrast(img, brightness_limit=0.05, contrast_limit=0.05, 
     if np.random.rand() < p:
         brightness_factor = np.random.uniform(-brightness_limit, brightness_limit)
         contrast_factor = np.random.uniform(-contrast_limit, contrast_limit)
-        img = img.astype(np.float32)
-        mean = np.mean(img, axis=(0, 1), keepdims=True)
-        img = (img - mean) * (1 + contrast_factor) + mean + brightness_factor * 255
-        img = np.clip(img, 0, 255).astype(np.uint8)
-        applied = True
+        
+        # Optimized version: avoid unnecessary conversions and use more efficient operations
+        if brightness_factor != 0 or contrast_factor != 0:
+            # Convert to float32 only once
+            img_float = img.astype(np.float32)
+            
+            # Apply brightness (additive)
+            if brightness_factor != 0:
+                img_float += brightness_factor * 255
+            
+            # Apply contrast (multiplicative)
+            if contrast_factor != 0:
+                # Use a simpler contrast calculation that doesn't require computing mean
+                # This is faster and still provides good contrast adjustment
+                img_float = img_float * (1 + contrast_factor)
+            
+            # Clip and convert back
+            img = np.clip(img_float, 0, 255).astype(np.uint8)
+            applied = True
 
     return img, brightness_factor, contrast_factor, applied

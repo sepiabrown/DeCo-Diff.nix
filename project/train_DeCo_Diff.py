@@ -25,6 +25,7 @@ from VISADataLoader import VISADataset
 from MixedFineTuningDataset import MixedFineTuningDataset
 from scipy.ndimage import gaussian_filter
 from transformers import get_cosine_schedule_with_warmup
+from utils import debug_print
 
 import torch.nn as nn
 import sys
@@ -353,10 +354,10 @@ def _main(args):
         )
     elif args.dataset == "pcb":
         if args.debug:
-            logger.info(f"DEBUG: Creating PCB dataset with unified_json: {args.unified_json}")
-            logger.info(f"DEBUG: Patch size: {args.patch_size}")
-            logger.info(f"DEBUG: Augment: {args.augmentation}")
-            logger.info(f"DEBUG: Center crop: {args.center_crop}")
+            debug_print(f"DEBUG: Creating PCB dataset with unified_json: {args.unified_json}", debug=args.debug)
+            debug_print(f"DEBUG: Patch size: {args.patch_size}", debug=args.debug)
+            debug_print(f"DEBUG: Augment: {args.augmentation}", debug=args.debug)
+            debug_print(f"DEBUG: Center crop: {args.center_crop}", debug=args.debug)
         
         dataset = MixedFineTuningDataset(
             "train",
@@ -382,16 +383,14 @@ def _main(args):
         )
         
         if args.debug:
-            logger.info(f"DEBUG: Dataset created successfully")
-            logger.info(f"DEBUG: Dataset size: {len(dataset)}")
-            logger.info(f"DEBUG: CSV image paths: {len(dataset.csv_image_paths)}")
-            logger.info(f"DEBUG: Existing image paths: {len(dataset.existing_image_paths)}")
+            debug_print(f"DEBUG: Dataset created successfully", debug=args.debug)
+            debug_print(f"DEBUG: Dataset size: {len(dataset)}", debug=args.debug)
             
             # Debug: Show some sample image paths
             if hasattr(dataset, 'csv_image_paths') and dataset.csv_image_paths:
-                logger.info(f"DEBUG: Sample CSV image paths: {dataset.csv_image_paths[:2]}")
+                debug_print(f"DEBUG: Sample CSV image paths: {dataset.csv_image_paths[:2]}", debug=args.debug)
             if hasattr(dataset, 'existing_image_paths') and dataset.existing_image_paths:
-                logger.info(f"DEBUG: Sample existing image paths: {dataset.existing_image_paths[:2]}")
+                debug_print(f"DEBUG: Sample existing image paths: {dataset.existing_image_paths[:2]}", debug=args.debug)
         
 
     batch_size = args.global_batch_size // dist.get_world_size()
@@ -529,37 +528,40 @@ def _main(args):
         # Set the current epoch BEFORE starting the batch loop (regardless of dataset recreation)
         if args.dataset == "pcb" and hasattr(dataset, 'track_crop') and dataset.track_crop:
             dataset.current_epoch = epoch
-            #print(f"DEBUG: Setting dataset.current_epoch to {epoch}")
+            if args.debug:
+                debug_print(f"DEBUG: Setting dataset.current_epoch to {epoch}", debug=args.debug)
         elif args.dataset == "pcb" and hasattr(dataset, 'current_epoch'):
             dataset.current_epoch = epoch
+            if args.debug:
+                debug_print(f"DEBUG: Setting dataset.current_epoch to {epoch}", debug=args.debug)
             
         for batch_idx, batch in enumerate(loader):
             try:
-                x, _, y, _, _, crop_info = batch
+                x, seg, y, image_path, anomaly_class, crop_info = batch
                 
                 # Debug: Check image dimensions and crop info
                 if args.debug and batch_idx == 0:  # Only log first batch of each epoch
-                    logger.info(f"DEBUG: Batch {batch_idx} - Image shapes: {x.shape}")
-                    logger.info(f"DEBUG: Batch {batch_idx} - Crop info types: {[type(info) for info in crop_info]}")
+                    debug_print(f"DEBUG: Batch {batch_idx} - Image shapes: {x.shape}", debug=args.debug)
+                    debug_print(f"DEBUG: Batch {batch_idx} - Crop info types: {[type(info) for info in crop_info]}", debug=args.debug)
                     
                     # Get image paths from the batch (they should be in the 4th position)
                     if len(batch) >= 4:
                         image_paths = batch[3]  # Image paths are at index 3
-                        logger.info(f"DEBUG: Batch {batch_idx} - Image paths: {image_paths}")
+                        debug_print(f"DEBUG: Batch {batch_idx} - Image paths: {image_paths}", debug=args.debug)
                     
                     for i, info in enumerate(crop_info):
                         if info and isinstance(info, dict):
-                            logger.info(f"DEBUG: Item {i} crop info: {info.get('patch_type', 'unknown')} - {info.get('crop_coords', 'N/A')}")
+                            debug_print(f"DEBUG: Item {i} crop info: {info.get('patch_type', 'unknown')} - {info.get('crop_coords', 'N/A')}", debug=args.debug)
                             if 'grid_position' in info:
-                                logger.info(f"DEBUG: Item {i} grid position: {info['grid_position']}")
+                                debug_print(f"DEBUG: Item {i} grid position: {info['grid_position']}", debug=args.debug)
                             if 'original_shape' in info:
-                                logger.info(f"DEBUG: Item {i} original shape: {info['original_shape']}")
+                                debug_print(f"DEBUG: Item {i} original shape: {info['original_shape']}", debug=args.debug)
                             # Check for missing keys that might cause the KeyError
                             required_keys = ['patch_type', 'crop_coords', 'is_csv_image', 'epoch', 'augmentation_applied']
                             missing_keys = [key for key in required_keys if key not in info]
                             if missing_keys:
-                                logger.warning(f"DEBUG: Item {i} missing keys: {missing_keys}")
-                                logger.warning(f"DEBUG: Item {i} available keys: {list(info.keys())}")
+                                debug_print(f"DEBUG: Item {i} missing keys: {missing_keys}", debug=args.debug)
+                                debug_print(f"DEBUG: Item {i} available keys: {list(info.keys())}", debug=args.debug)
                 
                 x = x.to(torch_device)
                 
@@ -569,8 +571,8 @@ def _main(args):
                 
                 # Debug: Check latent dimensions
                 if args.debug and batch_idx == 0:
-                    logger.info(f"DEBUG: Latent tensor shape: {x.shape}")
-                    logger.info(f"DEBUG: Expected latent size: {args.actual_image_size // 8}")
+                    debug_print(f"DEBUG: Latent tensor shape: {x.shape}", debug=args.debug)
+                    debug_print(f"DEBUG: Expected latent size: {args.actual_image_size // 8}", debug=args.debug)
                 
                 t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
                 
@@ -809,9 +811,9 @@ def _main(args):
                 # Recreate dataset with new data files
                 if args.dataset == "pcb":
                     if args.debug:
-                        logger.info(f"DEBUG: Recreating dataset at epoch {epoch}")
-                        logger.info(f"DEBUG: Unified JSON: {args.unified_json}")
-                        logger.info(f"DEBUG: Patch size: {args.patch_size}")
+                        debug_print(f"DEBUG: Recreating dataset at epoch {epoch}", debug=args.debug)
+                        debug_print(f"DEBUG: Unified JSON: {args.unified_json}", debug=args.debug)
+                        debug_print(f"DEBUG: Patch size: {args.patch_size}", debug=args.debug)
                     
                     dataset = MixedFineTuningDataset(
                         "train",
@@ -838,19 +840,21 @@ def _main(args):
                     )
                     
                     if args.debug:
-                        logger.info(f"DEBUG: Dataset recreated successfully")
-                        logger.info(f"DEBUG: New dataset size: {len(dataset)}")
-                        logger.info(f"DEBUG: New CSV image paths: {len(dataset.csv_image_paths)}")
-                        logger.info(f"DEBUG: New existing image paths: {len(dataset.existing_image_paths)}")
+                        debug_print(f"DEBUG: Dataset recreated successfully", debug=args.debug)
+                        debug_print(f"DEBUG: New dataset size: {len(dataset)}", debug=args.debug)
+                        debug_print(f"DEBUG: New CSV image paths: {len(dataset.csv_image_paths)}", debug=args.debug)
+                        debug_print(f"DEBUG: New existing image paths: {len(dataset.existing_image_paths)}", debug=args.debug)
                         
                         # Debug: Show some sample image paths
                         if hasattr(dataset, 'csv_image_paths') and dataset.csv_image_paths:
-                            logger.info(f"DEBUG: Sample new CSV image paths: {dataset.csv_image_paths[:2]}")
+                            debug_print(f"DEBUG: Sample new CSV image paths: {dataset.csv_image_paths[:2]}", debug=args.debug)
                         if hasattr(dataset, 'existing_image_paths') and dataset.existing_image_paths:
-                            logger.info(f"DEBUG: Sample new existing image paths: {dataset.existing_image_paths[:2]}")
+                            debug_print(f"DEBUG: Sample new existing image paths: {dataset.existing_image_paths[:2]}", debug=args.debug)
                 
                 # Set the current epoch IMMEDIATELY after dataset recreation
                 dataset.current_epoch = epoch
+                if args.debug:
+                    debug_print(f"DEBUG: Set dataset.current_epoch to {epoch} after recreation", debug=args.debug)
                 
                 # Recreate dataloader
                 loader = DataLoader(
@@ -993,13 +997,6 @@ def main():
         type=float,
         default=0.5,
         help="Ratio of CSV images vs existing images in mixed mode (default: 0.5 for 50/50 split)",
-    )
-    parser.add_argument(
-        "--fine-tuning-mode",
-        type=str,
-        choices=["csv_only", "mixed"],
-        default="mixed",
-        help="Fine-tuning mode: 'csv_only' uses only CSV images, 'mixed' uses 50/50 split between CSV and existing images",
     )
     parser.add_argument(
         "--debug",

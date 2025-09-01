@@ -6,6 +6,7 @@ import torch
 import numpy as np
 from typing import Dict, Set, Tuple
 from PIL import Image as PILImage
+from tqdm import tqdm
 
 def path_to_safe_filename(file_path: str) -> str:
     """
@@ -568,7 +569,7 @@ def load_original_images(image_paths: Set[str]) -> Dict[str, np.ndarray]:
     """
     original_images = {}
     
-    for image_path in image_paths:
+    for image_path in tqdm(image_paths, desc="Loading images", unit="images"):
         try:
             # First try the path as-is
             if os.path.exists(image_path):
@@ -586,11 +587,18 @@ def load_original_images(image_paths: Set[str]) -> Dict[str, np.ndarray]:
                         else:
                             print(f"Warning: Original image not found: {image_path} (tried: {actual_path})")
                     except Exception as e:
-                        print(f"Warning: Error converting safe filename {image_path}: {e}")
+                        print(f"Warning: Error converting safe filename {image_path}: {str(e)}")
                 else:
-                    print(f"Warning@: Original image not found: {image_path}")
+                    print(f"Warning: Original image not found: {image_path}")
         except Exception as e:
-            print(f"Warning: Error loading original image {image_path}: {e}")
+            print(f"Warning: Error loading original image {image_path}: {str(e)}")
+            # Try to provide more context about what went wrong
+            if "No such file or directory" in str(e):
+                print(f"  → File does not exist at path: {image_path}")
+            elif "Permission denied" in str(e):
+                print(f"  → Permission denied accessing: {image_path}")
+            elif "Invalid argument" in str(e):
+                print(f"  → Invalid file path format: {image_path}")
     
     return original_images
 

@@ -247,7 +247,13 @@ function Run-SingleExecution {
         [Console]::InputEncoding = [System.Text.Encoding]::UTF8
         
         # Start process with only stdout redirected, let stderr (tqdm) display naturally
-        $process = Start-Process -FilePath "py" -ArgumentList "-3.11", "`"$($ScriptPathAbs)`"", "--input-json", "`"$($InputJsonAbs)`"" -Wait -PassThru -NoNewWindow -RedirectStandardOutput $tempStdout
+        if ($ScriptType -eq "train") {
+            # Training command with distributed run
+            $process = Start-Process -FilePath "py" -ArgumentList "-3.11", "-m", "torch.distributed.run", "--standalone", "--nnodes=1", "--nproc-per-node=1", "`"$($ScriptPathAbs)`"", "--input-json", "`"$($InputJsonAbs)`"" -Wait -PassThru -NoNewWindow -RedirectStandardOutput $tempStdout
+        } else {
+            # Evaluation command
+            $process = Start-Process -FilePath "py" -ArgumentList "-3.11", "`"$($ScriptPathAbs)`"", "--input-json", "`"$($InputJsonAbs)`"" -Wait -PassThru -NoNewWindow -RedirectStandardOutput $tempStdout
+        }
         $ExitCode = $process.ExitCode
         
         # Read only the stdout content for our output capture

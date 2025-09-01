@@ -181,8 +181,7 @@ class MixedFineTuningDataset(Dataset):
         
         # Determine loading strategy based on available parameters
         self._determine_loading_strategy(
-            fine_tuning_csv, split_csv_path, split_json_path, 
-            fine_tuning_json, unified_json, patch_size, num_datafile, object_class, mode, anomaly_class, rootdir
+            split_csv_path, fine_tuning_json, unified_json, patch_size, num_datafile, object_class, mode, anomaly_class, rootdir
         )
         
         # Set up augmentations
@@ -214,15 +213,27 @@ class MixedFineTuningDataset(Dataset):
             print(f"Total dataset size: {self.total_size} (includes all patches)")
             
         else:
-            # Fallback if no fine-tuning patches
-            self.total_size = split_source_count + total_equal_spaced_patches
-            print(f"Total dataset size: {self.total_size} (Split source: {split_source_count} + Patches: {total_equal_spaced_patches})")
+            # Fallback if no fine-tuning patches - fix double-counting of equal-spaced images
+            # Count regular images (for direct access) separately from equal-spaced images (which only contribute patches)
+            regular_image_count = sum(1 for img in self.split_source_image_paths 
+                                     if not img.get('equal_spaced_cropping', False))
+            
+            print(f"Regular image count: {regular_image_count}")
+            print(f"Equal-spaced patches: {total_equal_spaced_patches}")
+            self.total_size = regular_image_count + total_equal_spaced_patches
+            print(f"Total dataset size: {self.total_size} (Regular images: {regular_image_count} + Equal-spaced patches: {total_equal_spaced_patches})")
+            
+            if self.debug:
+                equal_spaced_image_count = sum(1 for img in self.split_source_image_paths 
+                                              if img.get('equal_spaced_cropping', False))
+                print(f"DEBUG: Split source breakdown - Regular: {regular_image_count}, Equal-spaced images: {equal_spaced_image_count}, Total split_source_count: {split_source_count}")
+                print(f"DEBUG: Equal-spaced images contribute {total_equal_spaced_patches} patches, not direct access")
         
         if self.total_size == 0:
             raise Exception("No images loaded from any source")
 
-    def _determine_loading_strategy(self, fine_tuning_csv, split_csv_path, 
-                                   split_json_path, fine_tuning_json, unified_json, 
+    def _determine_loading_strategy(self, split_csv_path, 
+                                   fine_tuning_json, unified_json, 
                                    patch_size, num_datafile, object_class, mode, anomaly_class, rootdir):
         """
         Determine which loading strategy to use based on available parameters
@@ -245,34 +256,18 @@ class MixedFineTuningDataset(Dataset):
         if unified_json:
             print("Using unified JSON loading strategy")
             self._load_unified_json_data(unified_json, patch_size, rootdir, num_datafile, object_class, mode, anomaly_class)
-            
-        # Strategy 2: Mixed fine-tuning mode (fine_tuning_csv + split_csv_path)
-        elif fine_tuning_csv and split_csv_path:
-            print("Using mixed fine-tuning loading strategy")
-            self._load_fine_tuning_patches(fine_tuning_csv, rootdir)
-            self._load_split_source_images(split_csv_path, num_datafile, rootdir)
-            
-        # Strategy 3: Fine-tuning JSON mode (PCBDataset compatibility)
+             
+        # Strategy 2: Fine-tuning JSON mode (PCBDataset compatibility)
         elif fine_tuning_json:
             print("Using fine-tuning JSON loading strategy")
             self._load_fine_tuning_json_data(fine_tuning_json, rootdir)
-            
-        # Strategy 3: Fine-tuning CSV mode (PCBDataset compatibility)
-        elif fine_tuning_csv:
-            print("Using fine-tuning CSV loading strategy")
-            self._load_fine_tuning_csv_data(fine_tuning_csv, rootdir)
-            
-        # Strategy 4: JSON split mode (PCBDataset compatibility)
-        elif split_json_path:
-            print("Using JSON split loading strategy")
-            self._load_json_data(split_json_path, rootdir, num_datafile, object_class, mode, anomaly_class)
-            
-        # Strategy 5: CSV split mode (PCBDataset compatibility)
+    
+        # Strategy 3: CSV split mode (PCBDataset compatibility)
         elif split_csv_path:
             print("Using CSV split loading strategy")
             self._load_csv_data(split_csv_path, rootdir, num_datafile, object_class, mode, anomaly_class)
             
-        # Strategy 6: Default CSV mode (PCBDataset compatibility)
+        # Strategy 4: Default CSV mode (PCBDataset compatibility)
         else:
             print("Using default CSV loading strategy")
             self._load_csv_data(None, rootdir, num_datafile, object_class, mode, anomaly_class)
@@ -314,49 +309,6 @@ class MixedFineTuningDataset(Dataset):
             print(f"Warning: Fine-tuning JSON file not found: {fine_tuning_json}")
             raise Exception("Fine-tuning JSON file not found")
 
-    def _load_fine_tuning_csv_data(self, fine_tuning_csv, rootdir):
-        """Load image paths and masks directly from the fine-tuning CSV file (PCBDataset compatibility)"""
-        if os.path.exists(fine_tuning_csv):
-            # Read CSV file using pandas
-            df = pd.read_csv(fine_tuning_csv)
-            
-            print(f"DEBUG: Loading fine-tuning data from CSV: {fine_tuning_csv}")
-            print(f"DEBUG: CSV columns: {list(df.columns)}")
-            print(f"DEBUG: Found {len(df)} entries in CSV file")
-            
-            # Filter entries based on split and category (similar to _load_csv_data)
-            if 'split' in df.columns:
-                df = df.query(f'split=="train"')  # Use train split for fine-tuning
-            
-            if 'category' in df.columns:
-                df = df.query('category=="good"')  # Use good images for fine-tuning
-            
-            if len(df) == 0:
-                raise Exception("No data found in CSV file after filtering")
-            
-            for i, row in df.iterrows():
-                image_path = row.get('image')
-                if not image_path:
-                    continue
-                    
-                # Normalize the path to handle mixed separators
-                normalized_path = os.path.normpath(str(image_path).strip())
-                if os.path.exists(normalized_path):
-                    self.split_source_image_paths.append({
-                        'path': normalized_path,
-                        'object_class': 0,  # pcb
-                        'anomaly_class': "good",
-                        'is_csv': False
-                    })
-                else:
-                    print(f"Warning: Image not found: {normalized_path}")
-            
-            print(f"Loaded {len(self.split_source_image_paths)} images from fine-tuning CSV")
-            
-        else:
-            print(f"Warning: Fine-tuning CSV file not found: {fine_tuning_csv}")
-            raise Exception("Fine-tuning CSV file not found")
-    #
     def _load_unified_json_data(self, unified_json, patch_size, rootdir, num_datafile, object_class, mode, anomaly_class):
         """
         Load data from unified JSON file that contains both fine-tuning patches and split information.
@@ -515,81 +467,6 @@ class MixedFineTuningDataset(Dataset):
         if fine_tuning_count == 0 and split_count == 0:
             raise Exception("No valid data found in unified JSON file")
 
-    def _load_json_data(self, split_json_path, rootdir, num_datafile, object_class, mode, anomaly_class):
-        """Load image paths and masks from JSON file (PCBDataset compatibility)"""
-        if split_json_path is None:
-            raise Exception("split_json_path is required for JSON-based loading")
-        
-        with open(split_json_path, 'r') as f:
-            json_data = json.load(f)
-        
-        # Extract entries from JSON
-        entries = json_data.get('entries', [])
-        
-        if num_datafile is not None:
-            # Ensure we don't sample more than available data
-            if len(entries) > num_datafile:
-                import random
-                entries = random.sample(entries, num_datafile)
-        
-        # Filter entries based on object_class and mode
-        filtered_entries = []
-        for entry in entries:
-            # Check if entry has required fields
-            if 'image_path' in entry:
-                # For now, we'll include all entries since JSON structure may vary
-                filtered_entries.append(entry)
-        
-        if len(filtered_entries) == 0:
-            raise Exception("No data found in JSON file")
-
-        for entry in filtered_entries:
-            image_path = entry.get('image_path')
-            if not image_path:
-                continue
-                
-            # Check if image exists
-            if not os.path.exists(image_path):
-                print(f"Warning: Image path not found: {image_path}")
-                continue
-            
-            try:
-                # Check if this entry has grid coordinates (patch-specific)
-                grid_row = entry.get('grid_row')
-                grid_col = entry.get('grid_col')
-                
-                if grid_row is not None and grid_col is not None:
-                    # This is a patch-specific entry - store as split source image for augmentation
-                    self.split_source_image_paths.append({
-                        'path': image_path,
-                        'object_class': 0,  # pcb
-                        'anomaly_class': "good",
-                        'is_csv': False,
-                        'patch_info': {
-                            'pixel_coordinates': [
-                                grid_col * 128,  # Convert grid coordinates to pixel coordinates
-                                grid_row * 128,
-                                (grid_col + 1) * 128,
-                                (grid_row + 1) * 128
-                            ],
-                            'grid_row': grid_row,
-                            'grid_col': grid_col,
-                            'anomaly_max': entry.get('anomaly_max', 0),
-                            'status': entry.get('status', 'FP')
-                        }
-                    })
-                else:
-                    # This is a full image entry (no grid coordinates)
-                    self.split_source_image_paths.append({
-                        'path': image_path,
-                        'object_class': 0,  # pcb
-                        'anomaly_class': "good",
-                        'is_csv': False
-                    })
-                
-            except Exception as e:
-                print(f"Warning: Could not process image {image_path}: {e}")
-                continue
 
     def _load_csv_data(self, split_csv_path, rootdir, num_datafile, object_class, mode, anomaly_class):
         """Load image paths and masks from CSV file (PCBDataset compatibility)"""
@@ -633,7 +510,10 @@ class MixedFineTuningDataset(Dataset):
                 'path': data_path,
                 'object_class': 0,  # pcb
                 'anomaly_class': str(row["category"]),
-                'is_csv': False
+                'is_csv': False,
+                'random_cropping': True,
+                'split': str(row["split"]),
+                'label': str(row["label"])
             })
 
     def _load_false_positive_patches(self, fp_review_file):
@@ -701,144 +581,6 @@ class MixedFineTuningDataset(Dataset):
         
         return True, crop_x, crop_y, crop_w, crop_h, patch_info
 
-    def _load_fine_tuning_patches(self, csv_path, rootdir):
-        """Load fine-tuning patches from CSV file (no augmentation) - similar to _load_csv_data in PCBDataLoader.py"""
-        df = pd.read_csv(csv_path)
-        
-        # Filter for train split and good category
-        if 'split' in df.columns:
-            df = df.query(f'split=="train"')
-        
-        if 'category' in df.columns:
-            df = df.query('category=="good"')
-            
-        if len(df) == 0:
-            print("Warning: No data found in CSV file after filtering")
-            return
-            
-        # Define object class dictionary
-        object_cls_dict = {"pcb": 0}
-        
-        # Initialize lists to store loaded data (similar to PCBDataLoader.py)
-        self.fine_tuning_images = []
-        self.fine_tuning_segs = []
-        self.fine_tuning_object_classes = []
-        self.fine_tuning_patches = []
-        self.fine_tuning_anomaly_classes = []
-        
-        for i, row in df.iterrows():
-            # Fix path handling to ensure consistent separators
-            image_filename = str(row["image"]).strip()
-            # Normalize the path to handle mixed separators
-            data_path = os.path.normpath(os.path.join(rootdir, image_filename))
-            
-            # Check if file exists before trying to load it
-            if not os.path.exists(data_path):
-                print(f"Warning: Image file not found: {data_path}")
-                print(f"  - rootdir: {rootdir}")
-                print(f"  - image filename: {image_filename}")
-                continue
-                
-            try:
-                img = np.array(
-                    Image.open(data_path).convert("RGB")
-                    # .resize((self.image_size, self.image_size))
-                ).astype(np.uint8)
-                self.fine_tuning_patches.append({
-                    'path': data_path,
-                    'object_class': object_cls_dict[str(row["object"])],
-                    'anomaly_class': str(row["category"]),
-                    'is_csv': True,
-                    'random_cropping': False,
-                    'equal_spaced_cropping': False,
-                    'num_patches': 0,
-                    'split': 'train',
-                    'label': 'good'
-                })
-                self.fine_tuning_images.append(img)
-                self.fine_tuning_object_classes.append(object_cls_dict[str(row["object"])])
-                self.fine_tuning_anomaly_classes.append(str(row["category"]))
-                
-                # For CSV images, we assume they are good images (no masks)
-                #seg_shape = (self.image_size, self.image_size)
-                #self.csv_segs.append(np.zeros(seg_shape))
-                
-            except Exception as e:
-                print(f"Error loading image {data_path}: {e}")
-                continue
-
-    def _load_split_source_images(self, csv_path, num_datafile, rootdir):
-        """Load split source images from CSV file (with augmentation) - similar to _load_csv_data in PCBDataLoader.py"""
-        if csv_path is None:
-            df = pd.read_csv(os.path.join(".", "splits", "pcb-split.csv"))
-        else:
-            df = pd.read_csv(csv_path)
-        
-        if num_datafile is not None:
-            # Ensure we don't sample more than available data
-            df = df.sample(n=num_datafile, replace=True)
-        
-        # Filter for train split and good category
-        if 'split' in df.columns:
-            df = df.query(f'split=="train"')
-        
-        if 'category' in df.columns:
-            df = df.query('category=="good"')
-
-        if len(df) == 0:
-            print("Warning: No data found in existing CSV file after filtering")
-            return
-            
-        # Define object class dictionary
-        object_cls_dict = {"pcb": 0}
-        
-        # Initialize lists to store loaded data (similar to PCBDataLoader.py)
-        self.split_source_images = []
-        self.split_source_segs = []
-        self.split_source_object_classes = []
-        self.split_source_image_paths = []
-        self.split_source_anomaly_classes = []
-        
-        for i, row in df.iterrows():
-            # Fix path handling to ensure consistent separators
-            image_filename = str(row["image"]).strip()
-            # Normalize the path to handle mixed separators
-            data_path = os.path.normpath(os.path.join(rootdir, image_filename))
-            
-            # Check if file exists before trying to load it
-            if not os.path.exists(data_path):
-                print(f"Warning: Image file not found: {data_path}")
-                print(f"  - rootdir: {rootdir}")
-                print(f"  - image filename: {image_filename}")
-                continue
-                
-            try:
-                img = np.array(
-                    Image.open(data_path).convert("RGB")
-                    # .resize((self.image_size, self.image_size))
-                ).astype(np.uint8)
-                self.split_source_image_paths.append({
-                    'path': data_path,
-                    'object_class': object_cls_dict[str(row["object"])],
-                    'anomaly_class': str(row["category"]),
-                    'is_csv': False,
-                    'random_cropping': True,
-                    'equal_spaced_cropping': False,
-                    'num_patches': 0,
-                    'split': 'train',
-                    'label': 'good'
-                })
-                self.split_source_images.append(img)
-                self.split_source_object_classes.append(object_cls_dict[str(row["object"])])
-                self.split_source_anomaly_classes.append(str(row["category"]))
-                
-                # For existing images, we assume they are good images (no masks)
-                #seg_shape = img.shape[:2]  # Use actual image shape
-                #self.existing_segs.append(np.zeros(seg_shape))
-                
-            except Exception as e:
-                print(f"Error loading image {data_path}: {e}")
-                continue
 
     def _setup_augmentations(self):
         """Set up augmentation functions for existing images"""
@@ -1076,7 +818,160 @@ class MixedFineTuningDataset(Dataset):
         cycle = index // 10
         position_in_cycle = index % 10
         
-        if position_in_cycle < fine_tuning_per_cycle and fine_tuning_count > 0:
+        # Handle CSV-only mode (no fine-tuning patches, only split source images)
+        if fine_tuning_count == 0 and split_source_count > 0:
+            # Check if this is pure CSV mode (all regular images) or mixed mode (regular + equal-spaced)
+            regular_image_count = sum(1 for img in self.split_source_image_paths 
+                                     if not img.get('equal_spaced_cropping', False))
+            
+            if regular_image_count == split_source_count:
+                # Pure CSV mode - all images are regular, use simple indexing
+                split_source_index = index % split_source_count
+                if self.debug:
+                    print(f"DEBUG: Pure CSV mode - Using split source image {split_source_index} for index {index}")
+            else:
+                # Mixed mode without fine-tuning - need to handle regular + equal-spaced separation
+                if index < regular_image_count:
+                    # Find the index-th regular image
+                    regular_images_seen = 0
+                    split_source_index = 0
+                    for i, img_data in enumerate(self.split_source_image_paths):
+                        if not img_data.get('equal_spaced_cropping', False):
+                            if regular_images_seen == index:
+                                split_source_index = i
+                                break
+                            regular_images_seen += 1
+                    if self.debug:
+                        print(f"DEBUG: Mixed mode (no fine-tuning) - Regular image access, using image {split_source_index} for index {index}")
+                else:
+                    # Handle equal-spaced patch access using existing logic
+                    if self.debug:
+                        print(f"DEBUG: Mixed mode (no fine-tuning) - Equal-spaced patch access for index {index}")
+                    # Reuse the complex equal-spaced logic from the original code but without fine-tuning cycles
+                    patch_index = index - regular_image_count
+                    
+                    # Find which image and which patch within that image
+                    current_patch_count = 0
+                    selected_image_data = None
+                    selected_patch_info = None
+                    
+                    for img_data in self.split_source_image_paths:
+                        if img_data.get('equal_spaced_cropping'):
+                            num_patches = img_data.get('num_patches', 0)
+                            if current_patch_count <= patch_index < current_patch_count + num_patches:
+                                # This is the image we want
+                                selected_image_data = img_data
+                                local_patch_index = patch_index - current_patch_count
+                                selected_patch_info = {
+                                    'grid_index': local_patch_index,
+                                    'grid_row': local_patch_index // img_data.get('grid_cols', 1),
+                                    'grid_col': local_patch_index % img_data.get('grid_cols', 1)
+                                }
+                                break
+                            current_patch_count += num_patches
+                    
+                    if selected_image_data is None:
+                        # Fallback to first regular image
+                        for img_data in self.split_source_image_paths:
+                            if not img_data.get('equal_spaced_cropping', False):
+                                selected_image_data = img_data
+                                selected_patch_info = None
+                                break
+                        split_source_index = self.split_source_image_paths.index(selected_image_data)
+                    else:
+                        split_source_index = self.split_source_image_paths.index(selected_image_data)
+            
+            # Simple indexing for pure CSV mode only
+            if regular_image_count == split_source_count:
+                pass  # split_source_index already set above
+            
+            # Get split source image data
+            split_source_data = self.split_source_image_paths[split_source_index]
+            img_path = split_source_data['path']
+            
+            # Load image directly
+            try:
+                img = np.array(Image.open(img_path).convert("RGB")).astype(np.uint8)
+            except Exception as e:
+                print(f"Error loading CSV image {img_path}: {e}")
+                raise e
+            
+            # Apply basic augmentations if enabled
+            if self.augment:
+                # Apply brightness/contrast
+                img, brightness_factor, contrast_factor, bc_applied = albumentations_brightness_contrast(
+                    img, brightness_limit=0.05, contrast_limit=0.05, p=0.5
+                )
+                
+                # Apply rotation
+                h, w = img.shape[:2]
+                center = (w // 2, h // 2)
+                rotation_angle = np.random.uniform(-5, 5)
+                rotation_matrix = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
+                img = cv2.warpAffine(img, rotation_matrix, (w, h),
+                                   flags=cv2.INTER_NEAREST,
+                                   borderMode=cv2.BORDER_REPLICATE)
+                
+                # Random crop to target size
+                crop_h = min(self.image_size, h)
+                crop_w = min(self.image_size, w)
+                max_h = h - crop_h
+                max_w = w - crop_w
+                crop_y = np.random.randint(0, max_h + 1) if max_h > 0 else 0
+                crop_x = np.random.randint(0, max_w + 1) if max_w > 0 else 0
+                img = img[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+            else:
+                # Center crop if no augmentation
+                h, w = img.shape[:2]
+                crop_h = min(self.image_size, h)
+                crop_w = min(self.image_size, w)
+                crop_y = (h - crop_h) // 2
+                crop_x = (w - crop_w) // 2
+                img = img[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+                brightness_factor = 0
+                contrast_factor = 0
+                bc_applied = False
+                rotation_angle = 0
+            
+            # Create transform info for CSV-only mode
+            x1, y1, x2, y2 = crop_x, crop_y, crop_x + crop_w, crop_y + crop_h
+            transform_info = {
+                'crop_coords': [x1, y1, x2, y1, x2, y2, x1, y2],  # 8 values for consistency
+                'rotation_angle': rotation_angle,
+                'brightness_factor': brightness_factor,
+                'contrast_factor': contrast_factor,
+                'brightness_contrast_applied': bc_applied,
+                'original_shape': (h, w),  # Use original image dimensions
+                'is_csv_image': True,
+                'epoch': self.current_epoch,
+                'augmentation_applied': self.augment,
+                'patch_type': 'csv_only',
+                'grid_position': (0, 0)  # Default for non-grid based
+            }
+            
+            # Apply transform
+            if self.transform:
+                img = self.transform(img)
+            else:
+                img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+            
+            # Create dummy segmentation mask
+            seg = torch.zeros(1, img.shape[1], img.shape[2])
+            
+            # Track crop if enabled
+            if self.track_crop:
+                self.add_crop_to_cumulative_map(img_path, transform_info, self.current_epoch)
+            
+            return (
+                img,
+                seg,
+                int(split_source_data['object_class']),
+                img_path,
+                split_source_data['anomaly_class'],
+                transform_info,
+            )
+        
+        elif position_in_cycle < fine_tuning_per_cycle and fine_tuning_count > 0:
             # Use fine-tuning patch (small, no augmentation)
             # Ensure all fine-tuning patches are used by cycling through them properly
             fine_tuning_index = (cycle * fine_tuning_per_cycle + position_in_cycle) % fine_tuning_count

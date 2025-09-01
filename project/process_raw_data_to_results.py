@@ -34,7 +34,8 @@ from utils import (
     path_to_safe_filename,
     safe_filename_to_path,
     _binary_mask_exclude_boundary3,
-    load_original_images
+    load_original_images,
+    load_ground_truth_map
 )
 
 # Type definitions
@@ -62,42 +63,6 @@ def _get_patch_base_key_from_filename(file_path: str) -> str:
         return stem
     # Re-attach the marker so keys are unambiguous and consistent
     return parts[0] + "__minimal_diff"
-
-def load_ground_truth_map(annotation_dir: str) -> Dict[str, Set[Tuple[int, int]]]:
-    """
-    Load ground truth defective patches for all images from annotation files.
-    
-    Args:
-        annotation_dir: Directory containing annotation files
-        
-    Returns:
-        Dictionary mapping image paths to sets of (grid_row, grid_col) tuples
-    """
-    ground_truth_map = {}
-    
-    if not annotation_dir or not os.path.exists(annotation_dir):
-        return ground_truth_map
-    
-    # Find all annotation files
-    annotation_files = glob.glob(os.path.join(annotation_dir, "*__annotations.json"))
-    
-    for annotation_file in annotation_files:
-        try:
-            with open(annotation_file, 'r') as f:
-                annotation = json.load(f)
-                
-            # Get the original image path from the annotation
-            image_path = annotation.get("image_path")
-            if image_path:
-                # Convert defective patches to set of tuples
-                defective_patches = set(tuple(x) for x in annotation.get("defective_patches", []))
-                ground_truth_map[image_path] = defective_patches
-                
-        except Exception as e:
-            print(f"Warning: Error reading annotation file {annotation_file}: {e}")
-    
-    return ground_truth_map
-
 
 
 def create_anomaly_overlay(original_image: np.ndarray, anomaly_map: np.ndarray, is_binary: bool = True) -> np.ndarray:
