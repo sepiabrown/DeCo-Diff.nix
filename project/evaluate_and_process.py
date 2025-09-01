@@ -1991,19 +1991,7 @@ def _process_records_stream_incrementally(
         max_workers = min(os.cpu_count() * 2, 16)  # Use more workers for better CPU utilization
         print(f"🚀 Auto-detected workers: {max_workers} (from {os.cpu_count()} CPU cores)")
     
-    # Convert patch_groups to list for chunk size calculation
-    patch_list = list(patch_groups)
-    total_patches = len(patch_list)
-    
-    if getattr(args, 'chunk_size', None):
-        chunk_size = args.chunk_size
-        print(f"🚀 Using custom chunk size: {chunk_size}")
-    else:
-        # Auto-calculate chunk size for round-robin distribution
-        chunk_size = max(1, total_patches // (max_workers * 4))  # Distribute work evenly
-        print(f"🚀 Auto-calculated chunk size: {chunk_size}")
-    
-    print(f"🚀 Round-robin parallel processing: {max_workers} workers, chunk size {chunk_size}")
+    print(f"🚀 Round-robin parallel processing: {max_workers} workers")
     
     # Thread-safe counters and collections
     total_records_lock = threading.Lock()
@@ -2011,311 +1999,132 @@ def _process_records_stream_incrementally(
     normal_records_lock = threading.Lock()
     image_to_records_lock = threading.Lock()
     
-    def process_patch_chunk(chunk_data, chunk_idx):
-        """Process a chunk of patches in parallel."""
-        chunk_records = []
-        chunk_total = 0
-        chunk_defects = 0
-        chunk_normals = 0
-        chunk_image_records = defaultdict(list)
+    def process_single_patch_wrapper(patch_data):
+        """Process a single patch in round-robin distribution."""
+        current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw = patch_data
         
-        for current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw in chunk_data:
-            record = _process_single_patch(
-                ground_truth_map=ground_truth_map,
-                original_images=original_images,
-                anomaly_binary_threshold=args.anomaly_binary_threshold,
-                anomaly_pixel_num_threshold=args.anomaly_pixel_num_threshold,
-                patch_size=args.patch_size,
-                current_image_path=current_image_path,
-                coords_8_values=coords_8_values,
-                encodedrecon_raw=encodedrecon_raw,
-                latent_raw=latent_raw,
-                anomaly_map_arithmetic_raw=anomaly_map_arithmetic_raw,
-            )
-            if record is None:
-                continue
-                
-            chunk_records.append(record)
-            chunk_total += 1
-            is_predicted_defective = record.get("is_predicted_defective", (None, False))[1]
-            if is_predicted_defective:
-                chunk_defects += 1
-            else:
-                chunk_normals += 1
-            chunk_image_records[current_image_path].append(record)
+        record = _process_single_patch(
+            ground_truth_map=ground_truth_map,
+            original_images=original_images,
+            anomaly_binary_threshold=args.anomaly_binary_threshold,
+            anomaly_pixel_num_threshold=args.anomaly_pixel_num_threshold,
+            patch_size=args.patch_size,
+            current_image_path=current_image_path,
+            coords_8_values=coords_8_values,
+            encodedrecon_raw=encodedrecon_raw,
+            latent_raw=latent_raw,
+            anomaly_map_arithmetic_raw=anomaly_map_arithmetic_raw,
+        )
         
+        if record is None:
+            return None
+            
+        # Return record with metadata for aggregation
+        is_predicted_defective = record.get("is_predicted_defective", (None, False))[1]
         return {
-            'records': chunk_records,
-            'total': chunk_total,
-            'defects': chunk_defects,
-            'normals': chunk_normals,
-            'image_records': dict(chunk_image_records)
+            'record': record,
+            'is_defective': is_predicted_defective,
+            'image_path': current_image_path
         }
     
-    # Use the already created patch_list for round-robin distribution
-    
-    # Process chunks using concurrent queues with immediate submission
-    from queue import Queue
-    import threading
-    
-    # Create queues for chunk submission and result collection
-    chunk_queue = Queue(maxsize=max_workers * 2)  # Limit queue size to prevent memory buildup
-    result_queue = Queue()
-    
-    # Track submitted and completed chunks
-    submitted_chunks = 0
-    completed_chunks = 0
-    total_chunks = (total_patches + chunk_size - 1) // chunk_size  # Calculate total chunks
-    
-    # Track active workers and utilization statistics with minimal overhead
-    from threading import Lock
+    # Use ThreadPoolExecutor for true round-robin processing
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     import time
     
-    # Check if monitoring is disabled for maximum performance
-    enable_monitoring = not getattr(args, 'no_worker_monitoring', False)
+    start_time = time.time()
+    processed_count = 0
     
-    if enable_monitoring:
-        # Use atomic operations where possible to reduce lock contention
-        active_workers_lock = Lock()
-        active_workers_count = 0
-        peak_active_workers = 0
-        total_worker_seconds = 0.0
-        processing_start_time = None
+    print(f"📊 Starting round-robin parallel processing...")
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all patches using round-robin distribution
+        futures = []
         
-        # Batch progress updates to reduce overhead
-        progress_update_counter = 0
-        progress_update_interval = 5  # Update progress every 5 chunks
-        print(f"📊 Worker monitoring enabled (use --no-worker-monitoring to disable for max performance)")
-    else:
-        # Minimal monitoring for maximum performance
-        active_workers_lock = None
-        active_workers_count = 0
-        peak_active_workers = 0
-        total_worker_seconds = 0.0
-        processing_start_time = None
-        progress_update_counter = 0
-        progress_update_interval = 0  # Disable progress updates
-        print(f"⚡ Worker monitoring disabled for maximum performance")
-    
-    print(f"📊 Streaming round-robin: {total_chunks} chunks of ~{chunk_size} patches each")
-    print(f"🚀 Queue-based processing: max queue size {max_workers * 2}")
-    
-    # Worker function that processes chunks from the queue
-    def worker_consumer():
-        nonlocal completed_chunks, active_workers_count, peak_active_workers, total_worker_seconds, processing_start_time
-        while True:
-            try:
-                # Get chunk from queue with timeout to allow graceful shutdown
-                chunk_data = chunk_queue.get(timeout=1.0)
-                if chunk_data is None:  # Sentinel value to stop workers
-                    break
+        with tqdm(desc="Submitting patches", unit="patch") as submit_pbar:
+            for i, patch_data in enumerate(patch_groups):
+                future = executor.submit(process_single_patch_wrapper, patch_data)
+                futures.append(future)
+                submit_pbar.update(1)
                 
-                # Mark worker as active with minimal lock time (conditional)
-                worker_start_time = time.time() if enable_monitoring else None
-                if enable_monitoring and active_workers_lock:
-                    with active_workers_lock:
-                        active_workers_count += 1
-                        if active_workers_count > peak_active_workers:
-                            peak_active_workers = active_workers_count
-                        if processing_start_time is None:
-                            processing_start_time = worker_start_time
-                
-                chunk_idx, chunk = chunk_data
-                chunk_result = process_patch_chunk(chunk, chunk_idx)
-                
-                # Put result in result queue
-                result_queue.put((chunk_idx, chunk_result))
-                
-                # Mark worker as inactive with minimal lock time (conditional)
-                if enable_monitoring and active_workers_lock:
-                    worker_end_time = time.time()
-                    worker_duration = worker_end_time - worker_start_time
-                    with active_workers_lock:
-                        active_workers_count -= 1
-                        total_worker_seconds += worker_duration
-                
-                # Mark task as done
-                chunk_queue.task_done()
-                
-            except Exception as e:
-                print(f"⚠️  Worker error: {e}")
-                # Mark worker as inactive even on error (conditional)
-                if enable_monitoring and active_workers_lock:
-                    with active_workers_lock:
-                        active_workers_count -= 1
-                chunk_queue.task_done()
-    
-    # Start worker threads
-    worker_threads = []
-    for i in range(max_workers):
-        worker = threading.Thread(target=worker_consumer, daemon=True)
-        worker.start()
-        worker_threads.append(worker)
-    
-    # Producer thread that submits chunks to the queue
-    def chunk_producer():
-        nonlocal submitted_chunks
-        for i in range(0, total_patches, chunk_size):
-            chunk = patch_list[i:i + chunk_size]
-            if chunk:  # Only submit non-empty chunks
-                chunk_idx = submitted_chunks
-                # Wait if queue is full (backpressure)
-                chunk_queue.put((chunk_idx, chunk))
-                submitted_chunks += 1
+                # Update progress every 50 submissions to show worker activity
+                if i % 50 == 0:
+                    # Count active workers by checking running futures
+                    active_workers = sum(1 for f in futures if f.running())
+                    completed_workers = sum(1 for f in futures if f.done() and not f.cancelled())
+                    submit_pbar.set_postfix({
+                        'submitted': i+1,
+                        'active': active_workers,
+                        'completed': completed_workers,
+                        'workers': f"{active_workers}/{max_workers}"
+                    })
         
-        # Send sentinel values to stop workers
-        for _ in range(max_workers):
-            chunk_queue.put(None)
-    
-    # Start producer thread
-    producer_thread = threading.Thread(target=chunk_producer, daemon=True)
-    producer_thread.start()
-    
-    # Process results as they arrive
-    with tqdm(total=total_chunks, desc="Processing chunks", unit="chunk") as pbar:
-        while completed_chunks < total_chunks:
-            try:
-                # Get result with timeout
-                chunk_idx, chunk_result = result_queue.get(timeout=1.0)
-                
-                # Aggregate chunk results with thread safety
-                with total_records_lock:
-                    total_records += chunk_result['total']
-                with defect_records_lock:
-                    defect_records_count += chunk_result['defects']
-                with normal_records_lock:
-                    normal_records_count += chunk_result['normals']
-                
-                # Add records to batch and image tracking
-                batch_records.extend(chunk_result['records'])
-                
-                with image_to_records_lock:
-                    for img_path, img_records in chunk_result['image_records'].items():
-                        image_to_records[img_path].extend(img_records)
-                
-                completed_chunks += 1
-                
-                # Get current active workers count (batched to reduce overhead)
-                if enable_monitoring:
-                    progress_update_counter += 1
-                    if progress_update_counter >= progress_update_interval:
-                        with active_workers_lock:
-                            current_active_workers = active_workers_count
-                        
-                        # Calculate worker utilization percentage
-                        worker_utilization = (current_active_workers / max_workers) * 100 if max_workers > 0 else 0
-                        
-                        pbar.set_postfix({
-                            'total': total_records,
-                            'defects': defect_records_count,
-                            'normals': normal_records_count,
-                            'batch_size': len(batch_records),
-                            'submitted': submitted_chunks,
-                            'completed': completed_chunks,
-                            'workers': f"{current_active_workers}/{max_workers}",
-                            'util': f"{worker_utilization:.0f}%"
-                        })
-                        progress_update_counter = 0
+        print(f"📊 Submitted {len(futures)} patches for parallel processing")
+        
+        # Process results as they complete (true parallelism)
+        with tqdm(total=len(futures), desc="Processing results", unit="patch") as pbar:
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    if result is None:
+                        continue
+                    
+                    record = result['record']
+                    is_predicted_defective = result['is_defective']
+                    current_image_path = result['image_path']
+                    
+                    # Thread-safe aggregation
+                    batch_records.append(record)
+                    
+                    with total_records_lock:
+                        total_records += 1
+                    
+                    if is_predicted_defective:
+                        with defect_records_lock:
+                            defect_records_count += 1
                     else:
-                        # Lightweight progress update without worker stats
-                        pbar.set_postfix({
-                            'total': total_records,
-                            'defects': defect_records_count,
-                            'normals': normal_records_count,
-                            'batch_size': len(batch_records),
-                            'submitted': submitted_chunks,
-                            'completed': completed_chunks
-                        })
-                else:
-                    # Minimal progress update when monitoring is disabled
+                        with normal_records_lock:
+                            normal_records_count += 1
+                    
+                    with image_to_records_lock:
+                        image_to_records[current_image_path].append(record)
+                    
+                    processed_count += 1
+                    
+                    # Update progress
                     pbar.set_postfix({
                         'total': total_records,
                         'defects': defect_records_count,
                         'normals': normal_records_count,
-                        'batch_size': len(batch_records),
-                        'submitted': submitted_chunks,
-                        'completed': completed_chunks
+                        'batch_size': len(batch_records)
                     })
-                
-                pbar.update(1)
-                
-                # Show detailed worker status every 20 chunks (reduced frequency, conditional)
-                if enable_monitoring and completed_chunks % 20 == 0:
-                    with active_workers_lock:
-                        current_active_workers = active_workers_count
-                    worker_utilization = (current_active_workers / max_workers) * 100
-                    pbar.write(f"🔧 Worker Status: {current_active_workers}/{max_workers} active ({worker_utilization:.1f}% utilization)")
-                    pbar.write(f"   📊 Queue Status: {chunk_queue.qsize()}/{chunk_queue.maxsize} chunks in queue")
-                    pbar.write(f"   📈 Progress: {completed_chunks}/{total_chunks} chunks completed ({completed_chunks/total_chunks*100:.1f}%)")
-                
-                # Process batch when it reaches the flush threshold
-                if len(batch_records) >= flush_every:
-                    _process_batch_records_immediately(
-                        args,
-                        batch_records,
-                        ground_truth_map,
-                        original_images,
-                        checkpoint_manager,
-                        output_subdir,
-                        image_to_records,
-                    )
-                    del batch_records
-                    batch_records = []
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    import gc
-                    gc.collect()
+                    pbar.update(1)
                     
-            except Exception as e:
-                print(f"⚠️  Error processing result: {e}")
-                completed_chunks += 1
-                pbar.update(1)
+                    # Process batch when it reaches the flush threshold
+                    if len(batch_records) >= flush_every:
+                        _process_batch_records_immediately(
+                            args,
+                            batch_records,
+                            ground_truth_map,
+                            original_images,
+                            checkpoint_manager,
+                            output_subdir,
+                            image_to_records,
+                        )
+                        del batch_records
+                        batch_records = []
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        import gc
+                        gc.collect()
+                        
+                except Exception as e:
+                    print(f"⚠️  Error processing patch: {e}")
+                    processed_count += 1
+                    pbar.update(1)
     
-    # Wait for all threads to complete
-    producer_thread.join()
-    for worker in worker_threads:
-        worker.join()
-    
-    # Final worker utilization summary (conditional)
-    if enable_monitoring:
-        with active_workers_lock:
-            final_active_workers = active_workers_count
-            final_peak_workers = peak_active_workers
-            final_total_worker_seconds = total_worker_seconds
-            final_processing_start_time = processing_start_time
-        
-        # Calculate utilization statistics
-        if final_processing_start_time is not None:
-            total_processing_time = time.time() - final_processing_start_time
-            total_worker_time = max_workers * total_processing_time  # Total available worker time
-            actual_worker_time = final_total_worker_seconds  # Actual worker time used
-            average_utilization = (actual_worker_time / total_worker_time) * 100 if total_worker_time > 0 else 0
-        else:
-            total_processing_time = 0
-            average_utilization = 0
-        
-        print(f"✅ Queue-based processing completed: {submitted_chunks} chunks submitted, {completed_chunks} completed")
-        print(f"🔧 Worker Statistics:")
-        print(f"   📊 Peak active workers: {final_peak_workers}/{max_workers} ({final_peak_workers/max_workers*100:.1f}% peak utilization)")
-        print(f"   ⏱️  Total processing time: {total_processing_time:.2f}s")
-        print(f"   📈 Average worker utilization: {average_utilization:.1f}%")
-        print(f"   🎯 Final worker status: {final_active_workers}/{max_workers} workers active")
-        
-        if final_active_workers == 0:
-            print(f"✅ All workers properly shut down")
-        else:
-            print(f"⚠️  Warning: {final_active_workers} workers still active (should be 0)")
-        
-        # Performance insights
-        if average_utilization < 50:
-            print(f"💡 Performance insight: Low average utilization ({average_utilization:.1f}%) - consider reducing workers or increasing chunk size")
-        elif average_utilization > 90:
-            print(f"💡 Performance insight: High utilization ({average_utilization:.1f}%) - workers are well utilized")
-        else:
-            print(f"💡 Performance insight: Moderate utilization ({average_utilization:.1f}%) - good balance")
-    else:
-        print(f"✅ Queue-based processing completed: {submitted_chunks} chunks submitted, {completed_chunks} completed")
-        print(f"⚡ Processing completed with monitoring disabled for maximum performance")
+    elapsed_time = time.time() - start_time
+    patches_per_second = processed_count / elapsed_time if elapsed_time > 0 else 0
+    print(f"✅ Round-robin processing completed: {processed_count} patches in {elapsed_time:.2f}s ({patches_per_second:.1f} patches/sec)")
 
     if batch_records:
         _process_batch_records_immediately(
