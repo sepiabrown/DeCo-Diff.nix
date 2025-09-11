@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Combined Evaluation and Processing Script
 
@@ -95,6 +96,12 @@ from models import UNET_models
 from torchvision import transforms
 from torch.utils.data import DataLoader, Dataset
 import sys
+
+# Configure UTF-8 encoding for output
+if sys.platform.startswith('win'):
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # Import utility functions
 from utils import (
@@ -1870,6 +1877,32 @@ class SmartImageCache:
         except Exception as e:
             print(f"Warning: Error loading image {image_path}: {str(e)}")
             return None
+    
+    def __contains__(self, image_path):
+        """Check if an image path is available (either cached or loadable)."""
+        # First check if it's in cache
+        if image_path in self.cache:
+            return True
+        
+        # Check if file exists on disk
+        import os
+        if os.path.exists(image_path):
+            return True
+        
+        # Try converting from safe filename
+        if '__' in image_path:
+            try:
+                from utils import safe_filename_to_path
+                actual_path = safe_filename_to_path(image_path)
+                return os.path.exists(actual_path)
+            except:
+                return False
+        
+        return False
+    
+    def __getitem__(self, image_path):
+        """Get image using bracket notation (same as get method)."""
+        return self.get(image_path)
     
     def get_stats(self):
         """Get cache statistics."""
