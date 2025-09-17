@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Combined Evaluation and Processing Script
 
@@ -95,6 +96,12 @@ from models import UNET_models
 from torchvision import transforms
 from torch.utils.data import DataLoader, Dataset
 import sys
+
+# Configure UTF-8 encoding for output
+if sys.platform.startswith('win'):
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # Import utility functions
 from utils import (
@@ -1871,6 +1878,32 @@ class SmartImageCache:
             print(f"Warning: Error loading image {image_path}: {str(e)}")
             return None
     
+    def __contains__(self, image_path):
+        """Check if an image path is available (either cached or loadable)."""
+        # First check if it's in cache
+        if image_path in self.cache:
+            return True
+        
+        # Check if file exists on disk
+        import os
+        if os.path.exists(image_path):
+            return True
+        
+        # Try converting from safe filename
+        if '__' in image_path:
+            try:
+                from utils import safe_filename_to_path
+                actual_path = safe_filename_to_path(image_path)
+                return os.path.exists(actual_path)
+            except:
+                return False
+        
+        return False
+    
+    def __getitem__(self, image_path):
+        """Get image using bracket notation (same as get method)."""
+        return self.get(image_path)
+    
     def get_stats(self):
         """Get cache statistics."""
         return {
@@ -2379,6 +2412,293 @@ def _count_distributed_folders(results_dir, files_per_patch_set=4):
         return num_folders, estimated_files
     else:
         return 0, 0
+
+
+def _get_part_folders(results_dir):
+    """
+    Get sorted list of part_* directories from the evaluation results.
+
+    Args:
+        results_dir: Base results directory
+
+    Returns:
+        List of part folder paths sorted by part number
+    """
+    import glob
+
+    base_eval_dir = os.path.join(results_dir, "evaluation_results")
+    part_pattern = os.path.join(base_eval_dir, "part_*")
+    part_folders = glob.glob(part_pattern)
+
+    # Sort by part number to ensure consistent processing order
+    def extract_part_number(path):
+        import re
+        match = re.search(r'part_(\d+)', os.path.basename(path))
+        return int(match.group(1)) if match else 0
+
+    part_folders.sort(key=extract_part_number)
+    return part_folders
+
+
+def _iterate_saved_patch_items_by_part(args, part_folder):
+    """
+    Iterate saved .npy patches from a specific part folder as a generator.
+
+    Args:
+        args: Arguments object
+        part_folder: Path to the specific part_* folder
+
+    Yields:
+        (current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw)
+    """
+    import glob
+
+    # Get all .npy files from this specific part folder
+    npy_pattern = os.path.join(part_folder, "*_encodedrecon.npy")
+    npy_files = glob.glob(npy_pattern)
+
+    debug_print(f"📁 Processing part {os.path.basename(part_folder)}: {len(npy_files)} .npy files", debug=DEBUG_ENABLED)
+
+    # Use tqdm for loading .npy files in this part
+    for npy_file in tqdm(npy_files, desc=f"Loading {os.path.basename(part_folder)}", unit="file", leave=False):
+        base_name = npy_file.replace("_encodedrecon.npy", "")
+        coords_file = f"{base_name}_coords.npy"
+        latent_file = f"{base_name}_latent.npy"
+        anomaly_file = f"{base_name}_anomaly_map_arithmetic.npy"
+
+        if os.path.exists(coords_file) and os.path.exists(latent_file) and os.path.exists(anomaly_file):
+            try:
+                patch_coords_8_values = np.load(coords_file).tolist()
+                filename = os.path.basename(npy_file)
+
+                # Extract image path portion by removing patch coordinates and file suffix
+                import re as _re
+                coord_pattern = r"__x\d+_y\d+_x\d+_y\d+_x\d+_y\d+_x\d+_y\d+__"
+                match = _re.search(coord_pattern, filename)
+                if match:
+                    file_info = filename[:match.start()]
+                else:
+                    if "__minimal_diff" in filename:
+                        file_info = filename.split("__minimal_diff")[0]
+                        file_info = _re.sub(r"__x\d+_y\d+_x\d+_y\d+_x\d+_y\d+_x\d+_y\d+$", "", file_info)
+                    else:
+                        file_info = filename.split("__")[0]
+
+                image_path = safe_filename_to_path(file_info)
+                encodedrecon_data = np.load(npy_file)
+                latent_data = np.load(latent_file)
+                anomaly_data = np.load(anomaly_file)
+
+                yield (
+                    image_path,
+                    patch_coords_8_values,
+                    encodedrecon_data.squeeze(),
+                    latent_data.squeeze(),
+                    anomaly_data.squeeze(),
+                )
+            except Exception as e:
+                debug_print(f"⚠️  Failed reading file in part {os.path.basename(part_folder)}: {npy_file}: {e}", debug=DEBUG_ENABLED)
+                continue
+
+
+class MetricsAccumulator:
+    """
+    Memory-optimized accumulator for metrics (TP/FP/FN/TN) across multiple processing parts.
+    Only stores essential metrics and optionally minimal record data.
+    """
+
+    def __init__(self, store_records=False):
+        self.total_tp = 0
+        self.total_fp = 0
+        self.total_fn = 0
+        self.total_tn = 0
+        self.total_records = 0
+        self.defect_records_count = 0
+        self.normal_records_count = 0
+
+        # Optional: Store only essential fields, not full records with numpy arrays
+        self.store_records = store_records
+        if store_records:
+            self.minimal_records = []  # Lightweight storage
+
+    def update_from_records(self, records):
+        """
+        Update metrics from a batch of records from one part.
+        Extracts only essential data and clears full records to save memory.
+
+        Args:
+            records: List of record dictionaries
+        """
+        part_tp = part_fp = part_fn = part_tn = 0
+
+        for record in records:
+            self.total_records += 1
+
+            # Count defective vs normal predictions
+            is_predicted_defective = record.get("is_predicted_defective", (None, False))[1]
+            if is_predicted_defective:
+                self.defect_records_count += 1
+            else:
+                self.normal_records_count += 1
+
+            # Count confusion matrix elements
+            status = record.get("status", (None, ""))[1]
+            if status == "TP":
+                self.total_tp += 1
+                part_tp += 1
+            elif status == "FP":
+                self.total_fp += 1
+                part_fp += 1
+            elif status == "FN":
+                self.total_fn += 1
+                part_fn += 1
+            elif status == "TN":
+                self.total_tn += 1
+                part_tn += 1
+
+            # Store only minimal data if needed for reports (no numpy arrays)
+            if self.store_records:
+                self.minimal_records.append({
+                    'status': status,
+                    'image_path': record.get("image_path", (None, ""))[1],
+                    'anomaly_pixels': int(record.get("anomaly_pixels", (None, 0))[1]),
+                    'is_defective': is_predicted_defective
+                })
+
+        # Clear full records after extracting metrics to free memory immediately
+        records.clear()
+
+        # Print part-level metrics using tqdm.write for clean output
+        tqdm.write(f"  📊 Part metrics: TP={part_tp}, FP={part_fp}, FN={part_fn}, TN={part_tn}")
+        tqdm.write(f"  📊 Cumulative: TP={self.total_tp}, FP={self.total_fp}, FN={self.total_fn}, TN={self.total_tn}")
+
+    def get_final_metrics(self):
+        """
+        Calculate and return final metrics.
+
+        Returns:
+            Dictionary containing final metrics
+        """
+        total_patches = self.total_tp + self.total_fp + self.total_fn + self.total_tn
+        accuracy = (self.total_tp + self.total_tn) / total_patches if total_patches > 0 else 0
+        precision = self.total_tp / (self.total_tp + self.total_fp) if (self.total_tp + self.total_fp) > 0 else 0
+        recall = self.total_tp / (self.total_tp + self.total_fn) if (self.total_tp + self.total_fn) > 0 else 0
+        f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+        return {
+            "total_records": self.total_records,
+            "defective_records": self.defect_records_count,
+            "normal_records": self.normal_records_count,
+            "TP": self.total_tp,
+            "FP": self.total_fp,
+            "FN": self.total_fn,
+            "TN": self.total_tn,
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1_score,
+            "total_patches": total_patches
+        }
+
+    def get_all_records(self):
+        """Return minimal records for report generation or generate placeholder data."""
+        if self.store_records:
+            return self.minimal_records
+        else:
+            # Generate minimal placeholder records from metrics only
+            return self._generate_placeholder_records()
+
+    def _generate_placeholder_records(self):
+        """Generate minimal records for reports when full records aren't stored."""
+        placeholder_records = []
+
+        # Create simple records based on metrics
+        for status, count in [("TP", self.total_tp), ("FP", self.total_fp), ("FN", self.total_fn), ("TN", self.total_tn)]:
+            for i in range(count):
+                placeholder_records.append({
+                    "status": (None, status),
+                    "image_path": (None, f"placeholder_{status}_{i}"),
+                    "is_predicted_defective": (None, status in ["TP", "FP"]),
+                    "anomaly_pixels": (None, 1 if status in ["TP", "FP"] else 0)
+                })
+
+        return placeholder_records
+
+
+def _process_single_part(args, part_folder, ground_truth_map, image_cache):
+    """
+    Process a single part folder and return the processed records.
+
+    Args:
+        args: Arguments object
+        part_folder: Path to the part_* folder to process
+        ground_truth_map: Ground truth mapping
+        image_cache: Smart image cache
+
+    Returns:
+        List of processed records from this part
+    """
+    # Get patches from this part
+    patch_item_iter = _iterate_saved_patch_items_by_part(args, part_folder)
+
+    # Process patches from this part using similar logic to the original function
+    batch_records = []
+    batch_size = max(1, int(getattr(args, "batch_size", 64)))
+
+    from collections import defaultdict
+    image_to_records = defaultdict(list)
+
+    # Count actual .npy files for accurate progress
+    import glob
+    npy_pattern = os.path.join(part_folder, "*_encodedrecon.npy")
+    npy_files = glob.glob(npy_pattern)
+    actual_count = len(npy_files)
+
+    part_name = os.path.basename(part_folder)
+
+    # Process each patch in this part with progress bar using actual count
+    for current_image_path, coords_8_values, encodedrecon_raw, latent_raw, anomaly_map_arithmetic_raw in tqdm(
+        patch_item_iter,
+        total=actual_count,
+        desc=f"Processing {part_name}",
+        unit="patch",
+        leave=False
+    ):
+        try:
+            record = _process_single_patch(
+                ground_truth_map=ground_truth_map,
+                original_images=image_cache,
+                anomaly_binary_threshold=args.anomaly_binary_threshold,
+                anomaly_pixel_num_threshold=args.anomaly_pixel_num_threshold,
+                patch_size=args.patch_size,
+                current_image_path=current_image_path,
+                coords_8_values=coords_8_values,
+                encodedrecon_raw=encodedrecon_raw,
+                latent_raw=latent_raw,
+                anomaly_map_arithmetic_raw=anomaly_map_arithmetic_raw,
+            )
+
+            if record is None:
+                continue
+
+            batch_records.append(record)
+            image_to_records[current_image_path].append(record)
+
+            # Process batch when it reaches the flush limit
+            if len(batch_records) >= batch_size:
+                # Don't save images here, just collect records
+                batch_records = []  # Clear the batch
+
+        except Exception as e:
+            debug_print(f"⚠️  Failed processing patch in part {os.path.basename(part_folder)}: {e}", debug=DEBUG_ENABLED)
+            continue
+
+    # Collect all records from this part
+    all_part_records = []
+    for records_list in image_to_records.values():
+        all_part_records.extend(records_list)
+
+    return all_part_records
 
 
 def _iterate_saved_patch_items(args):
@@ -3206,9 +3526,146 @@ def mode_save_only(args):
     return None
 
 def mode_process_only(args):
-    """Mode 2: Read existing .npy files and generate categorization results using the incremental streaming pipeline."""
-    print("=== Mode 2: Process Only ===")
-    
+    """Mode 2: Process .npy files part by part and accumulate TP/FP/FN/TN results."""
+    print("=== Mode 2: Process Only (Part-wise Processing) ===")
+
+    # Load ground truth map
+    ground_truth_map = load_ground_truth_map(args.annotation_dir)
+    print(f"Loaded ground truth for {len(ground_truth_map)} images")
+
+    # Get all part folders
+    part_folders = _get_part_folders(args.results_dir)
+    if not part_folders:
+        print("❌ No part_* folders found in evaluation_results directory")
+        print("   Falling back to legacy processing mode...")
+        # If no parts, process all files at once (legacy behavior)
+        return mode_process_only_legacy(args)
+
+    print(f"🔍 Found {len(part_folders)} part folders to process")
+    for i, folder in enumerate(part_folders):
+        print(f"   {i+1}. {os.path.basename(folder)}")
+
+    # Create smart image cache
+    max_cache_memory_gb = getattr(args, 'max_cache_memory_gb', 2.0)  # Default 2GB
+    max_cache_images = getattr(args, 'max_cache_images', 100)  # Default 100 images
+    print(f"🧠 Smart image cache: max {max_cache_memory_gb}GB, max {max_cache_images} images")
+    image_cache = SmartImageCache(max_memory_gb=max_cache_memory_gb, max_images=max_cache_images)
+
+    # Initialize metrics accumulator with minimal record storage for reports
+    store_minimal_records = args.enable_confusion_matrix or args.enable_save_json_results
+    accumulator = MetricsAccumulator(store_records=store_minimal_records)
+
+    # Create output directory
+    from datetime import datetime
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.tag:
+        output_dir = os.path.join(args.results_dir, f"{args.tag}_{current_time}")
+    else:
+        output_dir = os.path.join(args.results_dir, f"{current_time}")
+    os.makedirs(output_dir, exist_ok=True)
+    output_subdir = os.path.join(output_dir, "processed_results")
+    os.makedirs(output_subdir, exist_ok=True)
+    print(f"📁 Output directory: {output_subdir}")
+
+    # Process each part sequentially
+    import time
+    total_start_time = time.time()
+
+    # Use tqdm for the main part processing loop
+    for i, part_folder in enumerate(tqdm(part_folders, desc="Processing parts", unit="part")):
+        part_name = os.path.basename(part_folder)
+        tqdm.write(f"\n📦 Processing {part_name} ({i+1}/{len(part_folders)})...")
+
+        part_start_time = time.time()
+
+        try:
+            # Process this part
+            part_records = _process_single_part(args, part_folder, ground_truth_map, image_cache)
+
+            if part_records:
+                # Update accumulator with records from this part (clears records automatically)
+                accumulator.update_from_records(part_records)
+
+                part_elapsed = time.time() - part_start_time
+                tqdm.write(f"  ✅ {part_name}: {len(part_records)} records processed in {part_elapsed:.1f}s")
+
+                # Explicit memory cleanup after processing part
+                del part_records
+                part_records = None
+
+            else:
+                tqdm.write(f"  ⚠️ {part_name}: No records found")
+
+        except Exception as e:
+            tqdm.write(f"  ❌ {part_name}: Failed to process - {e}")
+            debug_print(f"Error processing {part_name}: {e}", debug=DEBUG_ENABLED)
+            continue
+
+        # Aggressive memory cleanup after each part
+        import gc
+        if hasattr(torch, 'cuda') and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    # Calculate final metrics
+    total_elapsed = time.time() - total_start_time
+    final_metrics = accumulator.get_final_metrics()
+
+    print(f"\n🎯 Final Results Summary:")
+    print(f"   📊 Total records: {final_metrics['total_records']}")
+    print(f"   🟢 Normal: {final_metrics['normal_records']}")
+    print(f"   🔴 Defective: {final_metrics['defective_records']}")
+    print(f"   📈 Confusion Matrix:")
+    print(f"      TP: {final_metrics['TP']}, FP: {final_metrics['FP']}")
+    print(f"      FN: {final_metrics['FN']}, TN: {final_metrics['TN']}")
+    print(f"   📊 Metrics:")
+    print(f"      Accuracy: {final_metrics['accuracy']:.4f}")
+    print(f"      Precision: {final_metrics['precision']:.4f}")
+    print(f"      Recall: {final_metrics['recall']:.4f}")
+    print(f"      F1-Score: {final_metrics['f1_score']:.4f}")
+    print(f"   ⏱️ Total processing time: {total_elapsed:.1f}s")
+
+    # Generate final reports using accumulated records
+    try:
+        all_records = accumulator.get_all_records()
+
+        # Create confusion matrix
+        if args.enable_confusion_matrix:
+            print(f"📊 Generating confusion matrix...")
+            create_confusion_matrix_from_records(
+                all_records,
+                output_subdir,
+                annotation_dir=args.annotation_dir,
+                patch_size=args.patch_size
+            )
+
+        # Save JSON results
+        if args.enable_save_json_results:
+            print(f"💾 Saving JSON results...")
+            save_all_records_json(
+                all_records,
+                output_subdir,
+                filename="all_records.json",
+                patch_size=args.patch_size
+            )
+
+    except Exception as e:
+        print(f"⚠️ Warning: Failed to generate final reports: {e}")
+        debug_print(f"Report generation error: {e}", debug=DEBUG_ENABLED)
+
+    # Print final cache statistics
+    cache_stats = image_cache.get_stats()
+    print(f"🧠 Final cache statistics:")
+    print(f"   📊 Cached images: {cache_stats['cached_images']}")
+    print(f"   💾 Memory used: {cache_stats['total_memory_mb']:.1f}MB / {cache_stats['max_memory_mb']:.1f}MB ({cache_stats['memory_usage_percent']:.1f}%)")
+
+    return final_metrics
+
+
+def mode_process_only_legacy(args):
+    """Legacy mode: Read existing .npy files and generate categorization results using the original pipeline."""
+    print("=== Mode 2: Process Only (Legacy Mode) ===")
+
     # Load ground truth and original images based on annotations, mirroring the incremental path
     ground_truth_map = load_ground_truth_map(args.annotation_dir)
     print(f"Loaded ground truth for {len(ground_truth_map)} images")
@@ -3218,14 +3675,14 @@ def mode_process_only(args):
     # Use parallel processing for better performance on large datasets
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import threading
-    
+
     image_paths_set = set()
     image_paths_lock = threading.Lock()  # Thread-safe set operations
-    
+
     def process_file_chunk(file_chunk, chunk_idx):
         """Process a chunk of .npy files in parallel"""
         chunk_new_paths = []
-        
+
         for npy_file in file_chunk:
             try:
                 # Process each .npy file (this is the expensive I/O operation)
@@ -3233,7 +3690,7 @@ def mode_process_only(args):
                 coords_file = f"{base_name}_coords.npy"
                 latent_file = f"{base_name}_latent.npy"
                 anomaly_file = f"{base_name}_anomaly_map_arithmetic.npy"
-                
+
                 if os.path.exists(coords_file) and os.path.exists(latent_file) and os.path.exists(anomaly_file):
                     # Extract image path from filename (same logic as _iterate_saved_patch_items)
                     filename = os.path.basename(npy_file)
@@ -3248,52 +3705,52 @@ def mode_process_only(args):
                             file_info = _re.sub(r"__x\d+_y\d+_x\d+_y\d+_x\d+_y\d+_x\d+_y\d+$", "", file_info)
                         else:
                             file_info = filename.split("__")[0]
-                    
+
                     image_path = safe_filename_to_path(file_info)
-                    
+
                     # Check if this is a new image path
                     if image_path and image_path not in image_paths_set:
                         with image_paths_lock:
                             if image_path not in image_paths_set:
                                 image_paths_set.add(image_path)
                                 chunk_new_paths.append(image_path)
-                                
+
             except Exception as e:
                 debug_print(f"⚠️  Failed reading file in chunk {chunk_idx}: {npy_file}: {e}", debug=DEBUG_ENABLED)
                 continue
-        
+
         print(f"📊 Completed file chunk {chunk_idx + 1}: {len(file_chunk)} files, {len(chunk_new_paths)} new paths")
         return chunk_new_paths
-    
+
     # Process file discovery and reading in parallel
     print(f"📁 Processing saved patches with parallel file I/O...")
-    
+
     # Process in parallel using ThreadPoolExecutor for I/O bound operations
     import os
     import time
     max_workers = min(os.cpu_count() * 2, 16)  # Use more workers for better CPU utilization
-    
+
     print(f"⚙️  Using {max_workers} worker threads for parallel file processing")
     start_time = time.time()
-    
+
     # Get all .npy files first (this is fast)
     npy_files = _get_distributed_npy_files(args.results_dir)
     print(f"🔍 Found {len(npy_files)} .npy files to process")
-    
+
     # Split files into chunks for parallel processing
     chunk_size = max(1, len(npy_files) // max_workers)
     file_chunks = [npy_files[i:i + chunk_size] for i in range(0, len(npy_files), chunk_size)]
     print(f"📦 Split into {len(file_chunks)} chunks of ~{chunk_size} files each")
-    
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         newly_added_paths = []
-        
+
         # Submit file chunks for parallel processing
         chunk_futures = []
         for chunk_idx, file_chunk in enumerate(file_chunks):
             chunk_future = executor.submit(process_file_chunk, file_chunk, chunk_idx)
             chunk_futures.append(chunk_future)
-        
+
         # Process completed chunks as they finish
         total_processed = 0
         for future in tqdm(as_completed(chunk_futures), total=len(chunk_futures), desc="Processing file chunks"):
@@ -3301,27 +3758,27 @@ def mode_process_only(args):
             if chunk_result:
                 newly_added_paths.extend(chunk_result)
             total_processed += len(npy_files)  # Total files processed
-    
+
     elapsed_time = time.time() - start_time
     patches_per_second = total_processed / elapsed_time if elapsed_time > 0 else 0
     print(f"✅ Found {len(image_paths_set)} unique image paths from {total_processed} processed patches")
     print(f"⏱️  Processing time: {elapsed_time:.2f}s ({patches_per_second:.1f} patches/sec)")
     if newly_added_paths:
         print(f"📊 Newly discovered paths: {len(newly_added_paths)}")
-    
+
     # Reload iterator after scan (it is a generator)
     patch_item_iter = _iterate_saved_patch_items(args)
 
     # Create smart image cache instead of loading all images at once
     print(f"🧠 Creating smart image cache...")
-    
+
     # Create smart cache with configurable memory limits
     max_cache_memory_gb = getattr(args, 'max_cache_memory_gb', 2.0)  # Default 2GB
     max_cache_images = getattr(args, 'max_cache_images', 100)  # Default 100 images
-    
+
     print(f"🧠 Smart image cache: max {max_cache_memory_gb}GB, max {max_cache_images} images")
     image_cache = SmartImageCache(max_memory_gb=max_cache_memory_gb, max_images=max_cache_images)
-    
+
     # Process incrementally via shared pipeline with smart cache
     metrics, output_dir = _process_records_stream_incrementally(
         args,
@@ -3330,7 +3787,7 @@ def mode_process_only(args):
         image_cache,  # Pass cache instead of loaded images
         output_subdir_name="processed_results",
     )
-    
+
     # Print final cache statistics
     cache_stats = image_cache.get_stats()
     print(f"🧠 Final cache statistics:")
@@ -3338,6 +3795,7 @@ def mode_process_only(args):
     print(f"   💾 Memory used: {cache_stats['total_memory_mb']:.1f}MB / {cache_stats['max_memory_mb']:.1f}MB ({cache_stats['memory_usage_percent']:.1f}%)")
 
     return metrics
+
 
 def mode_save_and_process(args):
     """Mode 3: Save .npy files and immediately process them for categorization."""
