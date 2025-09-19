@@ -249,11 +249,26 @@ function Run-SingleExecution {
         # Start process with only stdout redirected, let stderr (tqdm) display naturally
         if ($ScriptType -eq "train") {
             # Training command with distributed run
-            $process = Start-Process -FilePath "py" -ArgumentList "-3.11", "-m", "torch.distributed.run", "--standalone", "--nnodes=1", "--nproc-per-node=1", "`"$($ScriptPathAbs)`"", "--input-json", "`"$($InputJsonAbs)`"" -Wait -PassThru -NoNewWindow -RedirectStandardOutput $tempStdout
+            $process = Start-Process -FilePath "py" -ArgumentList "-3.11", "-m", "torch.distributed.run", "--standalone", "--nnodes=1", "--nproc-per-node=1", "`"$($ScriptPathAbs)`"", "--input-json", "`"$($InputJsonAbs)`"" -PassThru -NoNewWindow -RedirectStandardOutput $tempStdout
         } else {
             # Evaluation command
-            $process = Start-Process -FilePath "py" -ArgumentList "-3.11", "`"$($ScriptPathAbs)`"", "--input-json", "`"$($InputJsonAbs)`"" -Wait -PassThru -NoNewWindow -RedirectStandardOutput $tempStdout
+            $process = Start-Process -FilePath "py" -ArgumentList "-3.11", "`"$($ScriptPathAbs)`"", "--input-json", "`"$($InputJsonAbs)`"" -PassThru -NoNewWindow -RedirectStandardOutput $tempStdout
         }
+
+        # Monitor the process
+        $LastUpdate = Get-Date
+        while (-not $process.HasExited) {
+            # Show elapsed time every 60 seconds
+            $CurrentTime = Get-Date
+            if (($CurrentTime - $LastUpdate).TotalSeconds -ge 60) {
+                Show-ElapsedTime
+                $LastUpdate = $CurrentTime
+            }
+            Start-Sleep -Seconds 1
+        }
+
+        # Wait for completion
+        $process.WaitForExit()
         $ExitCode = $process.ExitCode
         
         # Read only the stdout content for our output capture

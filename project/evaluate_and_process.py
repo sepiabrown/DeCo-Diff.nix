@@ -156,6 +156,10 @@ class CheckpointManager:
         base_results_dir = os.path.dirname(results_dir) if os.path.basename(results_dir) != "results" else results_dir
         self.evaluation_results_dir = os.path.join(base_results_dir, "evaluation_results")
         os.makedirs(self.evaluation_results_dir, exist_ok=True)
+
+        # Create marked_images directory for image saving
+        self.marked_images_dir = os.path.join(results_dir, "marked_images")
+        os.makedirs(self.marked_images_dir, exist_ok=True)
         
         # Clear checkpoint files if force rerun is enabled
         if self.force_rerun:
@@ -1531,7 +1535,15 @@ def save_all_records_json(records: List[Record], output_dir: str, filename: str 
     # Sort records by anomaly_pixels from largest to smallest if requested
     if sort_records:
         print(f"🔍 Sorting records by anomaly_pixels (largest to smallest)...")
-        sorted_records = sorted(records, key=lambda record: record.get("anomaly_pixels", [None, 0])[1], reverse=True)
+        def get_anomaly_pixels(record):
+            """Extract anomaly_pixels value, handling both tuple and direct int formats."""
+            anomaly_pixels = record.get("anomaly_pixels", 0)
+            if isinstance(anomaly_pixels, (list, tuple)) and len(anomaly_pixels) > 1:
+                return anomaly_pixels[1]  # Tuple format: (metadata, value)
+            else:
+                return anomaly_pixels if isinstance(anomaly_pixels, int) else 0  # Direct int format
+
+        sorted_records = sorted(records, key=get_anomaly_pixels, reverse=True)
         print(f"✅ Records sorted successfully")
     else:
         print(f"📊 Keeping records in original order (no sorting)")
@@ -2583,6 +2595,7 @@ class MetricsAccumulator:
         accuracy = (self.total_tp + self.total_tn) / total_patches if total_patches > 0 else 0
         precision = self.total_tp / (self.total_tp + self.total_fp) if (self.total_tp + self.total_fp) > 0 else 0
         recall = self.total_tp / (self.total_tp + self.total_fn) if (self.total_tp + self.total_fn) > 0 else 0
+        specificity = self.total_tn / (self.total_tn + self.total_fp) if (self.total_tn + self.total_fp) > 0 else 0
         f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
 
         return {
@@ -2596,6 +2609,7 @@ class MetricsAccumulator:
             "accuracy": accuracy,
             "precision": precision,
             "recall": recall,
+            "specificity": specificity,
             "f1_score": f1_score,
             "total_patches": total_patches
         }
@@ -2625,7 +2639,7 @@ class MetricsAccumulator:
         return placeholder_records
 
 
-def _process_single_part(args, part_folder, ground_truth_map, image_cache):
+def _process_single_part(args, part_folder, ground_truth_map, image_cache, output_subdir):
     """
     Process a single part folder and return the processed records.
 
@@ -2634,6 +2648,7 @@ def _process_single_part(args, part_folder, ground_truth_map, image_cache):
         part_folder: Path to the part_* folder to process
         ground_truth_map: Ground truth mapping
         image_cache: Smart image cache
+        output_subdir: Output directory for results
 
     Returns:
         List of processed records from this part
@@ -2686,12 +2701,53 @@ def _process_single_part(args, part_folder, ground_truth_map, image_cache):
 
             # Process batch when it reaches the flush limit
             if len(batch_records) >= batch_size:
-                # Don't save images here, just collect records
+                # Save images if enabled
+                if args.enable_save_image_results or args.enable_save_whole_image_results:
+                    # Create a temporary checkpoint manager for image saving using the passed output_subdir
+                    if not hasattr(args, 'temp_checkpoint_manager'):
+                        args.temp_checkpoint_manager = CheckpointManager(
+                            results_dir=output_subdir,
+                            annotation_dir=args.annotation_dir,
+                            force_rerun=args.force_rerun
+                        )
+
+                    # Call the batch processing function to save images
+                    _process_batch_records_immediately(
+                        args,
+                        batch_records,
+                        ground_truth_map,
+                        image_cache,  # original_images
+                        args.temp_checkpoint_manager,
+                        output_subdir,
+                        image_to_records
+                    )
+
                 batch_records = []  # Clear the batch
 
         except Exception as e:
             debug_print(f"⚠️  Failed processing patch in part {os.path.basename(part_folder)}: {e}", debug=DEBUG_ENABLED)
             continue
+
+    # Process any remaining batch records for image saving
+    if batch_records and (args.enable_save_image_results or args.enable_save_whole_image_results):
+        # Create a temporary checkpoint manager for image saving using the passed output_subdir
+        if not hasattr(args, 'temp_checkpoint_manager'):
+            args.temp_checkpoint_manager = CheckpointManager(
+                results_dir=output_subdir,
+                annotation_dir=args.annotation_dir,
+                force_rerun=args.force_rerun
+            )
+
+        # Call the batch processing function to save images for remaining records
+        _process_batch_records_immediately(
+            args,
+            batch_records,
+            ground_truth_map,
+            image_cache,  # original_images
+            args.temp_checkpoint_manager,
+            output_subdir,
+            image_to_records
+        )
 
     # Collect all records from this part
     all_part_records = []
@@ -3199,15 +3255,14 @@ def _process_batch_records_immediately(args, batch_records, ground_truth_map, or
                 # Create marked_images directory in the output_subdir (tagged folder)
                 marked_images_dir = os.path.join(output_subdir, "marked_images")
                 os.makedirs(marked_images_dir, exist_ok=True)
-                
+
                 save_patch_results_from_records(
-                    marked_images_dir,
-                    checkpoint_manager.evaluation_results_dir,
-                    img_path,
-                    patch_records,
-                    patch_pred_set,
-                    ground_truth_defective,
-                    overlapping,
+                    checkpoint_manager,  # CheckpointManager object
+                    img_path,           # image_path
+                    patch_records,      # patch_records
+                    patch_pred_set,     # predicted_defective_set
+                    ground_truth_defective,  # ground_truth_defective
+                    overlapping,        # overlapping
                     enable_save_optional_image_results=args.enable_save_optional_image_results,
                     patch_size=args.patch_size,
                     patch_x=patch_x,
@@ -3580,7 +3635,7 @@ def mode_process_only(args):
 
         try:
             # Process this part
-            part_records = _process_single_part(args, part_folder, ground_truth_map, image_cache)
+            part_records = _process_single_part(args, part_folder, ground_truth_map, image_cache, output_subdir)
 
             if part_records:
                 # Update accumulator with records from this part (clears records automatically)
@@ -3616,13 +3671,14 @@ def mode_process_only(args):
     print(f"   🟢 Normal: {final_metrics['normal_records']}")
     print(f"   🔴 Defective: {final_metrics['defective_records']}")
     print(f"   📈 Confusion Matrix:")
-    print(f"      TP: {final_metrics['TP']}, FP: {final_metrics['FP']}")
-    print(f"      FN: {final_metrics['FN']}, TN: {final_metrics['TN']}")
+    print(f"      TP: {final_metrics['TP']}, FN: {final_metrics['FN']}")
+    print(f"      FP: {final_metrics['FP']}, TN: {final_metrics['TN']}")
     print(f"   📊 Metrics:")
-    print(f"      Accuracy: {final_metrics['accuracy']:.4f}")
-    print(f"      Precision: {final_metrics['precision']:.4f}")
-    print(f"      Recall: {final_metrics['recall']:.4f}")
-    print(f"      F1-Score: {final_metrics['f1_score']:.4f}")
+    print(f"      Accuracy ((TP+TN)/(TP+FN+FP+TN)): {final_metrics['accuracy']:.4f}")
+    print(f"      Precision (TP/(TP+FP)): {final_metrics['precision']:.4f}")
+    print(f"      Recall (TP/(TP+FN)): {final_metrics['recall']:.4f}")
+    print(f"      Specificity (TN/(TN+FP)): {final_metrics['specificity']:.4f}")
+    print(f"      F1-Score (2*Precision*Recall/(Precision+Recall)): {final_metrics['f1_score']:.4f}")
     print(f"   ⏱️ Total processing time: {total_elapsed:.1f}s")
 
     # Generate final reports using accumulated records
@@ -3648,6 +3704,7 @@ def mode_process_only(args):
                 filename="all_records.json",
                 patch_size=args.patch_size
             )
+
 
     except Exception as e:
         print(f"⚠️ Warning: Failed to generate final reports: {e}")
