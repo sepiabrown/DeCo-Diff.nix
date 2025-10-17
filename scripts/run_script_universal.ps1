@@ -270,6 +270,11 @@ function Run-SingleExecution {
         # Wait for completion
         $process.WaitForExit()
         $ExitCode = $process.ExitCode
+
+        # Handle null exit code (treat as success if process completed normally)
+        if ($null -eq $ExitCode) {
+            $ExitCode = 0
+        }
         
         # Read only the stdout content for our output capture
         $outputLines = @()
@@ -372,8 +377,8 @@ if ($Loop) {
             if ($ExitCode -eq 0) {
                 Write-Host "✓ Iteration completed successfully." -ForegroundColor Green
                 Send-SlackNotification -Status "✅ Iteration $Iteration Success" -Color "#2eb886" -ScriptPath $ScriptPath -Iteration $Iteration -Notify $Notify -LastOutputLines $LastOutputLines
-                Write-Host "Restarting immediately..." -ForegroundColor Green
-                Start-Sleep -Seconds 5  # Brief pause before restart
+                Write-Host "Stopping after successful iteration." -ForegroundColor Yellow
+                break
             } else {
                 Write-Host "✗ Iteration failed with exit code $ExitCode" -ForegroundColor Red
                 Send-SlackNotification -Status "❌ Iteration $Iteration Failed (Exit code: $ExitCode)" -Color "#e01e5a" -ScriptPath $ScriptPath -Iteration $Iteration -Notify $Notify -LastOutputLines $LastOutputLines
