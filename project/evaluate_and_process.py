@@ -94,7 +94,7 @@ from diffusion import create_diffusion
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from models import UNET_models
 from torchvision import transforms
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 import sys
 
 # Configure UTF-8 encoding for output
@@ -122,13 +122,6 @@ from evaluation_DeCo_Diff2 import (
     determine_image_status, compute_y_true_y_score, compute_metrics_from_y_true_y_score,
     make_excel, plot_accuracy_results, save_perturbation_results, draw_patch_rectangles_on_image,
     EvaluationMetrics
-)
-
-# Import from process_raw_data_to_results.py
-from process_raw_data_to_results import (
-    parse_filename_to_info,
-    load_raw_data_files,
-    compute_simple_metrics,
 )
 
 # ============================================================================
@@ -1752,6 +1745,32 @@ def get_transform():
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
 
+
+def create_bootstrap_indices(dataset_length: int, num_samples: int, seed: int = 42) -> List[int]:
+    """
+    Generate bootstrap sample indices with replacement.
+
+    Pure function for creating bootstrap samples from a dataset. Uses numpy's random
+    generator for efficient sampling with replacement.
+
+    Args:
+        dataset_length: Total number of items in dataset
+        num_samples: Number of bootstrap samples to draw
+        seed: Random seed for reproducibility (default: 42)
+
+    Returns:
+        List of sampled indices (may contain duplicates due to replacement)
+
+    Example:
+        >>> indices = create_bootstrap_indices(1000, 100, seed=42)
+        >>> len(indices)
+        100
+    """
+    rng = np.random.RandomState(seed)
+    indices = rng.choice(dataset_length, size=num_samples, replace=True)
+    return indices.tolist()
+
+
 def _before_saving_results(args):
     """
     Shared logic for preparing evaluation components.
@@ -1768,6 +1787,24 @@ def _before_saving_results(args):
         transform=get_transform(),
         object_class=args.object_class,
     )
+
+    # Apply bootstrap sampling if requested
+    if args.bootstrap_samples is not None:
+        original_length = len(dataset)
+        num_samples = args.bootstrap_samples
+
+        print(f"🎲 Bootstrap sampling enabled: {num_samples} samples from {original_length} patches")
+
+        # Generate bootstrap indices using pure function
+        bootstrap_indices = create_bootstrap_indices(
+            dataset_length=original_length,
+            num_samples=num_samples,
+            seed=args.bootstrap_seed
+        )
+
+        # Create subset dataset with bootstrap indices
+        dataset = Subset(dataset, bootstrap_indices)
+        print(f"✅ Bootstrap dataset created: {len(dataset)} samples (seed={args.bootstrap_seed})")
 
     dataloader_kwargs = dict(
         dataset=dataset,
@@ -2571,10 +2608,10 @@ class MetricsAccumulator:
             # Store only minimal data if needed for reports (no numpy arrays)
             if self.store_records:
                 self.minimal_records.append({
-                    'status': status,
-                    'image_path': record.get("image_path", (None, ""))[1],
-                    'anomaly_pixels': int(record.get("anomaly_pixels", (None, 0))[1]),
-                    'is_defective': is_predicted_defective
+                    'status': (None, status),
+                    'image_path': (None, record.get("image_path", (None, ""))[1]),
+                    'anomaly_pixels': (None, int(record.get("anomaly_pixels", (None, 0))[1])),
+                    'is_defective': (None, is_predicted_defective)
                 })
 
         # Clear full records after extracting metrics to free memory immediately
@@ -2864,7 +2901,9 @@ def _process_eval_batches_core(args, vae, model, diffusion, loader, checkpoint_m
     all_image_paths = []
     if checkpoint_manager:
         # Collect all unique image paths from the dataset
-        all_image_paths = list(set(loader.dataset.get_all_image_paths()))
+        # Handle both direct dataset and Subset-wrapped dataset
+        dataset = loader.dataset.dataset if hasattr(loader.dataset, 'dataset') else loader.dataset
+        all_image_paths = list(set(dataset.get_all_image_paths()))
         current_image_index, processed_images = checkpoint_manager.get_resume_info(all_image_paths)
         print(f"Resuming from image {current_image_index}/{len(all_image_paths)}")
         print(f"Already processed: {len(processed_images)} images")
@@ -3577,7 +3616,11 @@ def mode_save_only(args):
         patch_count += 1
         # Just consume the iterator to trigger saving, no processing needed
 
-    print(f"✅ Saved {patch_count} patches as NPY files to: {npy_save_dir}")
+    # Display success message with bootstrap status
+    if args.bootstrap_samples is not None:
+        print(f"✅ Saved {patch_count} bootstrap-sampled patches as NPY files to: {npy_save_dir}")
+    else:
+        print(f"✅ Saved {patch_count} patches as NPY files to: {npy_save_dir}")
     return None
 
 def mode_process_only(args):
@@ -3878,8 +3921,10 @@ def mode_full_pipeline(args):
     ground_truth_map = load_ground_truth_map(args.annotation_dir)
     print(f"Loaded ground truth for {len(ground_truth_map)} images")
 
-    image_paths = set(loader.dataset.get_all_image_paths())
-    
+    # Handle both direct dataset and Subset-wrapped dataset
+    dataset = loader.dataset.dataset if hasattr(loader.dataset, 'dataset') else loader.dataset
+    image_paths = set(dataset.get_all_image_paths())
+
     # Use smart cache for large datasets to avoid memory issues
     max_cache_memory_gb = getattr(args, 'max_cache_memory_gb', 2.0)
     max_cache_images = getattr(args, 'max_cache_images', 100)
@@ -3929,8 +3974,10 @@ def mode_full_pipeline_with_saving_npy(args):
     ground_truth_map = load_ground_truth_map(args.annotation_dir)
     print(f"Loaded ground truth for {len(ground_truth_map)} images")
 
-    image_paths = set(loader.dataset.get_all_image_paths())
-    
+    # Handle both direct dataset and Subset-wrapped dataset
+    dataset = loader.dataset.dataset if hasattr(loader.dataset, 'dataset') else loader.dataset
+    image_paths = set(dataset.get_all_image_paths())
+
     # Use smart cache for large datasets to avoid memory issues
     max_cache_memory_gb = getattr(args, 'max_cache_memory_gb', 2.0)
     max_cache_images = getattr(args, 'max_cache_images', 100)
@@ -4079,7 +4126,14 @@ def main():
                         help="Disable parallel processing and use sequential processing")
     parser.add_argument("--no-worker-monitoring", action="store_true", default=False,
                         help="Disable worker monitoring for maximum performance")
-    
+
+    # Bootstrap sampling control
+    parser.add_argument("--bootstrap-samples", type=int, default=None,
+                        help="Enable bootstrap sampling: save only N randomly sampled patches (with replacement). "
+                             "Reduces evaluation time. If None, processes all patches.")
+    parser.add_argument("--bootstrap-seed", type=int, default=42,
+                        help="Random seed for bootstrap sampling (default: 42 for reproducibility)")
+
     args = parser.parse_args()
     
     # Set global debug flag
@@ -4150,8 +4204,9 @@ def main():
             for key, value in test_args.items():
                 key = key.replace('-', '_')
                 if hasattr(test_args_obj, key):
-                    if key in ['anomaly_binary_threshold', 'anomaly_pixel_num_threshold', 'patch_size', 
-                              'batch_num', 'batch_size', 'reverse_steps', 'async_save_workers', 'stride']:
+                    if key in ['anomaly_binary_threshold', 'anomaly_pixel_num_threshold', 'patch_size',
+                              'batch_num', 'batch_size', 'reverse_steps', 'async_save_workers', 'stride',
+                              'bootstrap_samples', 'bootstrap_seed']:
                         value = int(value)
                     elif key in ['adaptive_threshold']:
                         value = float(value)
