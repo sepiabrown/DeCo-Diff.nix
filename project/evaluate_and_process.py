@@ -114,19 +114,829 @@ from utils import (
     load_ground_truth_map
 )
 
-# Import from process_raw_data_to_results.py
-from evaluation_DeCo_Diff2 import (
-    make_record, add_metric_fields,
-    _get_largest_connected_component_pixels, _create_contour_based_binary_mask_single,
-    save_patch_results_from_records,
-    determine_image_status, compute_y_true_y_score, compute_metrics_from_y_true_y_score,
-    make_excel, plot_accuracy_results, save_perturbation_results, draw_patch_rectangles_on_image,
-    EvaluationMetrics
+# Additional imports for migrated functions
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image as XLImage
+from openpyxl.utils import get_column_letter
+from sklearn.metrics import roc_curve, auc
+from torchmetrics.functional.image import (
+    learned_perceptual_image_patch_similarity as _lpips,
+    structural_similarity_index_measure as _ssim,
 )
+from io import BytesIO
 
 # ============================================================================
 # INLINED CLASSES AND FUNCTIONS FROM evaluation_DeCo_Diff2.py
 # ============================================================================
+
+# ---------------------------------------------------------------------------
+# Constants and Type Definitions
+# ---------------------------------------------------------------------------
+_LATENT_SCALE = 0.18215
+
+Kinded = Tuple[str, Any]  # (kind, value)
+Record = OrderedDict[str, Kinded]
+
+# ---------------------------------------------------------------------------
+# EvaluationMetrics Class
+# ---------------------------------------------------------------------------
+
+class EvaluationMetrics:
+    """Utility class for computing and storing evaluation metrics with memory-efficient approach."""
+
+    def __init__(self):
+        # Use running statistics instead of storing all values
+        self.epoch_stats = {
+            'encodedrecon_values': {'count': 0, 'sum': 0.0, 'sum_sq': 0.0, 'min': float('inf'), 'max': float('-inf'), 'values': []},
+            'latent_values': {'count': 0, 'sum': 0.0, 'sum_sq': 0.0, 'min': float('inf'), 'max': float('-inf'), 'values': []},
+            'anomaly_map_arithmetic_values': {'count': 0, 'sum': 0.0, 'sum_sq': 0.0, 'min': float('inf'), 'max': float('-inf'), 'values': []},
+            'anomaly_map_geometric_values': {'count': 0, 'sum': 0.0, 'sum_sq': 0.0, 'min': float('inf'), 'max': float('-inf'), 'values': []}
+        }
+        # Store histogram bins for distribution analysis
+        self.hist_bins = np.arange(0, 0.4, 0.01)
+        self.histograms = {
+            'encodedrecon_values': np.zeros(len(self.hist_bins) - 1, dtype=np.int64),
+            'latent_values': np.zeros(len(self.hist_bins) - 1, dtype=np.int64),
+            'anomaly_map_arithmetic_values': np.zeros(len(self.hist_bins) - 1, dtype=np.int64),
+            'anomaly_map_geometric_values': np.zeros(len(self.hist_bins) - 1, dtype=np.int64)
+        }
+
+    def add_batch_stats(self, encodedrecon_diff, latent_diff, anomaly_map_arithmetic, anomaly_map_geometric):
+        """Add batch statistics to epoch collection using running statistics."""
+        # Process encodedrecon_diff
+        encodedrecon_flat = encodedrecon_diff.flatten().cpu().numpy()
+        self._update_running_stats('encodedrecon_values', encodedrecon_flat)
+        self._update_histogram('encodedrecon_values', encodedrecon_flat)
+
+        # Process latent_diff
+        latent_flat = latent_diff.flatten().cpu().numpy()
+        self._update_running_stats('latent_values', latent_flat)
+        self._update_histogram('latent_values', latent_flat)
+
+        # Process anomaly_map_arithmetic
+        anomaly_map_arithmetic_flat = anomaly_map_arithmetic.flatten().cpu().numpy()
+        self._update_running_stats('anomaly_map_arithmetic_values', anomaly_map_arithmetic_flat)
+        self._update_histogram('anomaly_map_arithmetic_values', anomaly_map_arithmetic_flat)
+
+        # Process anomaly_map_geometric
+        anomaly_map_geometric_flat = anomaly_map_geometric.flatten().cpu().numpy()
+        self._update_running_stats('anomaly_map_geometric_values', anomaly_map_geometric_flat)
+        self._update_histogram('anomaly_map_geometric_values', anomaly_map_geometric_flat)
+
+
+    def _update_running_stats(self, key, values):
+        """Update running statistics for a given key."""
+        stats = self.epoch_stats[key]
+        n = len(values)
+
+        if n == 0:
+            return
+
+        # Update count
+        stats['count'] += n
+
+        # Update sum and sum of squares
+        stats['sum'] += np.sum(values)
+        stats['sum_sq'] += np.sum(values ** 2)
+
+        # Update min and max
+        stats['min'] = min(stats['min'], np.min(values))
+        stats['max'] = max(stats['max'], np.max(values))
+
+        stats['values'].extend(values.tolist())
+
+    def _update_histogram(self, key, values):
+        """Update histogram for a given key."""
+        hist, _ = np.histogram(values, bins=self.hist_bins, range=(0, 3))
+        self.histograms[key] += hist
+
+    def print_epoch_stats(self):
+        """Print epoch-wise statistics."""
+        print(f'\n=== EPOCH-WISE STATISTICS ===')
+
+        for name, stats in self.epoch_stats.items():
+            if stats['count'] > 0:
+                # Calculate statistics from running values
+                mean = stats['sum'] / stats['count']
+                variance = (stats['sum_sq'] / stats['count']) - (mean ** 2)
+                std = np.sqrt(max(0, variance))  # Ensure non-negative
+
+                print(f'{name} epoch stats:')
+                print(f'  min: {stats["min"]:.6f}, max: {stats["max"]:.6f}')
+                print(f'  mean: {mean:.6f}, std: {std:.6f}')
+
+                # Calculate quantiles if we have stored values
+                if len(stats['values']) > 0:
+                    values_array = np.array(stats['values'])
+                    q1 = np.percentile(values_array, 25)
+                    median = np.percentile(values_array, 50)
+                    q3 = np.percentile(values_array, 75)
+                    print(f'  Q1: {q1:.6f}, median: {median:.6f}, Q3: {q3:.6f}')
+
+                # Print histogram
+                hist = self.histograms[name]
+                print(f'{name} epoch distribution:')
+                for i, (count, edge) in enumerate(zip(hist, self.hist_bins[:-1])):
+                    if stats['count'] > 0:
+                        percentage = (count / stats['count']) * 100
+                        print(f'  [{edge:.2f}-{edge+0.01:.2f}): {count:6d} ({percentage:5.1f}%)')
+
+# ---------------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------------
+
+def add_metric_fields(rec: Record, *, device=torch.device("cpu")) -> None:
+
+    def to4d(x):
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x)
+            if x.dtype != torch.float32:
+                x = x.float()
+            if x.ndim == 3 and x.shape[-1] == 3:  # HWC -> CHW
+                x = x.permute(2, 0, 1)
+            if x.ndim == 2:
+                x = x.unsqueeze(0)
+            if x.ndim == 3:
+                x = x.unsqueeze(0)
+            return x.to(device).clamp(-1, 1)
+        return None
+
+    a = to4d(rec["encoded_recon"][1])
+    b = to4d(rec["dod_recon"][1])
+
+    # Add null checks before computing metrics
+    if a is not None and b is not None:
+        rec["lpips"] = ("metric", _lpips(a, b, net_type="alex").item())
+        ssim_result = _ssim(a, b)
+        rec["ssim"] = ("metric", ssim_result[0].item() if isinstance(ssim_result, tuple) else ssim_result.item())
+        rec["mse"] = ("metric", F.mse_loss(a, b).item())
+    else:
+        # Set default values if conversion fails
+        rec["lpips"] = ("metric", 0.0)
+        rec["ssim"] = ("metric", 0.0)
+        rec["mse"] = ("metric", 0.0)
+
+
+def make_record(**kwargs) -> Record:
+    """Return an **ordered** dict whose values are (kind, value) pairs."""
+    return OrderedDict(kwargs)
+
+
+def _get_largest_connected_component_pixels(anomaly_binary: torch.Tensor) -> int:
+    """
+    Calculate the number of pixels in the largest connected component of white pixels.
+
+    Args:
+        anomaly_binary: Binary tensor with shape (H, W) or (1, H, W) where 1 indicates white pixels
+
+    Returns:
+        Number of pixels in the largest connected component
+    """
+    # Convert to numpy and ensure 2D shape
+    if anomaly_binary.dim() == 3 and anomaly_binary.shape[0] == 1:
+        binary_np = anomaly_binary.squeeze(0).cpu().numpy()
+    else:
+        binary_np = anomaly_binary.cpu().numpy()
+
+    # Ensure binary values (0 or 1)
+    binary_np = (binary_np > 0).astype(np.uint8)
+
+    # Find connected components
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_np, connectivity=8)
+
+    if num_labels <= 1:  # Only background (label 0) or no components
+        return 0
+
+    # Find the largest component (excluding background which is label 0)
+    largest_component_size = 0
+    for i in range(1, num_labels):  # Skip background (i=0)
+        component_size = stats[i, cv2.CC_STAT_AREA]
+        if component_size > largest_component_size:
+            largest_component_size = component_size
+
+    return largest_component_size
+
+
+def _create_contour_based_binary_mask_single(anomaly_map: torch.Tensor, adaptive_threshold: float = 0.1, anomaly_binary_threshold: int = 5) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Create three different binary masks for a single image based on different contour selection styles.
+
+    Args:
+        anomaly_map: Anomaly map tensor with shape (H, W) with values in [0, 1]
+        adaptive_threshold: Threshold for adaptive contour selection (default: 0.1)
+        anomaly_binary_threshold: Threshold value for binary conversion (0-255, default: 5)
+                                 - Lower values create more white pixels
+                                 - Higher values create fewer white pixels
+
+    Returns:
+        Tuple of three binary tensors with shape (H, W) where selected contour pixels are 1, others are 0:
+        - style1: Top contours by sum (most significant)
+        - style2: Statistical outliers (mean + threshold * std)
+        - style3: Contours contributing significant portion of total
+    """
+    # Convert to numpy
+    map_np = anomaly_map.cpu().numpy()
+
+    # Ensure the map is 2D
+    if map_np.ndim != 2:
+        print(f"Warning: Expected 2D array, got shape {map_np.shape}")
+        zero_mask = torch.zeros_like(anomaly_map)
+        return zero_mask, zero_mask, zero_mask
+
+    # Handle negative values and ensure proper range
+    map_np = np.clip(map_np, 0, 1)  # Clip to [0, 1] range
+
+    # Convert to uint8 for contour detection (0-255 range)
+    map_uint8 = (map_np * 255).astype(np.uint8)
+
+    # Apply morphological operations to reduce noise
+    kernel = np.ones((3, 3), np.uint8)
+    map_uint8 = cv2.morphologyEx(map_uint8, cv2.MORPH_CLOSE, kernel)  # Close small holes
+    map_uint8 = cv2.morphologyEx(map_uint8, cv2.MORPH_OPEN, kernel)   # Remove small noise
+
+    # Convert to binary image for contour detection
+    _, binary_map = cv2.threshold(map_uint8, anomaly_binary_threshold, 255, cv2.THRESH_BINARY)
+
+    # Check if the image is all zeros (no contours possible)
+    if np.all(binary_map == 0):
+        zero_mask = torch.zeros_like(anomaly_map)
+        return zero_mask, zero_mask, zero_mask
+
+    try:
+        # Find contours on the binary image
+        contours, _ = cv2.findContours(binary_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    except cv2.error as e:
+        print(f"OpenCV error in findContours: {e}")
+        print(f"Binary map shape: {binary_map.shape}, dtype: {binary_map.dtype}")
+        print(f"Binary map min: {binary_map.min()}, max: {binary_map.max()}")
+        zero_mask = torch.zeros_like(anomaly_map)
+        return zero_mask, zero_mask, zero_mask
+
+    if not contours:
+        # No contours found, return all zeros
+        zero_mask = torch.zeros_like(anomaly_map)
+        return zero_mask, zero_mask, zero_mask
+
+    # Calculate contour statistics (sum of pixel values within each contour)
+    contour_stats = []
+
+    # Filter parameters to reduce noise
+    min_contour_area = 10.0  # Minimum contour area to consider
+    min_white_pixels = 5     # Minimum white pixels to consider
+
+    for i, contour in enumerate(contours):
+        # Create a mask for this contour
+        contour_mask = np.zeros_like(binary_map)
+        cv2.fillPoly(contour_mask, [contour], (255,))
+
+        # Calculate sum of pixel values within this contour
+        contour_white_pixels = np.sum(contour_mask > 0)
+        contour_sum = np.sum(map_np * (contour_mask > 0))
+        contour_area = cv2.contourArea(contour)
+
+        # Filter out noise: skip contours that are too small
+        if contour_area < min_contour_area or contour_white_pixels < min_white_pixels:
+            continue
+
+        contour_stats.append({
+            'index': i,
+            'contour': contour,
+            'sum': contour_sum,
+            'area': contour_area,
+            'white_pixels': contour_white_pixels
+        })
+
+    # Sort by sum (descending)
+    contour_stats.sort(key=lambda x: x['sum'], reverse=True)
+
+    if not contour_stats:
+        zero_mask = torch.zeros_like(anomaly_map)
+        return zero_mask, zero_mask, zero_mask
+
+    # Extract sums for adaptive selection
+    sums = np.array([stat['sum'] for stat in contour_stats])
+
+    # Calculate statistics for adaptive selection
+    mean_sum = np.mean(sums)
+    std_sum = np.std(sums)
+
+    # Remove statistical outliers (contours with sums > mean + 2*std)
+    outlier_threshold = mean_sum + 2 * std_sum
+    filtered_contour_stats = [stat for stat in contour_stats if stat['sum'] <= outlier_threshold]
+
+    if not filtered_contour_stats:
+        # If all contours were outliers, keep the top 3
+        filtered_contour_stats = contour_stats[:3]
+
+    # Use filtered contours for selection
+    contour_stats = filtered_contour_stats
+
+    # Create binary masks for each style
+    binary_mask_style1 = np.zeros_like(binary_map)
+    binary_mask_style2 = np.zeros_like(binary_map)
+    binary_mask_style3 = np.zeros_like(binary_map)
+
+    for contour_info in contour_stats:
+        cv2.fillPoly(binary_mask_style1, [contour_info['contour']], (255,))
+
+    for contour_info in contour_stats:
+        cv2.fillPoly(binary_mask_style2, [contour_info['contour']], (255,))
+
+    for contour_info in contour_stats:
+        cv2.fillPoly(binary_mask_style3, [contour_info['contour']], (255,))
+
+    # Convert back to tensors and normalize to [0, 1]
+    binary_tensor_style1 = torch.from_numpy(binary_mask_style1).float() / 255.0
+    binary_tensor_style2 = torch.from_numpy(binary_mask_style2).float() / 255.0
+    binary_tensor_style3 = torch.from_numpy(binary_mask_style3).float() / 255.0
+
+    # Return all three styles
+    return (binary_tensor_style1.to(anomaly_map.device),
+            binary_tensor_style2.to(anomaly_map.device),
+            binary_tensor_style3.to(anomaly_map.device))
+
+def _tensor_to_xlimage(arr, size: int) -> XLImage:
+    if isinstance(arr, torch.Tensor):
+        arr = arr.detach().cpu().numpy()
+    arr = np.squeeze(arr)
+    if arr.ndim == 2:
+        arr = arr[..., None]
+    if arr.ndim == 3 and arr.shape[0] in (1, 3, 4):
+        arr = np.transpose(arr, (1, 2, 0))
+    c = arr.shape[2]
+    if c == 1:
+        arr = np.repeat(arr, 3, axis=2)
+    elif c == 4:
+        # Split the image into 4 quadrants if c == 4 (e.g., 4-channel image)
+        q0 = arr[..., 0]
+        q1 = arr[..., 1]
+        q2 = arr[..., 2]
+        q3 = arr[..., 3]
+        # Stack as 2x2 grid
+        top = np.concatenate([q0, q1], axis=1)
+        bottom = np.concatenate([q2, q3], axis=1)
+        arr = np.stack(
+            [np.concatenate([top, bottom], axis=0)] * 3, axis=2
+        )  # make 3 channels
+    elif c != 3:
+        raise ValueError(f"unsupported channels: {c}")
+    if np.any(arr < 0):
+        arr = ((np.clip(arr, -1, 1) + 1) / 2 * 255).astype(np.uint8)
+    else:
+        arr = (arr * 255).astype(np.uint8)
+
+    buf = BytesIO()
+    PILImage.fromarray(arr, mode="RGB").save(buf, format="PNG")
+    buf.seek(0)
+    img = XLImage(buf)
+    img.width = img.height = size
+    return img
+
+
+def _write_row(ws, row_idx: int, rec: dict, size: int):
+    scalars, embeds = [], []
+    for col_idx, key in enumerate(rec.keys(), 1):
+        kind, val = rec[key]
+        if kind == "image":
+            embeds.append((col_idx, _tensor_to_xlimage(val, size)))
+            scalars.append("")
+            ws.column_dimensions[get_column_letter(col_idx)].width = size // 8
+        else:
+            # Convert tuples and other non-serializable types to strings
+            if isinstance(val, (tuple, list)):
+                scalars.append(str(val))
+            elif isinstance(val, (np.ndarray, torch.Tensor)):
+                scalars.append(str(val.tolist() if hasattr(val, 'tolist') else val))
+            else:
+                scalars.append(val)
+    ws.append(scalars)
+    ws.row_dimensions[row_idx].height = size * 0.75
+    for col_idx, img in embeds:
+        ws.add_image(img, f"{get_column_letter(col_idx)}{row_idx}")
+
+
+def make_excel(
+    records: List[Record],
+    image_size: int,
+    save_dir: str | Path = "report",
+    save_filename: str | None = datetime.now().strftime("%y%m%d_%H%M%S"),
+    max_rows_per_file: int = 50,
+) -> List[Path]:
+    """Create Excel report with all evaluation records and images.
+
+    Args:
+        records: List of evaluation records
+        image_size: Size of images to embed
+        save_dir: Directory to save Excel files
+        save_filename: Base filename for the Excel files
+        max_rows_per_file: Maximum number of rows per Excel file (default: 100)
+
+    Returns:
+        List of paths to created Excel files
+    """
+    save_dir = Path(save_dir).expanduser()
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Header comes from the first record's keys (order preserved)
+    header = list(records[0].keys())
+
+    # Calculate how many files we need
+    total_rows = len(records)
+    num_files = (total_rows + max_rows_per_file - 1) // max_rows_per_file  # Ceiling division
+
+    # Check if the last file would have fewer than max_rows_per_file rows
+    # If so, reduce the number of files by 1 and append remaining rows to the previous file
+    if num_files > 1:
+        remaining_rows = total_rows % max_rows_per_file
+        if remaining_rows > 0 and remaining_rows < max_rows_per_file:
+            num_files -= 1
+
+    created_files = []
+
+    for file_index in range(num_files):
+        # Calculate start and end indices for this file
+        start_idx = file_index * max_rows_per_file
+
+        # For the last file, include all remaining rows
+        if file_index == num_files - 1:
+            end_idx = total_rows
+        else:
+            end_idx = (file_index + 1) * max_rows_per_file
+
+        # Get records for this file
+        file_records = records[start_idx:end_idx]
+
+        # Create workbook for this file
+        wb = Workbook()
+        ws = wb.active
+        if ws is not None:
+            # Set worksheet title
+            if num_files == 1:
+                ws.title = "Report"
+            else:
+                ws.title = f"Report_Part{file_index + 1}"
+
+            # Add header
+            ws.append(header)
+
+            # Add data rows
+            for r, rec in enumerate(file_records, start=2):
+                _write_row(ws, r, rec, image_size)
+
+            # Set column widths
+            for c in range(1, len(header) + 1):
+                ws.column_dimensions[get_column_letter(c)].width = 18
+
+        # Generate filename
+        if num_files == 1:
+            out_filename = f"report_{save_filename}.xlsx"
+        else:
+            out_filename = f"report_{save_filename}_part{file_index + 1:02d}.xlsx"
+
+        out_path = save_dir / out_filename
+        wb.save(out_path)
+        created_files.append(out_path)
+
+        print(f"Report part {file_index + 1}/{num_files} saved to {out_path} ({len(file_records)} rows)")
+
+    if num_files > 1:
+        print(f"\nTotal: Created {num_files} Excel files with {total_rows} total rows")
+
+    return created_files
+
+
+def draw_patch_rectangles_on_image(base_img, predicted_defective_set, ground_truth_defective, overlapping, patch_size=128, grid_thickness=1):
+    """
+    Draw patch rectangles (TP/FP/FN) on top of an image.
+    Args:
+        base_img: The image to draw on (np.uint8, HxWx3)
+        predicted_defective: Set of (grid_row, grid_col) for predicted defective patches
+        ground_truth_defective: Set of (grid_row, grid_col) for ground truth defective patches
+        overlapping: Set of (grid_row, grid_col) where prediction and ground truth overlap
+        patch_size: Size of patches
+        grid_thickness: Thickness of the rectangle lines (default: 1)
+    Returns:
+        Image with rectangles drawn:
+        - Yellow rectangles around predicted defective regions
+        - Red rectangles around ground truth defective regions
+        - Green rectangles where prediction and ground truth overlap
+    """
+    img = base_img.copy()
+    # Draw predicted defective regions (yellow)
+    for grid_row, grid_col in predicted_defective_set:
+        x = grid_col * patch_size
+        y = grid_row * patch_size
+        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (255, 255, 0), grid_thickness)
+    # Draw ground truth defective regions (red)
+    for grid_row, grid_col in ground_truth_defective:
+        x = grid_col * patch_size
+        y = grid_row * patch_size
+        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (255, 0, 0), grid_thickness)
+    # Draw overlapping regions (green)
+    for grid_row, grid_col in overlapping:
+        x = grid_col * patch_size
+        y = grid_row * patch_size
+        cv2.rectangle(img, (x, y), (x + patch_size, y + patch_size), (0, 255, 0), grid_thickness)
+    return img
+
+
+def determine_image_status(image_records: list) -> str:
+    """
+    Determine the overall status of an image based on its patch records.
+
+    Returns:
+        str: 'TP', 'FN', 'FP', or 'TN' based on the image's classification status
+    """
+    # Count patches by their individual status
+    status_counts = {'TP': 0, 'FN': 0, 'FP': 0, 'TN': 0}
+
+    for record in image_records:
+        status = record["status"][1]  # Get the status from the record
+        if status in status_counts:
+            status_counts[status] += 1
+
+    # Determine overall image status based on the most common patch status
+    # If there are any defective patches (TP or FP), the image is considered defective
+    # If there are no defective patches but there are normal patches (TN or FN), the image is considered normal
+    # Priority: TP > FP > FN > TN (defective patches take precedence)
+
+    if status_counts['TP'] > 0 or status_counts['FP'] > 0:
+        # Image has defective patches
+        if status_counts['TP'] > 0:
+            return 'TP'  # True Positive: correctly identified as defective
+        else:
+            return 'FP'  # False Positive: incorrectly identified as defective
+    else:
+        # Image has no defective patches
+        if status_counts['FN'] > 0:
+            return 'FN'  # False Negative: missed defective patches
+        else:
+            return 'TN'  # True Negative: correctly identified as normal
+
+
+def compute_y_true_y_score(all_records):
+    """
+    For each param value, compute y_true and y_score arrays from records.
+    Returns: list of (y_true, y_score) tuples, one for each param value.
+    """
+    y_true_score_list = []
+    for i, (records, records_defect) in enumerate(all_records):
+        y_true = []
+        y_score = []
+        for rec in records:
+            y_true.append(0)
+            mask = (
+                rec["anomaly_map_arithmetic_binary"][1]
+                if isinstance(rec["anomaly_map_arithmetic_binary"], tuple)
+                else rec["anomaly_map_arithmetic_binary"]
+            )
+            num_white = np.sum(mask == 1)
+            y_score.append(num_white)
+        for rec in records_defect:
+            y_true.append(1)
+            mask = (
+                rec["anomaly_map_arithmetic_binary"][1]
+                if isinstance(rec["anomaly_map_arithmetic_binary"], tuple)
+                else rec["anomaly_map_arithmetic_binary"]
+            )
+            num_white = np.sum(mask == 1)
+            y_score.append(num_white)
+        y_score = np.array(y_score)
+        y_true = np.array(y_true)
+        y_true_score_list.append((y_true, y_score))
+    return y_true_score_list
+
+
+def compute_metrics_from_y_true_y_score(y_true_score_list):
+    """
+    For each (y_true, y_score), compute accuracy, threshold, and ROC stats.
+    Returns: accuracies, thresholds, and a dict of lists for each ROC metric.
+    """
+    accuracies = []
+    fpr_list = []
+    tpr_list = []
+    thresholds_list = []
+    best_thresholds = []
+    best_idxs = []
+    aucs = []
+    y_trues = []
+    y_preds = []
+    y_scores = []
+
+    for i, (y_true, y_score) in enumerate(y_true_score_list):
+        fpr, tpr, thresholds_, best_threshold, best_idx, auc_score = compute_roc_stats(
+            y_true, y_score
+        )
+        y_pred = (y_score >= best_threshold).astype(int)
+        y_preds.append(y_pred)
+        accuracy = np.mean(y_pred == y_true)
+        accuracies.append(accuracy)
+        fpr_list.append(fpr)
+        tpr_list.append(tpr)
+        best_thresholds.append(best_threshold)
+        best_idxs.append(best_idx)
+        aucs.append(auc_score)
+        y_trues.append(y_true)
+        y_scores.append(y_score)
+        print(f"Accuracy {accuracy:.4f} (threshold={best_threshold})")
+
+    roc_stats = {
+        "fpr": fpr_list,
+        "tpr": tpr_list,
+        "best_threshold": best_thresholds,
+        "best_idx": best_idxs,
+        "auc": aucs,
+        "y_true": y_trues,
+        "y_pred": y_preds,
+        "y_score": y_scores,
+        "accuracies": accuracies,
+    }
+    return roc_stats
+
+
+def compute_roc_stats(y_true, y_score):
+    """
+    Compute ROC statistics and best threshold using Youden's J statistic.
+    Returns: fpr, tpr, thresholds, best_threshold, best_idx, auc_score
+    """
+    fpr, tpr, thresholds = roc_curve(y_true, y_score)
+    youden_j = tpr - fpr
+    best_idx = np.argmax(youden_j)
+    best_threshold = thresholds[best_idx]
+    auc_score = auc(fpr, tpr)
+    return fpr, tpr, thresholds, best_threshold, best_idx, auc_score
+
+
+def plot_accuracy_results(
+    param_values,
+    accuracies,
+    param_name: str,
+    save_dir="accuracy_vs_param",
+    save_filename=datetime.now().strftime("%y%m%d_%H%M%S"),
+    title=None,
+    xlabel=None,
+    ylabel="Accuracy",
+    grid=True,
+    marker="o",
+    **plot_kwargs,
+):
+    """
+    Plot accuracy results with customizable parameters.
+
+    Args:
+        param_values: List of parameter values
+        accuracies: List of corresponding accuracies
+        param_name: Name of the parameter being varied
+        save_dir: Directory to save the plot
+        save_filename: Filename for saving the plot
+        title: Custom title for the plot
+        xlabel: Custom x-axis label
+        ylabel: Custom y-axis label
+        grid: Whether to show grid
+        marker: Marker style for the plot
+        **plot_kwargs: Additional plotting parameters
+    """
+    save_dir = Path(save_dir).expanduser()
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    plt.figure()
+    plt.plot(param_values, accuracies, marker=marker, **plot_kwargs)
+    plt.xlabel(xlabel or param_name)
+    plt.ylabel(ylabel)
+    plt.title(title or f"Accuracy vs {param_name.capitalize()} (synthetic defect)")
+    plt.ylim(0.5, 1.0)
+    plt.grid(grid)
+    out_path = os.path.join(save_dir, f"accuracy_vs_{param_name}_{save_filename}.png")
+    plt.savefig(out_path)
+    print(f"Accuracy vs {param_name} saved to {out_path}")
+    plt.close()
+
+
+def save_perturbation_results(
+    param_name: str,
+    roc_stats: dict,
+    param_values: list,
+    save_dir: str,
+):
+    """
+    Save perturbation experiment data (roc_stats and param_values) to a specified folder in JSON format.
+
+    Args:
+        param_name: Name of the perturbation parameter
+        roc_stats: Dictionary containing ROC statistics
+        param_values: List of parameter values
+        save_dir: Directory to save the results
+    """
+    save_dir_path = Path(save_dir).expanduser()
+    save_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Convert numpy arrays to lists for JSON serialization
+    def convert_for_json(obj):
+        if hasattr(obj, 'tolist'):  # numpy arrays
+            return obj.tolist()
+        elif isinstance(obj, list):
+            return [convert_for_json(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {key: convert_for_json(value) for key, value in obj.items()}
+        else:
+            return obj
+
+    # Convert roc_stats to JSON-serializable format
+    roc_stats_json = convert_for_json(roc_stats)
+
+    # Convert param_values to JSON-serializable format
+    param_values_json = convert_for_json(param_values)
+
+    # Save both roc_stats and param_values in a single JSON file
+    results_data = {
+        "param_name": param_name,
+        "param_values": param_values_json,
+        "roc_stats": roc_stats_json
+    }
+
+    json_path = os.path.join(save_dir, f"{param_name}_results.json")
+    with open(json_path, "w") as f:
+        json.dump(results_data, f, indent=2)
+
+    print(f"Perturbation results saved to {json_path}")
+
+
+def save_patch_results_from_records(checkpoint_manager, image_path: str,
+                                  patch_records: list,
+                                  predicted_defective_set: set, ground_truth_defective: set, overlapping: set,
+                                  enable_save_optional_image_results: bool = False, patch_size: int = 256,
+                                  patch_x: int = 0, patch_y: int = 0):
+    """Save patch-level results immediately."""
+    safe_name = path_to_safe_filename(image_path)
+    patch_coord_str = f"x{patch_x}_y{patch_y}"
+
+    # Create status-based subfolders
+    status_folders = {}
+    for status in ['TP', 'FN', 'FP', 'TN']:
+        status_dir = os.path.join(checkpoint_manager.marked_images_dir, status)
+        os.makedirs(status_dir, exist_ok=True)
+        status_folders[status] = status_dir
+
+    # Determine the status of this patch
+    if not patch_records:
+        print(f"Warning: No patch records provided for {image_path}")
+        return
+
+    patch_status = patch_records[0]["status"][1]
+
+    # Load original image
+    try:
+        original_img = np.array(PILImage.open(image_path).convert('RGB'))
+        h, w, _ = original_img.shape
+    except Exception as e:
+        print(f"Warning: Failed to load image {image_path}: {e}")
+        return
+
+    # Extract patch region from original image
+    patch_width = min(patch_size, w - patch_x)
+    patch_height = min(patch_size, h - patch_y)
+    patch_img = original_img[patch_y:patch_y+patch_height, patch_x:patch_x+patch_width]
+
+    # Save patch image in the appropriate status folder
+    patch_filename = f"{safe_name}__{patch_coord_str}.png"
+    patch_path = os.path.join(status_folders[patch_status], patch_filename)
+    PILImage.fromarray(patch_img).save(patch_path)
+
+    # Save patch-level anomaly maps
+    for record in patch_records:
+        # Extract anomaly maps for this patch
+        patch_arithmetic = record["anomaly_map_arithmetic"][1]
+        patch_arithmetic_binary = record["anomaly_map_arithmetic_binary"][1]
+        patch_geometric = record["anomaly_map_geometric"][1]
+        patch_geometric_binary = record["anomaly_map_geometric_binary"][1]
+
+        # Extract patch regions
+        patch_regions = {
+            'ar': patch_arithmetic.squeeze()[:patch_height, :patch_width],
+            'ar_bin': patch_arithmetic_binary.squeeze()[:patch_height, :patch_width],
+            'ge': patch_geometric.squeeze()[:patch_height, :patch_width],
+            'ge_bin': patch_geometric_binary.squeeze()[:patch_height, :patch_width],
+        }
+
+        # Save patch-level anomaly maps
+        for map_name, region in patch_regions.items():
+            # Create anomaly map image for this patch
+            anomaly_map_img = ImageProcessor.create_anomaly_map_image(
+                region, patch_size=patch_size, add_grid=False,
+                predicted_defective_set=predicted_defective_set, ground_truth_defective=ground_truth_defective,
+                overlapping=overlapping, is_binary=(map_name.endswith('binary'))
+            )
+            anomaly_map_filename = f"{safe_name}__{patch_coord_str}_{map_name}.png"
+            anomaly_map_path = os.path.join(status_folders[patch_status], anomaly_map_filename)
+            PILImage.fromarray(anomaly_map_img).save(anomaly_map_path)
+
+    # Mark this patch as processed
+    if checkpoint_manager:
+        checkpoint_manager.mark_image_processed(image_path)  # For now, mark entire image
+
+# ---------------------------------------------------------------------------
+# CheckpointManager Class
+# ---------------------------------------------------------------------------
 
 class CheckpointManager:
     """Manages checkpoint/resume functionality for evaluation."""
